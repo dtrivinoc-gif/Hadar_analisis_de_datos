@@ -81,3 +81,19 @@ def resolve_path(relative_path):
 
 ICON_PATH = resolve_path("logo.ico")
 LOGO_PNG_PATH = resolve_path("logo.png")
+
+
+# ----------------------------------------------------------------------------
+# Conexión al POS (fuente de datos "api_pos", ver io_datos.py) -- para
+# sincronizar en la misma red wifi con el PC donde corre POS by Hadar.
+#
+# Igual que las credenciales de Turso en el POS, la API key NUNCA se
+# escribe acá adentro ni se sube a GitHub -- se define como variable de
+# entorno en ESTE PC (el de Analytics). La URL sí tiene un valor por
+# defecto editable, porque no es secreta, solo hay que ajustarla si la
+# IP o el nombre de red del PC del POS cambia.
+# ----------------------------------------------------------------------------
+URL_POS_SINCRONIZACION = os.environ.get(
+    "ANALYTICS_URL_POS", "http://192.168.1.100:8000"
+)
+API_KEY_POS_SINCRONIZACION = os.environ.get("ANALYTICS_API_KEY_POS", "")

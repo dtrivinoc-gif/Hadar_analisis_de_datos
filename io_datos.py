@@ -251,6 +251,81 @@ def leer_tabla_sql_server(servidor, puerto, base_datos, usuario, password, tabla
         conn.close()
 
 
+class PosNoDisponible(Exception):
+    """Se lanza si no se pudo conectar a la API del POS (apagado, dirección
+    equivocada, clave inválida, etc.) -- siempre con un mensaje en español,
+    listo para mostrarlo tal cual en un QMessageBox. Rol equivalente a
+    SqlServerNoDisponible, pero para la fuente 'api_pos'."""
+    pass
+
+
+def verificar_conexion_pos(url_base):
+    """Prueba si el POS está prendido y accesible en la red, SIN necesitar
+    la API key (usa /salud). Pensado para un botón 'Probar conexión' en el
+    diálogo de configuración de la fuente, antes de guardar nada. Devuelve
+    True/False en vez de lanzar excepción."""
+    if requests is None:
+        return False
+    try:
+        resp = requests.get(f"{url_base.rstrip('/')}/salud", timeout=3.0)
+        return resp.status_code == 200
+    except Exception:
+        return False
+
+
+def _pedir_api_pos(url_base, api_key, ruta):
+    """Función interna compartida por listar_tablas_pos() y leer_tabla_pos():
+    arma el pedido HTTP, valida el resultado y traduce cualquier problema a
+    un mensaje en español entendible."""
+    if requests is None:
+        raise PosNoDisponible(
+            "Falta instalar la librería 'requests' para conectarse al POS "
+            "(ejecuta: pip install requests)."
+        )
+    try:
+        resp = requests.get(
+            f"{url_base.rstrip('/')}{ruta}",
+            headers={"X-API-Key": api_key},
+            timeout=6.0,
+        )
+    except Exception as e:
+        raise PosNoDisponible(
+            f"No se pudo conectar al POS en {url_base}. Revisa que esté "
+            f"encendido, conectado a la misma red wifi, y que la dirección "
+            f"sea correcta.\n\nDetalle: {e}"
+        ) from e
+
+    if resp.status_code == 401:
+        raise PosNoDisponible("La API key configurada no es válida.")
+    if resp.status_code == 404:
+        raise PosNoDisponible(f"El POS no reconoce '{ruta}'. ¿La tabla existe?")
+    if resp.status_code != 200:
+        detalle = ""
+        try:
+            cuerpo = resp.json()
+            detalle = f" Detalle: {cuerpo.get('tipo', '')}: {cuerpo.get('error', '')}"
+        except Exception:
+            pass
+        raise PosNoDisponible(f"El POS respondió con un error ({resp.status_code}).{detalle}")
+
+    return resp.json()
+
+
+def listar_tablas_pos(url_base, api_key):
+    """Nombres de todas las tablas que el POS deja sincronizar -- para
+    dejar elegir cuál(es) cargar, igual que listar_tablas_sql_server()."""
+    data = _pedir_api_pos(url_base, api_key, "/tablas")
+    return data.get("tablas", [])
+
+
+def leer_tabla_pos(url_base, api_key, tabla):
+    """Trae una tabla completa desde la API del POS (otro PC en la misma
+    red wifi) como DataFrame -- mismo rol que leer_tabla_sql_server(), pero
+    hablando HTTP con api_pos.py en vez de un servidor SQL Server."""
+    filas = _pedir_api_pos(url_base, api_key, f"/tabla/{tabla}")
+    return pd.DataFrame(filas)
+
+
 def fetch_uf_online():
     if requests is None:
         return None

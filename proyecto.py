@@ -76,10 +76,15 @@ def guardar_proyecto(ruta, *, tablas, nombre_tabla_activa, relaciones_ontologia,
                       ml_multivariado_activado=False, procedencia=None):
     """
     ... (ver parámetros existentes arriba)
-    fuentes_datos: dict {nombre_tabla: {"tipo": "archivo"|"sql_server", ...}}
+    fuentes_datos: dict {nombre_tabla: {"tipo": "archivo"|"sql_server"|"api_pos", ...}}
         de dónde vino cada tabla, para poder "Actualizar desde la fuente"
-        más adelante sin volver a pedir todo desde cero. NUNCA incluye la
-        contraseña de SQL Server -- esa se pide de nuevo cada vez que se
+        más adelante sin volver a pedir todo desde cero.
+        Para "api_pos" (sincronización con el POS por la red local), se
+        guarda {"tipo": "api_pos", "url_base": ..., "tabla": ...} -- la
+        API key NUNCA se guarda acá, mismo criterio que con la contraseña
+        de SQL Server: se lee de la configuración local de Analytics al
+        momento de actualizar, no queda escrita dentro del .hadarproy.
+        NUNCA incluye la contraseña de SQL Server -- esa se pide de nuevo cada vez que se
         actualiza (decisión del usuario, más seguro que guardarla en un
         .hadarproy que es un .zip común, fácil de abrir con 7-Zip).
     procedencia: lista de dicts (BitacoraProcedencia.a_lista()) con la historia

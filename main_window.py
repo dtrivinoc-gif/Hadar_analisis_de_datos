@@ -32,10 +32,12 @@ from PySide6.QtPrintSupport import QPrinter
 from .config import (
     THEMES, COLOR_ACCENT, COLOR_ACCENT_2, COLOR_ACCENT_3, COLOR_HOVER,
     COLOR_DANGER, ICON_PATH, LOGO_PNG_PATH,
+    URL_POS_SINCRONIZACION, API_KEY_POS_SINCRONIZACION,
 )
 from .io_datos import (
     SqlMultipleTablesError, read_sql_file, load_data, _excel_sheet_names,
     SqlServerNoDisponible, listar_tablas_sql_server, leer_tabla_sql_server,
+    PosNoDisponible, verificar_conexion_pos, listar_tablas_pos, leer_tabla_pos,
     cast_valor_a_dtype,
 )
 from .table_model import PandasTableModel
@@ -69,6 +71,7 @@ from .contagio import explorar_linaje, columna_clave_de_tabla
 from .alarmas import AlarmaHadar, AlarmaCard, DialogoAlarma, calcular_valor_actual, evaluar_regla
 from .notificaciones import DialogoConfiguracionCorreo, disparar_envio_correo, cargar_configuracion
 from .linea_tiempo_ui import LineaTiempoPanel
+from .panel import PanelControl
 from .linea_tiempo import parsear_fechas
 from .limpieza import (
     detectar_limpieza_sugerida, agrupar_por_tipo,
@@ -333,6 +336,67 @@ class _DialogoConexionSqlServer(QDialog):
         }
 
 
+class _DialogoConexionPos(QDialog):
+    """Pide (o confirma) la dirección del POS en la red local. A diferencia
+    de _DialogoConexionSqlServer, acá NO se pide contraseña/API key en el
+    diálogo -- esa clave vive en config.py de Analytics (variable de
+    entorno ANALYTICS_API_KEY_POS), fija para este PC, igual que la clave
+    de Turso vive en el config.py del POS. Solo la URL es editable acá,
+    por si la IP o el nombre de red del PC del POS cambia."""
+
+    def __init__(self, parent=None, valores_iniciales=None):
+        super().__init__(parent)
+        self.setWindowTitle("Conectar al POS")
+        self.resize(360, 200)
+        valores_iniciales = valores_iniciales or {}
+
+        layout = QVBoxLayout(self)
+
+        form = QFormLayout()
+        self.txt_url = QLineEdit(valores_iniciales.get("url_base", URL_POS_SINCRONIZACION))
+        self.txt_url.setPlaceholderText("ej. http://192.168.1.100:8000")
+        form.addRow("Dirección del POS:", self.txt_url)
+        layout.addLayout(form)
+
+        if not API_KEY_POS_SINCRONIZACION:
+            aviso_clave = QLabel(
+                "⚠ No hay una API key configurada en este PC (variable de "
+                "entorno ANALYTICS_API_KEY_POS). La conexión va a fallar "
+                "hasta que se configure."
+            )
+            aviso_clave.setWordWrap(True)
+            aviso_clave.setStyleSheet("color: #F59E0B; font-size: 11px;")
+            layout.addWidget(aviso_clave)
+
+        self.lbl_estado_prueba = QLabel("")
+        self.lbl_estado_prueba.setWordWrap(True)
+        layout.addWidget(self.lbl_estado_prueba)
+
+        btn_probar = QPushButton("Probar conexión")
+        btn_probar.clicked.connect(self._probar_conexion)
+        layout.addWidget(btn_probar)
+
+        botones = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        botones.accepted.connect(self.accept)
+        botones.rejected.connect(self.reject)
+        layout.addWidget(botones)
+
+    def _probar_conexion(self):
+        url = self.txt_url.text().strip()
+        if verificar_conexion_pos(url):
+            self.lbl_estado_prueba.setText("✓ El POS responde en esa dirección.")
+            self.lbl_estado_prueba.setStyleSheet("color: #34D399;")
+        else:
+            self.lbl_estado_prueba.setText(
+                "✗ No se pudo contactar al POS ahí. Revisa que esté encendido "
+                "y conectado a la misma red wifi."
+            )
+            self.lbl_estado_prueba.setStyleSheet("color: #EF4444;")
+
+    def valores(self):
+        return {"url_base": self.txt_url.text().strip()}
+
+
 class HadarApp(QMainWindow):
     def __init__(self, modo="nuevo"):
         super().__init__()
@@ -571,14 +635,22 @@ class HadarApp(QMainWindow):
 
         self.btn_actualizar_fuente = QPushButton("↻ Actualizar")
         self.btn_actualizar_fuente.setToolTip(
-            "Vuelve a traer los datos de donde vinieron (archivo o SQL "
-            "Server) para la tabla activa. Disponible solo si esa tabla "
-            "vino de un archivo o de una conexión en vivo."
+            "Vuelve a traer los datos de donde vinieron (archivo, SQL "
+            "Server o POS) para la tabla activa. Disponible solo si esa "
+            "tabla vino de un archivo o de una conexión en vivo."
         )
         self.btn_actualizar_fuente.clicked.connect(self._actualizar_desde_la_fuente)
         self.btn_actualizar_fuente.setEnabled(False)
         fila_sql_server.addWidget(self.btn_actualizar_fuente)
         sidebar_layout.addLayout(fila_sql_server)
+
+        btn_conectar_pos = QPushButton("Conectar al POS...")
+        btn_conectar_pos.setToolTip(
+            "Se conecta EN VIVO al PC del POS en la misma red wifi, para "
+            "traer sus tablas de ventas, productos, fiado, etc."
+        )
+        btn_conectar_pos.clicked.connect(self._conectar_pos)
+        sidebar_layout.addWidget(btn_conectar_pos)
 
         # "Chip" con el archivo cargado: reemplaza el texto suelto por una
         # pequeña tarjeta, para que se lea como un dato de estado y no como
@@ -1115,6 +1187,8 @@ class HadarApp(QMainWindow):
                 panel.render(self.filtered_df)
         if hasattr(self, "panel_linea_tiempo"):
             self.panel_linea_tiempo.aplicar_tema(self.colors)
+        if hasattr(self, "panel_control"):
+            self.panel_control.aplicar_tema(self.colors)
         if hasattr(self, "reporte_view"):
             self.reporte_view.setBackgroundBrush(QBrush(QColor(self.colors["bg"])))
         if hasattr(self, "panel_linaje"):
@@ -1606,7 +1680,9 @@ class HadarApp(QMainWindow):
         tab_reporte = QWidget()
         tab_alarma = QWidget()
         tab_linea_tiempo = QWidget()
+        tab_panel = QWidget()
         self.tabview.addTab(tab_datos, "Datos")
+        self.tabview.addTab(tab_panel, "Panel")
         self.tabview.addTab(tab_narrativa, "Narrativa")
         self.tabview.addTab(tab_graficos, "Gráficos")
         self.tabview.addTab(tab_metricas, "Métricas")
@@ -1625,6 +1701,7 @@ class HadarApp(QMainWindow):
         self._build_tab_reporte(tab_reporte)
         self._build_tab_alarma(tab_alarma)
         self._build_tab_linea_tiempo(tab_linea_tiempo)
+        self._build_tab_panel(tab_panel)
 
         root_layout.addWidget(main)
 
@@ -1641,6 +1718,19 @@ class HadarApp(QMainWindow):
         self.filtro_grafico = None
         self._refrescar_barra_filtro()
         self.apply_table_filter()
+
+    # ------------------------------------------------------------------
+    # TAB PANEL (ver panel.py)
+    # ------------------------------------------------------------------
+    def _build_tab_panel(self, tab):
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(0, 0, 0, 0)
+        self.panel_control = PanelControl(host=self)
+        layout.addWidget(self.panel_control)
+
+    def _notificar_panel(self):
+        if hasattr(self, "panel_control"):
+            self.panel_control.notificar_cambio()
 
     # ------------------------------------------------------------------
     # TAB LÍNEA DE TIEMPO
@@ -2175,6 +2265,96 @@ class HadarApp(QMainWindow):
         self._actualizar_boton_esquema()
         self._actualizar_boton_fuente()
 
+    def _conectar_pos(self):
+        """Conexión EN VIVO al POS en la red local, vía la API de
+        sincronización (api_pos.py del lado del POS)."""
+        dialogo = _DialogoConexionPos(self)
+        if dialogo.exec() != QDialog.DialogCode.Accepted:
+            return
+        url_base = dialogo.valores()["url_base"]
+        if not url_base:
+            QMessageBox.warning(self, "Falta la dirección", "Ingresa la dirección del POS.")
+            return
+        if not API_KEY_POS_SINCRONIZACION:
+            QMessageBox.critical(
+                self, "Falta la API key",
+                "No hay una API key configurada en este PC (variable de "
+                "entorno ANALYTICS_API_KEY_POS). Configúrala antes de conectar."
+            )
+            return
+
+        try:
+            tablas_disponibles = listar_tablas_pos(url_base, API_KEY_POS_SINCRONIZACION)
+        except PosNoDisponible as e:
+            QMessageBox.critical(self, "No se pudo conectar", str(e))
+            return
+
+        if not tablas_disponibles:
+            QMessageBox.information(self, "Sin tablas", "El POS no tiene tablas disponibles.")
+            return
+
+        selector = _DialogoElegirTablasSql(tablas_disponibles, "POS by Hadar", self)
+        if selector.exec() != QDialog.DialogCode.Accepted:
+            return
+        elegidas = selector.tablas_elegidas()
+
+        nuevas_tablas = {}
+        nuevas_fuentes = {}
+        errores = []
+        for nombre_tabla_pos in elegidas:
+            try:
+                df = leer_tabla_pos(url_base, API_KEY_POS_SINCRONIZACION, nombre_tabla_pos)
+            except PosNoDisponible as e:
+                errores.append(str(e))
+                continue
+            nombre_tabla = self._nombre_tabla_disponible(nombre_tabla_pos, nuevas_tablas)
+            nuevas_tablas[nombre_tabla] = df
+            # Igual criterio que sql_server: se guarda de dónde vino, pero
+            # nunca la API key (esa vive en config.py de este PC).
+            nuevas_fuentes[nombre_tabla] = {
+                "tipo": "api_pos", "url_base": url_base, "tabla": nombre_tabla_pos,
+            }
+
+        if not nuevas_tablas:
+            QMessageBox.critical(self, "No se pudo traer ninguna tabla", "\n".join(errores))
+            return
+        if errores:
+            QMessageBox.warning(self, "Algunas tablas no se pudieron traer", "\n".join(errores))
+
+        self.tablas = nuevas_tablas
+        self.fuentes_datos = nuevas_fuentes
+        self.procedencia = BitacoraProcedencia()   # datos recién cargados: sin historia previa
+        for nombre_tabla, f in nuevas_fuentes.items():
+            self.procedencia.registrar_origen(
+                nombre_tabla, ORIGEN_SQL_SERVER,  # ver nota en el mensaje de esta respuesta
+                filas=len(nuevas_tablas[nombre_tabla]), columnas=nuevas_tablas[nombre_tabla].shape[1],
+                servidor=f["url_base"], base_datos="POS by Hadar", tabla_sql=f["tabla"],
+            )
+        self.nombre_tabla_activa = next(iter(nuevas_tablas))
+        self.df = nuevas_tablas[self.nombre_tabla_activa]
+        self.filtro_grafico = None
+        self._resetear_filtro_anomalias()
+        self.table_model.limpiar_todas_las_notas()
+        self._quitar_marcas_limpieza()
+        self.excel_path = None
+        self.excel_sheet_names = []
+        self.excel_hojas_activas = []
+        self._actualizar_panel_hojas_excel()
+
+        sufijo_multi_tabla = (
+            f"  (+{len(nuevas_tablas) - 1} tabla{'s' if len(nuevas_tablas) > 2 else ''} más)"
+            if len(nuevas_tablas) > 1 else ""
+        )
+        self.lbl_archivo.setText(
+            f"POS by Hadar{sufijo_multi_tabla}\n"
+            f"{self.df.shape[0]:,} filas, {self.df.shape[1]} col."
+        )
+        self.refresh_all_column_lists()
+        self.apply_table_filter()
+        self.lbl_placeholder.setVisible(False)
+        self._actualizar_boton_esquema()
+        self._actualizar_boton_fuente()
+
     def _releer_archivo_de_origen(self, ruta):
         """Vuelve a leer el archivo de la tabla activa y devuelve (DataFrame,
         [hojas leídas]). Si es un Excel, relee la MISMA hoja (o las mismas hojas
@@ -2213,6 +2393,21 @@ class HadarApp(QMainWindow):
             except Exception as e:
                 QMessageBox.critical(self, "No se pudo actualizar", str(e))
                 return
+        elif info["tipo"] == "api_pos":
+            if not API_KEY_POS_SINCRONIZACION:
+                QMessageBox.critical(
+                    self, "Falta la API key",
+                    "No hay una API key configurada en este PC (variable de "
+                    "entorno ANALYTICS_API_KEY_POS)."
+                )
+                return
+            try:
+                df_nuevo = leer_tabla_pos(
+                    info["url_base"], API_KEY_POS_SINCRONIZACION, info["tabla"],
+                )
+            except PosNoDisponible as e:
+                QMessageBox.critical(self, "No se pudo actualizar", str(e))
+                return
         else:
             password, ok = QInputDialog.getText(
                 self, "Contraseña de SQL Server",
@@ -2247,6 +2442,12 @@ class HadarApp(QMainWindow):
                     filas=len(df_nuevo), columnas=df_nuevo.shape[1],
                     nombre_archivo=os.path.basename(info["ruta"]), ruta=info["ruta"],
                     hoja=hojas_releidas[0] if hojas_releidas else None,
+                )
+            elif info["tipo"] == "api_pos":
+                self.procedencia.registrar_origen(
+                    self.nombre_tabla_activa, ORIGEN_SQL_SERVER, es_actualizacion=True,
+                    filas=len(df_nuevo), columnas=df_nuevo.shape[1],
+                    servidor=info["url_base"], base_datos="POS by Hadar", tabla_sql=info["tabla"],
                 )
             else:
                 self.procedencia.registrar_origen(
@@ -3115,6 +3316,7 @@ class HadarApp(QMainWindow):
             self.indicador_widgets.append(card)
 
         self._actualizar_alarmas()
+        self._notificar_panel()
 
     def _guardar_indicadores(self):
         if not self.indicadores:
@@ -3616,6 +3818,7 @@ class HadarApp(QMainWindow):
         self._ultimas_anomalias = anomalias
         self._ultimo_df_narrativa = df
         self._ultimo_nombre_dataset_narrativa = nombre_dataset
+        self._notificar_panel()
         self._narrativa_actualizada = True
         if not self._narrativa_generada_alguna_vez:
             self._narrativa_generada_alguna_vez = True
