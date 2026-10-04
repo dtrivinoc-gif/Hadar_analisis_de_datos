@@ -16,7 +16,7 @@ from PySide6.QtGui import QColor, QFont, QPainter, QPainterPath, QPen, QBrush, Q
 from PySide6.QtWidgets import (
     QWidget, QMainWindow, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QComboBox, QListWidget, QTableView, QTabWidget, QScrollArea, QFrame,
-    QLineEdit, QRadioButton, QHeaderView, QCheckBox, QTabBar,
+    QLineEdit, QRadioButton, QHeaderView, QCheckBox, QTabBar, QSpinBox,
 )
 
 from .config import CHART_TYPES, DONUT_PALETTE, COLOR_ACCENT, COLOR_ACCENT_3, COLOR_HOVER, COLOR_DANGER
@@ -139,6 +139,80 @@ class DonutChartWidget(QWidget):
 # ----------------------------------------------------------------------------
 # Panel de gráfico individual
 # ----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
+# Agrupar por categoría (la "tabla dinámica" de los gráficos). Sin Qt, para
+# poder probarlo aparte.
+# ----------------------------------------------------------------------------
+_FUNCIONES_AGG = {"Suma": "sum", "Promedio": "mean", "Máximo": "max", "Mínimo": "min"}
+ETIQUETA_SIN_DATO = "(sin dato)"
+
+
+def agrupar_por_categoria(df, x_col, y_col, funcion="sum", orden="valor"):
+    """([etiquetas], [valores]) con una entrada por cada valor distinto de
+    `x_col`. Si y_col es 'Conteo' cuenta filas; si no, aplica `funcion`
+    (sum, mean, max, min) sobre y_col. `orden`: 'valor' (de mayor a menor)
+    o 'clave' (el orden natural de la categoría). Los vacíos de x_col se
+    muestran como '(sin dato)' en vez de desaparecer."""
+    claves = df[x_col]
+    serie = None
+    try:
+        if y_col == "Conteo":
+            g = df.groupby(x_col, observed=True).size()
+        else:
+            serie = pd.to_numeric(df[y_col], errors="coerce")
+            g = serie.groupby(claves, observed=True).agg(funcion)
+    except TypeError:  # categorías de tipos mezclados, imposibles de ordenar
+        if y_col == "Conteo":
+            g = df.groupby(x_col, observed=True, sort=False).size()
+        else:
+            g = serie.groupby(claves, observed=True, sort=False).agg(funcion)
+    etiquetas = [str(k) for k in g.index]
+    valores = g.astype(float).to_numpy()
+    nulos = claves.isna()
+    if nulos.any():
+        if serie is None:
+            v = float(nulos.sum())
+        else:
+            v = getattr(serie[nulos], funcion)()
+            v = float(v) if pd.notna(v) else np.nan
+        etiquetas.append(ETIQUETA_SIN_DATO)
+        valores = np.append(valores, v)
+    ok = ~np.isnan(valores)
+    etiquetas = [e for e, bueno in zip(etiquetas, ok) if bueno]
+    valores = valores[ok]
+    if orden == "valor" and len(valores):
+        idx = np.argsort(-valores, kind="stable")
+        etiquetas = [etiquetas[i] for i in idx]
+        valores = valores[idx]
+    return etiquetas, valores.tolist()
+
+
+def recortar_con_otros(etiquetas, valores, n, funcion="sum", incluir_otros=False):
+    """Deja solo los `n` primeros (los datos ya vienen ordenados). Con
+    incluir_otros=True suma el resto en una entrada 'Otros (k)' -- útil en
+    una dona, donde cada porción es parte de un total. En barras NO se
+    agrega: la barra 'Otros' suele ser la más grande y esconde el ranking.
+    Devuelve (etiquetas, valores, nota | None)."""
+    total = len(etiquetas)
+    if n <= 0 or total <= n:
+        return etiquetas, valores, None
+    resto = valores[n:]
+    nota = {"mostrados": n, "total": total, "funcion": funcion,
+            "resto": float(np.sum(resto)), "total_valor": float(np.sum(valores))}
+    top_e, top_v = list(etiquetas[:n]), list(valores[:n])
+    if incluir_otros:
+        top_e.append(f"Otros ({len(resto)})")
+        top_v.append(float(np.sum(resto)))
+    return top_e, top_v, nota
+
+
+def _es_etiqueta_real(etiqueta):
+    """False para las etiquetas que inventa el gráfico (no existen como valor
+    en la tabla, así que hacer clic en ellas no puede filtrar nada)."""
+    e = str(etiqueta)
+    return e != ETIQUETA_SIN_DATO and not e.startswith("Otros (")
+
+
 class ChartPanel(QWidget):
     removeRequested = Signal(object)
     categoryClicked = Signal(str, object)
@@ -152,6 +226,7 @@ class ChartPanel(QWidget):
         self.donut_widget = None
         self._bar_xvals = []
         self.x_es_fecha = False
+        self._click_habilitado = True
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -179,6 +254,28 @@ class ChartPanel(QWidget):
         self.combo_type = QComboBox()
         self.combo_type.addItems(CHART_TYPES)
         controls_top.addWidget(self.combo_type)
+
+        self.lbl_agg = QLabel("Calcular:")
+        controls_top.addWidget(self.lbl_agg)
+        self.combo_agg = QComboBox()
+        self.combo_agg.addItems(["Automático", "Suma", "Promedio", "Máximo", "Mínimo", "Cada fila"])
+        self.combo_agg.setToolTip(
+            "Cómo se combinan las filas que comparten la misma categoría (o el mismo período, "
+            "si el eje X es una fecha).\n"
+            "Automático: suma los valores de cada categoría.\n"
+            "Cada fila: no agrupa, dibuja una barra por fila de la tabla."
+        )
+        controls_top.addWidget(self.combo_agg)
+
+        self.lbl_top = QLabel("Mostrar:")
+        controls_top.addWidget(self.lbl_top)
+        self.spin_top = QSpinBox()
+        self.spin_top.setRange(0, 1000)
+        self.spin_top.setValue(15)
+        self.spin_top.setPrefix("Top ")
+        self.spin_top.setSpecialValueText("Todos")
+        self.spin_top.setToolTip("Cuántas categorías se dibujan, de la mayor a la menor. 'Todos' las muestra todas.")
+        controls_top.addWidget(self.spin_top)
         controls_top.addStretch()
 
         self.lbl_eje_x = QLabel("Eje X:")
@@ -226,6 +323,7 @@ class ChartPanel(QWidget):
         card_layout.addLayout(self.plot_container)
 
         self.btn_generate.clicked.connect(lambda: self.render_requested())
+        self.combo_y.currentTextChanged.connect(lambda _t: self._actualizar_controles())
         self.btn_delete.clicked.connect(lambda: self.removeRequested.emit(self))
         self.combo_type.currentTextChanged.connect(self._on_tipo_changed)
 
@@ -241,6 +339,18 @@ class ChartPanel(QWidget):
         self.combo_x.setVisible(not es_heatmap)
         self.lbl_eje_y.setVisible(not es_heatmap)
         self.combo_y.setVisible(not es_heatmap)
+        self._actualizar_controles()
+
+    def _actualizar_controles(self):
+        """Muestra 'Calcular' y 'Mostrar' solo cuando tienen sentido."""
+        tipo = self.combo_type.currentText()
+        y_es_conteo = self.combo_y.currentText() == "Conteo"
+        ver_agg = tipo in ("Barras", "Líneas") and not y_es_conteo
+        ver_top = tipo == "Barras"
+        self.lbl_agg.setVisible(ver_agg)
+        self.combo_agg.setVisible(ver_agg)
+        self.lbl_top.setVisible(ver_top)
+        self.spin_top.setVisible(ver_top)
 
     def render_requested(self):
         if self._render_callback:
@@ -267,6 +377,7 @@ class ChartPanel(QWidget):
         else:
             self.combo_y.setCurrentIndex(0)
         self.combo_y.blockSignals(False)
+        self._actualizar_controles()
 
     def _clear_plot_area(self):
         while self.plot_container.count():
@@ -330,11 +441,46 @@ class ChartPanel(QWidget):
 
         self.chart_x_col = x_col
         self.x_es_fecha = self._es_columna_fecha(df, x_col)
+        self._click_habilitado = True
 
         if chart_type == "Dona / Torta":
-            self._render_donut(df, x_col)
+            self._render_donut(df, x_col, y_col)
         else:
             self._render_pg_chart(df, chart_type, x_col, y_col)
+
+    def _funcion_agregacion(self):
+        """sum/mean/max/min según 'Calcular'. Automático = suma."""
+        return _FUNCIONES_AGG.get(self.combo_agg.currentText(), "sum")
+
+    def _debe_agrupar(self, df, x_col, y_col, es_fecha):
+        """True si se agrupan las filas por categoría/período. Con 'Cada
+        fila' no. Con 'Automático' sí, salvo que X sea un número con muchos
+        valores distintos (un id, un correlativo): ahí agrupar no tiene
+        sentido y se dibuja fila por fila, como siempre."""
+        if y_col == "Conteo":
+            return True
+        modo = self.combo_agg.currentText()
+        if modo == "Cada fila":
+            return False
+        if modo != "Automático" or es_fecha:
+            return True
+        serie = df[x_col]
+        if pd.api.types.is_numeric_dtype(serie) and serie.nunique() > 30:
+            return False
+        return True
+
+    def _mostrar_nota(self, nota):
+        """Una línea bajo el gráfico que dice cuánto se recortó, para que
+        nunca se confunda 'los 15 mayores' con 'todo'."""
+        if not nota:
+            return
+        txt = f"Mostrando los {nota['mostrados']} mayores de {nota['total']}"
+        if nota["funcion"] == "sum" and nota["total_valor"] > 0 and nota["resto"] >= 0:
+            pct = nota["resto"] / nota["total_valor"] * 100
+            txt += f" · el resto suma {self._formato_num(nota['resto'])} ({pct:.0f} % del total)"
+        lbl = QLabel(txt)
+        lbl.setObjectName("muted")
+        self.plot_container.addWidget(lbl)
 
     def _render_pg_chart(self, df, chart_type, x_col, y_col):
         usar_eje_fecha = self.x_es_fecha and chart_type in ("Barras", "Líneas")
@@ -356,13 +502,18 @@ class ChartPanel(QWidget):
 
         try:
             if chart_type == "Barras":
+                agrupar = self._debe_agrupar(df, x_col, y_col, usar_eje_fecha)
+                funcion = "sum" if y_col == "Conteo" else self._funcion_agregacion()
+                nota = None
                 if usar_eje_fecha:
-                    labels, values, xvals = self._datos_ordenados_por_fecha(df, x_col, y_col)
+                    labels, values, xvals = self._datos_ordenados_por_fecha(
+                        df, x_col, y_col, funcion if (agrupar and y_col != "Conteo") else None)
+                    if agrupar and y_col != "Conteo":
+                        self._click_habilitado = False  # cada barra es un período, no un valor de la tabla
                 else:
-                    if y_col == "Conteo":
-                        counts = df[x_col].value_counts()
-                        labels = counts.index.astype(str).tolist()
-                        values = counts.values.tolist()
+                    if agrupar:
+                        labels, values = agrupar_por_categoria(df, x_col, y_col, funcion, "valor")
+                        labels, values, nota = recortar_con_otros(labels, values, self.spin_top.value(), funcion)
                     else:
                         labels = df[x_col].astype(str).tolist()
                         values = pd.to_numeric(df[y_col], errors="coerce").fillna(0).tolist()
@@ -374,22 +525,34 @@ class ChartPanel(QWidget):
                 bar = pg.BarGraphItem(x=xvals, height=values, width=ancho, brush=COLOR_ACCENT)
                 pw.addItem(bar)
                 if not usar_eje_fecha:
-                    self._set_category_ticks(pw, labels)
+                    self._set_category_ticks(pw, labels, rotados=(agrupar and len(labels) <= 15))
                 pw.scene().sigMouseClicked.connect(
                     lambda ev, pw=pw: self._on_bar_clicked(ev, pw)
                 )
                 self._agregar_hover_categoria(pw, xvals, labels, values)
                 if self.chk_anotaciones.isChecked():
-                    self._agregar_anotaciones_serie(pw, xvals, values)
+                    if nota:  # el promedio de solo los 15 mayores engañaría: se usa el de todas
+                        self._agregar_anotaciones_serie(
+                            pw, xvals, values, promedio=nota["total_valor"] / nota["total"],
+                            texto_promedio="Promedio general")
+                    else:
+                        self._agregar_anotaciones_serie(pw, xvals, values)
+                self._mostrar_nota(nota)
+                if values and max(values) > 0:
+                    # Aire arriba para que el valor de la barra más alta no se corte.
+                    pw.setYRange(min(0, min(values)), max(values) * 1.12, padding=0)
 
             elif chart_type == "Líneas":
+                agrupar = self._debe_agrupar(df, x_col, y_col, usar_eje_fecha)
+                funcion = "sum" if y_col == "Conteo" else self._funcion_agregacion()
                 if usar_eje_fecha:
-                    labels, values, xvals = self._datos_ordenados_por_fecha(df, x_col, y_col)
+                    labels, values, xvals = self._datos_ordenados_por_fecha(
+                        df, x_col, y_col, funcion if (agrupar and y_col != "Conteo") else None)
+                    if agrupar and y_col != "Conteo":
+                        self._click_habilitado = False
                 else:
-                    if y_col == "Conteo":
-                        counts = df[x_col].value_counts().sort_index()
-                        labels = counts.index.astype(str).tolist()
-                        values = counts.values.tolist()
+                    if agrupar:
+                        labels, values = agrupar_por_categoria(df, x_col, y_col, funcion, "clave")
                     else:
                         labels = df[x_col].astype(str).tolist()
                         values = pd.to_numeric(df[y_col], errors="coerce").fillna(0).tolist()
@@ -460,32 +623,62 @@ class ChartPanel(QWidget):
         except Exception as e:
             pw.addItem(pg.TextItem(f"Error: {e}", color=COLOR_DANGER))
 
-    def _set_category_ticks(self, pw, labels, max_ticks=9):
+    def _set_category_ticks(self, pw, labels, max_ticks=9, rotados=False):
         """Menos etiquetas que categorías reales, a propósito: con muchas
         barras no caben todos los nombres sin que se amontonen, y forzar el
         texto no soluciona nada (Tufte: mejor pocas etiquetas legibles que
         muchas ilegibles). El nombre exacto de cada barra se ve completo
-        al pasar el mouse por encima (ver _agregar_hover_categoria)."""
+        al pasar el mouse por encima (ver _agregar_hover_categoria).
+
+        rotados=True es para un ranking de pocas barras (hasta 15): los
+        nombres se escriben en vertical sobre la base de cada barra, así
+        caben todos y se pueden leer sin pasar el mouse."""
         n = len(labels)
         if n == 0:
             return
+
+        def _acortar(txt, largo):
+            txt = str(txt)
+            return txt if len(txt) <= largo else txt[:largo - 1] + "…"
+
+        if rotados and n <= 15:
+            eje = pw.getAxis("bottom")
+            eje.setTicks([[(i, "") for i in range(n)]])
+            for i, lbl in enumerate(labels):
+                t = pg.TextItem(_acortar(lbl, 13), color=self.colors["text"], anchor=(0, 0.5), angle=90)
+                t.setPos(i, 0)
+                pw.addItem(t, ignoreBounds=True)
+            # Un poco de aire a los lados para que la primera y la última
+            # barra no queden pegadas al borde.
+            pw.setXRange(-0.7, n - 0.3, padding=0)
+            return
+
         step = max(1, math.ceil(n / max_ticks))
         largo_max = 12
-
-        def _acortar(txt):
-            txt = str(txt)
-            return txt if len(txt) <= largo_max else txt[:largo_max - 1] + "…"
-
-        ticks = [(i, _acortar(lbl)) for i, lbl in enumerate(labels) if i % step == 0]
+        ticks = [(i, _acortar(lbl, largo_max)) for i, lbl in enumerate(labels) if i % step == 0]
         pw.getAxis("bottom").setTicks([ticks])
 
     @classmethod
-    def _datos_ordenados_por_fecha(cls, df, x_col, y_col):
+    def _datos_ordenados_por_fecha(cls, df, x_col, y_col, funcion=None):
         """Para columnas de fecha: ordena cronológicamente y entrega
         posiciones X reales en segundos-epoch, para usar con DateAxisItem
         (así el espaciado entre barras/puntos refleja el tiempo real, no
         solo el orden de aparición en la tabla)."""
         fechas = cls._parsear_fechas(df[x_col])
+
+        if funcion is not None and y_col != "Conteo":
+            # Agrupado: un punto por período (minuto, hora, día, semana o mes,
+            # el más fino con el que no pasan de ~60 puntos).
+            from .panel import serie_por_periodo
+            validas = fechas.notna()
+            if validas.sum() >= 2:
+                serie, periodo = serie_por_periodo(df.loc[validas, y_col], fechas[validas], funcion=funcion)
+                serie = serie.dropna()
+                if len(serie):
+                    fmt = "%Y-%m" if periodo == "mes" else ("%Y-%m-%d" if periodo in ("día", "semana") else "%Y-%m-%d %H:%M")
+                    labels = serie.index.strftime(fmt).tolist()
+                    xvals = serie.index.values.astype("datetime64[s]").astype("int64").tolist()
+                    return labels, serie.astype(float).tolist(), xvals
 
         if y_col == "Conteo":
             validos = fechas.notna()
@@ -532,7 +725,7 @@ class ChartPanel(QWidget):
             pos=valor, angle=angulo,
             pen=pg.mkPen(self.colors["muted"], width=1, style=Qt.DashLine),
             label=texto,
-            labelOpts={"color": self.colors["muted"], "position": 0.95, "movable": False},
+            labelOpts={"color": self.colors["muted"], "position": 0.95 if len(texto) <= 16 else 0.8, "movable": False},
         )
         pw.addItem(linea)
 
@@ -599,7 +792,7 @@ class ChartPanel(QWidget):
         proxy = pg.SignalProxy(pw.scene().sigMouseMoved, rateLimit=30, slot=_mover)
         pw._hover_proxy = proxy  # referencia viva para que no la borre el GC
 
-    def _agregar_anotaciones_serie(self, pw, xvals, values):
+    def _agregar_anotaciones_serie(self, pw, xvals, values, promedio=None, texto_promedio=None):
         """Línea de referencia con el promedio de la serie, y —si no hay
         demasiados puntos como para saturar el gráfico— el valor exacto
         escrito directamente sobre cada barra/punto (etiquetado directo en
@@ -609,8 +802,10 @@ class ChartPanel(QWidget):
         if not pares:
             return
         valores_validos = [v for _, v in pares]
-        promedio = float(np.mean(valores_validos))
-        self._linea_referencia(pw, promedio, angulo=0, texto=f"Promedio: {self._formato_num(promedio)}")
+        if promedio is None:
+            promedio = float(np.mean(valores_validos))
+        etiqueta_prom = texto_promedio or "Promedio"
+        self._linea_referencia(pw, promedio, angulo=0, texto=f"{etiqueta_prom}: {self._formato_num(promedio)}")
 
         if len(pares) <= 25:
             for x, v in pares:
@@ -619,25 +814,30 @@ class ChartPanel(QWidget):
                 pw.addItem(etiqueta)
 
     def _on_bar_clicked(self, ev, pw):
-        if not self._bar_xvals:
+        if not self._bar_xvals or not self._click_habilitado:
             return
         vb = pw.getPlotItem().getViewBox()
         point = vb.mapSceneToView(ev.scenePos())
         idx = min(range(len(self._bar_xvals)), key=lambda i: abs(self._bar_xvals[i] - point.x()))
-        if 0 <= idx < len(self.categories):
+        if 0 <= idx < len(self.categories) and _es_etiqueta_real(self.categories[idx]):
             self.categoryClicked.emit(self.chart_x_col, self.categories[idx])
 
-    def _render_donut(self, df, x_col):
-        counts = df[x_col].value_counts()
-        self.categories = counts.index.astype(str).tolist()
+    def _render_donut(self, df, x_col, y_col="Conteo"):
+        """Porciones por categoría: filas (Conteo) o suma de la columna Y.
+        Con más de 10 categorías, muestra las 9 mayores y junta el resto en
+        'Otros' (la paleta tiene 10 colores y más porciones no se leen)."""
+        etiquetas, valores = agrupar_por_categoria(df, x_col, y_col, "sum", "valor")
+        if len(etiquetas) > 10:
+            etiquetas, valores, _ = recortar_con_otros(etiquetas, valores, 9, "sum", incluir_otros=True)
+        self.categories = etiquetas
         donut = DonutChartWidget()
-        donut.set_data(self.categories, counts.values.tolist(), text_color=self.colors["text"])
+        donut.set_data(self.categories, valores, text_color=self.colors["text"])
         donut.sliceClicked.connect(self._on_donut_clicked)
         self.plot_container.addWidget(donut)
         self.donut_widget = donut
 
     def _on_donut_clicked(self, idx):
-        if 0 <= idx < len(self.categories):
+        if 0 <= idx < len(self.categories) and _es_etiqueta_real(self.categories[idx]):
             self.categoryClicked.emit(self.chart_x_col, self.categories[idx])
 
     def _render_heatmap_correlacion(self, df):
@@ -738,7 +938,11 @@ class ChartPanel(QWidget):
         if tipo == "Mapa de Calor (Correlación)":
             base = tipo
         else:
-            base = f"{tipo} — X: {self.combo_x.currentText()}, Y: {self.combo_y.currentText()}"
+            y = self.combo_y.currentText()
+            agg = self.combo_agg.currentText()
+            if tipo in ("Barras", "Líneas") and y != "Conteo" and agg in _FUNCIONES_AGG:
+                y = f"{agg} de {y}"
+            base = f"{tipo} — X: {self.combo_x.currentText()}, Y: {y}"
         nombre = self.nombre()
         return f"{nombre} ({base})" if nombre else base
 

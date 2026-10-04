@@ -72,6 +72,7 @@ from .alarmas import AlarmaHadar, AlarmaCard, DialogoAlarma, calcular_valor_actu
 from .notificaciones import DialogoConfiguracionCorreo, disparar_envio_correo, cargar_configuracion
 from .linea_tiempo_ui import LineaTiempoPanel
 from .panel import PanelControl
+from .prediccion_ui import PanelPrediccion
 from .linea_tiempo import parsear_fechas
 from .limpieza import (
     detectar_limpieza_sugerida, agrupar_por_tipo,
@@ -445,6 +446,9 @@ class HadarApp(QMainWindow):
         # termómetro de confiabilidad) -- a diferencia de ml_activado, no se
         # pregunta una sola vez: se puede prender/apagar en cualquier momento.
         self.ml_multivariado_activado = False
+        # Configuración de la pestaña Predicción (qué predecir, qué columnas usar).
+        # Se guarda en el .hadarproy; el modelo entrenado no (ver prediccion.py).
+        self.prediccion_config = {}
         # De dónde vino cada tabla ({nombre_tabla: {"tipo": "archivo"|"sql_server", ...}})
         # -- para poder "Actualizar" sin volver a preguntar todo. Nunca
         # incluye contraseñas (ver _DialogoConexionSqlServer).
@@ -1189,6 +1193,8 @@ class HadarApp(QMainWindow):
             self.panel_linea_tiempo.aplicar_tema(self.colors)
         if hasattr(self, "panel_control"):
             self.panel_control.aplicar_tema(self.colors)
+        if hasattr(self, "panel_prediccion"):
+            self.panel_prediccion.aplicar_tema(self.colors)
         if hasattr(self, "reporte_view"):
             self.reporte_view.setBackgroundBrush(QBrush(QColor(self.colors["bg"])))
         if hasattr(self, "panel_linaje"):
@@ -1681,6 +1687,7 @@ class HadarApp(QMainWindow):
         tab_alarma = QWidget()
         tab_linea_tiempo = QWidget()
         tab_panel = QWidget()
+        tab_prediccion = QWidget()
         self.tabview.addTab(tab_datos, "Datos")
         self.tabview.addTab(tab_panel, "Panel")
         self.tabview.addTab(tab_narrativa, "Narrativa")
@@ -1690,6 +1697,7 @@ class HadarApp(QMainWindow):
         self.tabview.addTab(tab_frecuencias, "Frecuencias")
         self.tabview.addTab(tab_alarma, "Alarma")
         self.tabview.addTab(tab_linea_tiempo, "Línea de Tiempo")
+        self.tabview.addTab(tab_prediccion, "Predicción")
         self.tabview.addTab(tab_reporte, "Reporte")
 
         self._build_tab_datos(tab_datos)
@@ -1702,6 +1710,7 @@ class HadarApp(QMainWindow):
         self._build_tab_alarma(tab_alarma)
         self._build_tab_linea_tiempo(tab_linea_tiempo)
         self._build_tab_panel(tab_panel)
+        self._build_tab_prediccion(tab_prediccion)
 
         root_layout.addWidget(main)
 
@@ -1731,6 +1740,17 @@ class HadarApp(QMainWindow):
     def _notificar_panel(self):
         if hasattr(self, "panel_control"):
             self.panel_control.notificar_cambio()
+        if hasattr(self, "panel_prediccion"):
+            self.panel_prediccion.notificar_cambio()
+
+    # ------------------------------------------------------------------
+    # TAB PREDICCIÓN (ver prediccion.py y prediccion_ui.py)
+    # ------------------------------------------------------------------
+    def _build_tab_prediccion(self, tab):
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(0, 0, 0, 0)
+        self.panel_prediccion = PanelPrediccion(host=self)
+        layout.addWidget(self.panel_prediccion)
 
     # ------------------------------------------------------------------
     # TAB LÍNEA DE TIEMPO
@@ -2541,6 +2561,8 @@ class HadarApp(QMainWindow):
                 fuentes_datos=self.fuentes_datos,
                 ml_multivariado_activado=self.ml_multivariado_activado,
                 procedencia=self.procedencia.a_lista(),
+                prediccion=(self.panel_prediccion.config_a_dict()
+                            if hasattr(self, "panel_prediccion") else self.prediccion_config),
             )
         except Exception as e:
             QMessageBox.critical(self, "Error al guardar el proyecto", str(e))
@@ -2617,6 +2639,9 @@ class HadarApp(QMainWindow):
         self.table_model.cargar_notas_manuales(datos_proyecto.notas_manuales)
 
         self.indicadores = [Indicador.from_dict(d) for d in datos_proyecto.indicadores_dict]
+        self.prediccion_config = datos_proyecto.prediccion
+        if hasattr(self, "panel_prediccion"):
+            self.panel_prediccion.cargar_config(self.prediccion_config)
 
         nombre_proyecto = os.path.splitext(os.path.basename(path))[0]
         sufijo_multi_tabla = (

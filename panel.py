@@ -253,16 +253,16 @@ def elegir_periodo(inicio, fin):
     return _PERIODOS[-1][0], _PERIODOS[-1][1]
 
 
-def serie_por_periodo(valores, fechas, contar=False):
-    """Suma de `valores` (o cantidad de filas si contar=True) por período.
-    Devuelve (serie, nombre_del_periodo)."""
+def serie_por_periodo(valores, fechas, contar=False, funcion="sum"):
+    """Suma de `valores` (o cantidad de filas si contar=True; o la función
+    indicada: sum, mean, max, min) por período. Devuelve (serie, nombre)."""
     s = pd.Series(pd.to_numeric(valores, errors="coerce").values, index=pd.DatetimeIndex(fechas.values))
     s = s[~s.index.isna()]
     if s.empty:
         return s, "día"
     regla, nombre = elegir_periodo(s.index.min(), s.index.max())
     grupos = s.resample(regla)
-    return (grupos.size() if contar else grupos.sum()), nombre
+    return (grupos.size() if contar else getattr(grupos, funcion)()), nombre
 
 
 def _partes_de_tendencia(df, fechas, n=PUNTOS_TENDENCIA):

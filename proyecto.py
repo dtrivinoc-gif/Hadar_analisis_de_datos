@@ -73,9 +73,13 @@ def ruta_carpeta_proyectos():
 def guardar_proyecto(ruta, *, tablas, nombre_tabla_activa, relaciones_ontologia,
                       filtro_columna, filtro_valores, notas_manuales, indicadores,
                       ml_activado=False, linea_base_ml=None, fuentes_datos=None,
-                      ml_multivariado_activado=False, procedencia=None):
+                      ml_multivariado_activado=False, procedencia=None, prediccion=None):
     """
     ... (ver parámetros existentes arriba)
+    prediccion: dict con la configuración de la pestaña Predicción (qué tabla,
+        qué columna predecir, qué columnas usar o ignorar). El modelo entrenado
+        NO se guarda: un .hadarproy es un .zip común y los modelos de Python
+        (pickle) pueden ejecutar código al abrirse. Se reentrena con un clic.
     fuentes_datos: dict {nombre_tabla: {"tipo": "archivo"|"sql_server"|"api_pos", ...}}
         de dónde vino cada tabla, para poder "Actualizar desde la fuente"
         más adelante sin volver a pedir todo desde cero.
@@ -111,6 +115,7 @@ def guardar_proyecto(ruta, *, tablas, nombre_tabla_activa, relaciones_ontologia,
         "fuentes_datos": fuentes_datos or {},
         "ml_multivariado_activado": bool(ml_multivariado_activado),
         "procedencia": procedencia or [],
+        "prediccion": prediccion or {},
     }
 
     carpeta = os.path.dirname(ruta)
@@ -132,7 +137,7 @@ class ProyectoCargado:
     def __init__(self, tablas, nombre_tabla_activa, relaciones_ontologia,
                  filtro_columna, filtro_valores, notas_manuales, indicadores_dict,
                  ml_activado=False, linea_base_ml=None, fuentes_datos=None,
-                 ml_multivariado_activado=False, procedencia=None):
+                 ml_multivariado_activado=False, procedencia=None, prediccion=None):
         self.tablas = tablas
         self.nombre_tabla_activa = nombre_tabla_activa
         self.relaciones_ontologia = relaciones_ontologia
@@ -144,6 +149,7 @@ class ProyectoCargado:
         self.linea_base_ml = linea_base_ml or {}
         self.fuentes_datos = fuentes_datos or {}
         self.ml_multivariado_activado = ml_multivariado_activado
+        self.prediccion = prediccion or {}     # config de la pestaña Predicción (dict)
         self.procedencia = procedencia or []   # lista de dicts -- ver procedencia.BitacoraProcedencia.desde_lista
 
 
@@ -181,6 +187,7 @@ def abrir_proyecto(ruta):
             fuentes_datos=metadata.get("fuentes_datos", {}),
             ml_multivariado_activado=metadata.get("ml_multivariado_activado", False),
             procedencia=metadata.get("procedencia", []),
+            prediccion=metadata.get("prediccion", {}),
         )
 
 
