@@ -13,7 +13,8 @@ otra tabla, y Hadar elige sola cuál corresponde mirando los datos:
 
   2. "Una fila tiene muchas" (ej. cada cliente -> muchas compras): no se puede
      pegar todo, así que se RESUME (cantidad, suma, promedio, mínimo y máximo
-     de las columnas numéricas). Aquí hay un riesgo que Hadar cuida: si el
+     de las columnas numéricas y, con fechas, también hace cuánto fue lo último
+     y cuánto ocurrió en los últimos días). Aquí hay un riesgo que Hadar cuida: si el
      resumen incluye compras POSTERIORES a la fila que se quiere predecir,
      el modelo "se entera del futuro" y el resultado sale falsamente bueno.
      Por eso, si la tabla base tiene una columna de fecha y la tabla hija
@@ -184,9 +185,38 @@ def _resumen_total(codigos_base, otra, codigos_otra, nums, prefijo) -> pd.DataFr
     return res
 
 
+def _ventanas_de(span_dias: float) -> list:
+    """Ventanas «lo ocurrido en los últimos…» según cuánto tiempo abarcan los
+    datos de la tabla hija (así sirve igual para datos de días que de años)."""
+    if span_dias >= 90:
+        return [(7, "últimos 7 días"), (30, "últimos 30 días")]
+    if span_dias >= 14:
+        return [(2, "últimos 2 días"), (7, "últimos 7 días")]
+    if span_dias >= 2:
+        return [(0.5, "últimas 12 horas"), (1, "último día")]
+    return []
+
+
+def _acumulado_antes(izq, acum, cols, n, dias=None) -> pd.DataFrame:
+    """Acumulado de `cols` justo ANTES de (fecha de cada fila base - dias).
+    Con dias=None es «antes de la fecha de la fila»."""
+    esq = izq[["__k", "__t", "__pos"]].copy()
+    if dias:
+        esq["__t"] = esq["__t"] - pd.Timedelta(days=dias)
+    esq = esq.sort_values("__t", kind="stable")
+    u = pd.merge_asof(esq, acum[["__k", "__t"] + cols].sort_values("__t", kind="stable"),
+                      on="__t", by="__k", allow_exact_matches=False, direction="backward")
+    return u.set_index("__pos").reindex(range(n))[cols].reset_index(drop=True)
+
+
 def _resumen_previo(codigos_base, fechas_base, otra, codigos_otra, fechas_otra, nums, prefijo) -> pd.DataFrame:
     """Para cada fila base, resume SOLO las filas de la tabla hija con fecha
-    estrictamente anterior (acumulados por clave + unión 'hasta esa fecha')."""
+    estrictamente anterior (acumulados por clave + unión 'hasta esa fecha').
+    Además de cantidad/suma/promedio/mínimo/máximo, agrega:
+      - recencia: días desde el último evento anterior,
+      - ventanas: cantidad (y suma) de lo ocurrido en los últimos N días,
+        con N elegido según el rango de fechas de la tabla hija.
+    Todo mira estrictamente hacia atrás, así que no se «ve el futuro»."""
     n = len(codigos_base)
     validos = np.flatnonzero((codigos_otra >= 0) & fechas_otra.notna().to_numpy())
     h = otra.iloc[validos][nums].apply(pd.to_numeric, errors="coerce").astype("float64").reset_index(drop=True)
@@ -194,8 +224,10 @@ def _resumen_previo(codigos_base, fechas_base, otra, codigos_otra, fechas_otra, 
     h["__t"] = fechas_otra.to_numpy()[validos]
     h = h.sort_values("__t", kind="stable").reset_index(drop=True)
     g_k = h["__k"]
-    acum = pd.DataFrame({"__k": g_k, "__t": h["__t"], "__cant": h.groupby("__k", sort=False).cumcount() + 1})
+    acum = pd.DataFrame({"__k": g_k, "__t": h["__t"], "__tprev": h["__t"],
+                         "__cant": h.groupby("__k", sort=False).cumcount() + 1})
     nombres_cols = {}
+    nums_ventana = nums[:3]
     if nums:
         valores = h[nums]
         cuenta_ok = valores.notna().astype("float64").groupby(g_k).cumsum()
@@ -212,7 +244,10 @@ def _resumen_previo(codigos_base, fechas_base, otra, codigos_otra, fechas_otra, 
             nombres_cols[f"{c}|prom"] = f"{prefijo}.{c} (promedio anterior)"
             nombres_cols[f"{c}|min"] = f"{prefijo}.{c} (mínimo anterior)"
             nombres_cols[f"{c}|max"] = f"{prefijo}.{c} (máximo anterior)"
+        for c in nums_ventana:
+            acum[f"{c}|cs"] = suma[c]          # suma acumulada sin vacíos (para las ventanas)
     nombres_cols["__cant"] = f"{prefijo} (cantidad anterior)"
+    nombres_cols["__tprev"] = "__tprev"
 
     ok = np.flatnonzero((codigos_base >= 0) & fechas_base.notna().to_numpy())
     izq = pd.DataFrame({
@@ -220,11 +255,32 @@ def _resumen_previo(codigos_base, fechas_base, otra, codigos_otra, fechas_otra, 
         "__t": fechas_base.to_numpy()[ok],
         "__pos": ok,
     }).sort_values("__t", kind="stable")
-    union = pd.merge_asof(izq, acum.sort_values("__t", kind="stable"), on="__t", by="__k",
+    union = pd.merge_asof(izq, acum.drop(columns=[c for c in acum.columns if c.endswith("|cs")])
+                          .sort_values("__t", kind="stable"), on="__t", by="__k",
                           allow_exact_matches=False, direction="backward")
     union = union.set_index("__pos").reindex(range(n))
-    res = union[[c for c in nombres_cols]].rename(columns=nombres_cols).reset_index(drop=True)
+    res = union[[c for c in nombres_cols if c != "__tprev"]].rename(columns=nombres_cols).reset_index(drop=True)
     res[nombres_cols["__cant"]] = res[nombres_cols["__cant"]].fillna(0)
+
+    # --- recencia: días desde el último evento anterior -----------------
+    ult = pd.to_datetime(union["__tprev"]).reset_index(drop=True)
+    t_fila = pd.Series(pd.to_datetime(fechas_base.to_numpy()), index=range(n))
+    res[f"{prefijo} (días desde la última)"] = ((t_fila - ult).dt.total_seconds() / 86400.0).clip(lower=0)
+
+    # --- ventanas: lo ocurrido en los últimos N días --------------------
+    if len(acum):
+        span = float((acum["__t"].max() - acum["__t"].min()).total_seconds() / 86400.0)
+        ventanas = _ventanas_de(span)
+        if ventanas:
+            cols_cum = ["__cant"] + [f"{c}|cs" for c in nums_ventana]
+            fin = _acumulado_antes(izq, acum, cols_cum, n)
+            for i, (dias, etq) in enumerate(ventanas):
+                ini = _acumulado_antes(izq, acum, cols_cum, n, dias)
+                res[f"{prefijo} (cantidad, {etq})"] = (fin["__cant"].fillna(0) - ini["__cant"].fillna(0))
+                if i == len(ventanas) - 1:
+                    for c in nums_ventana:
+                        res[f"{prefijo}.{c} (suma, {etq})"] = (
+                            fin[f"{c}|cs"].fillna(0) - ini[f"{c}|cs"].fillna(0))
     return res
 
 
