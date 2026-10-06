@@ -73,6 +73,39 @@ def read_sql_file(file_path: str, table_name: str = None) -> pd.DataFrame:
     return df
 
 
+def read_sqlite_file(file_path: str, table_name: str = None) -> pd.DataFrame:
+    """Lee una tabla desde un archivo de base de datos SQLite ya existente
+    en disco (.sqlite, .db, .sqlite3). A diferencia de read_sql_file()
+    -- que ejecuta un script .sql de texto (CREATE TABLE/INSERT) sobre una
+    base temporal en memoria --, esto abre directamente el archivo binario
+    SQLite y lee una de sus tablas tal cual están guardadas."""
+    try:
+        conn = sqlite3.connect(file_path)
+    except Exception as e:
+        raise ValueError(f"No se pudo abrir el archivo SQLite: {e}")
+
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
+        tables = [row[0] for row in cur.fetchall()]
+
+        if not tables:
+            raise ValueError("El archivo SQLite no contiene ninguna tabla.")
+
+        if table_name is None:
+            if len(tables) == 1:
+                table_name = tables[0]
+            else:
+                raise SqlMultipleTablesError(tables)
+
+        try:
+            return pd.read_sql_query(f"SELECT * FROM [{table_name}]", conn)
+        except Exception as e:
+            raise ValueError(f"No se pudo leer la tabla '{table_name}': {e}") from e
+    finally:
+        conn.close()
+
+
 def _parquet_row_count(file_path: str):
     """Intenta leer el N° de filas desde los metadatos del Parquet, sin
     cargar los datos. Devuelve None si no se puede determinar."""
@@ -164,13 +197,21 @@ def load_data(file_path: str):
     # ---- Camino Pandas (archivos chicos/medianos, .sql, o fallback) ----
     if ext == ".csv":
         encodings = ["utf-8", "latin-1", "cp1252"]
+        # None = deja que pandas adivine el separador (funciona para la
+        # mayoría de los CSV, incluyendo los que usan ';' o tabulador).
+        # Si eso falla, se reintenta forzando coma: algunos exports (p.ej.
+        # reportes de punto de venta con saltos de línea dentro de
+        # encabezados entre comillas) confunden al sniffer y lo hacen
+        # calcular mal la cantidad de columnas.
+        separadores = [None, ","]
         last_error = None
         for enc in encodings:
-            try:
-                return pd.read_csv(file_path, encoding=enc, sep=None, engine="python"), "pandas"
-            except Exception as e:
-                last_error = e
-                continue
+            for sep in separadores:
+                try:
+                    return pd.read_csv(file_path, encoding=enc, sep=sep, engine="python"), "pandas"
+                except Exception as e:
+                    last_error = e
+                    continue
         raise ValueError(f"Error al leer CSV: {last_error}")
     elif ext == ".xls":
         try:
@@ -189,6 +230,8 @@ def load_data(file_path: str):
             raise ValueError(f"Error al leer Parquet: {e}")
     elif ext == ".sql":
         return read_sql_file(file_path), "pandas"
+    elif ext in (".sqlite", ".db", ".sqlite3"):
+        return read_sqlite_file(file_path), "pandas"
     else:
         return pd.read_excel(file_path), "pandas"
 

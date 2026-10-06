@@ -1115,8 +1115,8 @@ def build_stylesheet(colors):
     QTabBar::tab {{
         background: {colors['card']};
         border: 1px solid {colors['border']};
-        padding: 8px 16px;
-        margin-right: 4px;
+        padding: 5px 11px;
+        margin-right: 3px;
         border-top-left-radius: 6px;
         border-top-right-radius: 6px;
         color: {colors['text']};

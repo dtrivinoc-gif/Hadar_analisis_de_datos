@@ -35,7 +35,7 @@ from .config import (
     URL_POS_SINCRONIZACION, API_KEY_POS_SINCRONIZACION,
 )
 from .io_datos import (
-    SqlMultipleTablesError, read_sql_file, load_data, _excel_sheet_names,
+    SqlMultipleTablesError, read_sql_file, read_sqlite_file, load_data, _excel_sheet_names,
     SqlServerNoDisponible, listar_tablas_sql_server, leer_tabla_sql_server,
     PosNoDisponible, verificar_conexion_pos, listar_tablas_pos, leer_tabla_pos,
     cast_valor_a_dtype,
@@ -1276,7 +1276,8 @@ class HadarApp(QMainWindow):
         # arman la ontología (esquema sugerido entre tablas).
         paths, _ = QFileDialog.getOpenFileNames(
             self, "Cargar archivo(s) de datos", "",
-            "Archivos de Datos (*.csv *.xlsx *.xls *.parquet *.sql);;Todos los archivos (*.*)"
+            "Archivos de Datos (*.csv *.xlsx *.xls *.parquet *.sql *.sqlite *.db *.sqlite3)"
+            ";;Todos los archivos (*.*)"
         )
         if not paths:
             return
@@ -1297,10 +1298,11 @@ class HadarApp(QMainWindow):
                     continue
                 elegidas = dialogo.tablas_elegidas()
 
+                leer_tabla = read_sqlite_file if ext in (".sqlite", ".db", ".sqlite3") else read_sql_file
                 tablas_del_archivo = []
                 for nombre_tabla_sql in elegidas:
                     try:
-                        df_sql = read_sql_file(path, table_name=nombre_tabla_sql)
+                        df_sql = leer_tabla(path, table_name=nombre_tabla_sql)
                     except Exception as ex:
                         errores.append(f"{os.path.basename(path)} · {nombre_tabla_sql}: {ex}")
                         continue
