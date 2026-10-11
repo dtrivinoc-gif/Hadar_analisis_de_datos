@@ -14,7 +14,8 @@ otra tabla, y Hadar elige sola cuál corresponde mirando los datos:
   2. "Una fila tiene muchas" (ej. cada cliente -> muchas compras): no se puede
      pegar todo, así que se RESUME (cantidad, suma, promedio, mínimo y máximo
      de las columnas numéricas y, con fechas, también hace cuánto fue lo último
-     y cuánto ocurrió en los últimos días). Aquí hay un riesgo que Hadar cuida: si el
+     y cuánto ocurrió en los últimos días; de las columnas de texto con pocos valores, el último
+  valor conocido o cuántos valores distintos hubo). Aquí hay un riesgo que Hadar cuida: si el
      resumen incluye compras POSTERIORES a la fila que se quiere predecir,
      el modelo "se entera del futuro" y el resultado sale falsamente bueno.
      Por eso, si la tabla base tiene una columna de fecha y la tabla hija
@@ -46,6 +47,7 @@ MAX_COLS_AGG = 8            # columnas numéricas que se resumen por tabla hija
 MAX_COLS_POR_TABLA = 60     # columnas que se traen de una tabla "una fila"
 MAX_COLUMNAS_NUEVAS = 200
 MAX_PROFUNDIDAD = 3
+MAX_CATEGORIAS_RESUMEN = 4   # columnas de texto/categoría que se resumen por tabla hija
 SIN_FECHA = "__ninguna__"
 
 
@@ -167,7 +169,23 @@ def _traer_una_fila(codigos_base, otra, codigos_otra, columnas, prefijo) -> pd.D
     return alineado
 
 
-def _resumen_total(codigos_base, otra, codigos_otra, nums, prefijo) -> pd.DataFrame:
+def _columnas_categoricas_resumen(df: pd.DataFrame, excluir) -> list:
+    """Columnas de texto/categoría con pocos valores distintos que vale la pena
+    resumir (nunca se copian todas las categorías: solo señales compactas)."""
+    out = []
+    ex = set(excluir or ())
+    for c in df.columns:
+        if c in ex or es_columna_id(c):
+            continue
+        s = df[c]
+        if tipo_columna(s) in ("categorica", "booleana") and 2 <= s.nunique(dropna=True) <= 50:
+            out.append(c)
+        if len(out) >= MAX_CATEGORIAS_RESUMEN:
+            break
+    return out
+
+
+def _resumen_total(codigos_base, otra, codigos_otra, nums, prefijo, cats=()) -> pd.DataFrame:
     validos = np.flatnonzero(codigos_otra >= 0)
     h = otra.iloc[validos][nums].apply(pd.to_numeric, errors="coerce").astype("float64")
     k = codigos_otra[validos]
@@ -180,6 +198,12 @@ def _resumen_total(codigos_base, otra, codigos_otra, nums, prefijo) -> pd.DataFr
         for c in nums:
             for est, etiqueta in nombres.items():
                 salida[f"{prefijo}.{c} ({etiqueta})"] = agg[(c, est)]
+    for c in cats:
+        try:
+            distintos = otra.iloc[validos][c].groupby(k).nunique(dropna=True)
+            salida[f"{prefijo}.{c} (valores distintos)"] = distintos
+        except Exception:
+            pass
     res = salida.reindex(codigos_base).reset_index(drop=True)
     res[f"{prefijo} (cantidad)"] = res[f"{prefijo} (cantidad)"].fillna(0)
     return res
@@ -207,6 +231,35 @@ def _acumulado_antes(izq, acum, cols, n, dias=None) -> pd.DataFrame:
     u = pd.merge_asof(esq, acum[["__k", "__t"] + cols].sort_values("__t", kind="stable"),
                       on="__t", by="__k", allow_exact_matches=False, direction="backward")
     return u.set_index("__pos").reindex(range(n))[cols].reset_index(drop=True)
+
+
+def _resumen_categorias_previas(codigos_base, fechas_base, otra, codigos_otra, fechas_otra, cats, prefijo):
+    """Último valor de cada categoría conocido ESTRICTAMENTE antes de la fecha de
+    cada fila base (igual criterio que _resumen_previo: no se «ve el futuro»).
+    merge_asof exige que la clave «on» (la fecha) esté ordenada de forma global;
+    el orden por (clave, fecha) no sirve y hacía fallar el cruce sin avisar."""
+    n = len(codigos_base)
+    res = pd.DataFrame(index=np.arange(n))
+    if not cats or n == 0:
+        return res
+    izq = pd.DataFrame({"__k": np.asarray(codigos_base, dtype="int64"),
+                        "__t": pd.Series(fechas_base).to_numpy(),
+                        "__pos": np.arange(n)})
+    der = pd.DataFrame({"__k": np.asarray(codigos_otra, dtype="int64"),
+                        "__t": pd.Series(fechas_otra).to_numpy()})
+    for c in cats:
+        der[c] = otra[c].to_numpy()
+    izq = izq[(izq["__k"] >= 0) & izq["__t"].notna()].sort_values("__t", kind="stable")
+    der = der[(der["__k"] >= 0) & der["__t"].notna()].sort_values("__t", kind="stable")
+    if izq.empty or der.empty:
+        return res
+    m = pd.merge_asof(izq, der, on="__t", by="__k", direction="backward", allow_exact_matches=False)
+    pos = m["__pos"].to_numpy()
+    for c in cats:
+        col = np.full(n, np.nan, dtype=object)
+        col[pos] = m[c].to_numpy()
+        res[f"{prefijo}.{c} (último valor anterior)"] = col
+    return res
 
 
 def _resumen_previo(codigos_base, fechas_base, otra, codigos_otra, fechas_otra, nums, prefijo) -> pd.DataFrame:
@@ -288,11 +341,14 @@ def _resumen_previo(codigos_base, fechas_base, otra, codigos_otra, fechas_otra, 
 # Ampliar una tabla (recursivo, con límite de saltos)
 # ----------------------------------------------------------------------
 class _Contexto:
-    def __init__(self, tablas, enlaces, fecha_base, base):
+    def __init__(self, tablas, enlaces, fecha_base, base, columnas_excluir=None):
         self.tablas = tablas
         self.enlaces = enlaces
         self.fecha_base = fecha_base
         self.base = base
+        # Columnas que nunca se traen desde otras tablas. Predicción pasa aquí la
+        # columna objetivo: protección extra contra que la respuesta llegue por otro camino.
+        self.columnas_excluir = set(str(x) for x in (columnas_excluir or ()))
         self.advertencias = []
         self.info = {}
         self.claves_base = set()
@@ -325,6 +381,12 @@ def _ampliar(nombre, prof, camino, ctx: _Contexto, fechas_base=None) -> pd.DataF
         otra_df = _ampliar(otra, prof - 1, camino + [nombre], ctx) if prof > 1 else ctx.tablas[otra].reset_index(drop=True)
         cb, co = _codigos(df[col_propia], otra_df[col_otra])
         if es_base:
+            # «sin pareja» = clave vacía o que no aparece en la otra tabla (los códigos de
+            # _codigos existen para todas las claves, así que no basta mirar cb < 0)
+            con_pareja = np.isin(cb, co[co >= 0]) if len(co) else np.zeros(len(cb), dtype=bool)
+            if len(cb) and float(1.0 - con_pareja.mean()) > 0.30:
+                ctx.avisar(f"Más del 30% de las filas de «{nombre}» no tiene dato en «{otra}» "
+                           f"(unión por {col_propia}): esa relación puede aportar poco.")
             ctx.claves_base.add(col_propia)
         unica = _es_unica(co)
 
@@ -332,7 +394,8 @@ def _ampliar(nombre, prof, camino, ctx: _Contexto, fechas_base=None) -> pd.DataF
         prefijos_usados.add(otra)
 
         if unica:
-            traer = [c for c in otra_df.columns if c != col_otra and not es_columna_id(c)][:MAX_COLS_POR_TABLA]
+            traer = [c for c in otra_df.columns if c != col_otra and not es_columna_id(c)
+                     and str(c) not in ctx.columnas_excluir][:MAX_COLS_POR_TABLA]
             if not traer:
                 continue
             bloque = _traer_una_fila(cb, otra_df, co, traer, f"{base_pref}.")
@@ -347,7 +410,9 @@ def _ampliar(nombre, prof, camino, ctx: _Contexto, fechas_base=None) -> pd.DataF
             ctx.avisar(f"Se omitió resumir «{otra}» desde «{nombre}»: con fecha, solo se resumen "
                        f"tablas que cuelgan directamente de la tabla base (para no mezclar el futuro).")
             continue
-        nums = _columnas_numericas(otra_df, {col_otra})
+        nums = [c for c in _columnas_numericas(otra_df, {col_otra}) if str(c) not in ctx.columnas_excluir]
+        cats = [c for c in _columnas_categoricas_resumen(otra_df, {col_otra})
+                if str(c) not in ctx.columnas_excluir]
         fecha_otra = _fecha_de_tabla(otra_df, excluir={col_otra}) if usa_fecha else None
         if usa_fecha and fecha_otra is None:
             ctx.avisar(f"«{otra}» no tiene columna de fecha: se resumió todo su historial, que puede "
@@ -358,10 +423,14 @@ def _ampliar(nombre, prof, camino, ctx: _Contexto, fechas_base=None) -> pd.DataF
         if not (cb >= 0).any() or not (co >= 0).any():
             continue
         if usa_fecha and fecha_otra is not None:
-            bloque = _resumen_previo(cb, fechas_base, otra_df, co, _fecha_ns(otra_df[fecha_otra]), nums, base_pref)
+            fechas_otra = _fecha_ns(otra_df[fecha_otra])
+            bloque = _resumen_previo(cb, fechas_base, otra_df, co, fechas_otra, nums, base_pref)
+            if cats:
+                previas = _resumen_categorias_previas(cb, fechas_base, otra_df, co, fechas_otra, cats, base_pref)
+                bloque = pd.concat([bloque, previas], axis=1)
             nota = f"Resumen de «{otra}» por {col_propia}, solo con lo anterior a la fecha de cada fila"
         else:
-            bloque = _resumen_total(cb, otra_df, co, nums, base_pref)
+            bloque = _resumen_total(cb, otra_df, co, nums, base_pref, cats)
             nota = f"Resumen de «{otra}» por {col_propia} (todo el historial)"
         if not _es_unica(cb) and not unica:
             ctx.avisar(f"La relación entre «{nombre}» y «{otra}» es de muchos a muchos: el resumen es aproximado.")
@@ -384,7 +453,7 @@ class Ampliacion:
 
 
 def construir_tabla_ampliada(tablas: dict, base: str, enlaces: list, profundidad: int = 2,
-                             fecha_base: str | None = None) -> Ampliacion:
+                             fecha_base: str | None = None, columnas_excluir=None) -> Ampliacion:
     """La tabla `base` con las mismas filas y el mismo orden, más columnas
     traídas de las tablas relacionadas (ver explicación arriba)."""
     if base not in tablas:
@@ -394,7 +463,7 @@ def construir_tabla_ampliada(tablas: dict, base: str, enlaces: list, profundidad
         raise ValueError(f"La tabla «{base}» necesita la columna de fecha «{fecha_base}» "
                          f"para resumir las tablas relacionadas.")
     profundidad = int(min(max(profundidad, 1), MAX_PROFUNDIDAD))
-    ctx = _Contexto(tablas, _sin_repetidos(enlaces), fecha_base, base)
+    ctx = _Contexto(tablas, _sin_repetidos(enlaces), fecha_base, base, columnas_excluir=columnas_excluir)
     fechas = _fecha_ns(original[fecha_base]) if fecha_base else None
     amp = _ampliar(base, profundidad, [], ctx, fechas_base=fechas)
 
@@ -461,7 +530,9 @@ def preparar(tablas: dict, config, relaciones_ontologia) -> PreparacionRelaciona
     enlaces = [e for e in enlaces_disponibles(tablas, relaciones_ontologia, config)
                if e.clave() not in desactivados]
     fecha = elegir_fecha_base(tablas[train], config)
-    amp = construir_tabla_ampliada(tablas, train, enlaces, config.profundidad_relaciones, fecha)
+    excluir = {config.objetivo} if config.objetivo else None
+    amp = construir_tabla_ampliada(tablas, train, enlaces, config.profundidad_relaciones, fecha,
+                                   columnas_excluir=excluir)
 
     df_prueba, advertencias = None, list(amp.advertencias)
     if prueba and prueba in tablas:
@@ -478,7 +549,8 @@ def preparar(tablas: dict, config, relaciones_ontologia) -> PreparacionRelaciona
         # La tabla de entrenamiento no es fuente de datos al ampliar la de prueba.
         tablas_prueba = {n: d for n, d in tablas.items() if n != train}
         utiles = [e for e in utiles if e.tabla_a in tablas_prueba and e.tabla_b in tablas_prueba]
-        amp_p = construir_tabla_ampliada(tablas_prueba, prueba, utiles, config.profundidad_relaciones, fecha)
+        amp_p = construir_tabla_ampliada(tablas_prueba, prueba, utiles, config.profundidad_relaciones, fecha,
+                                         columnas_excluir=excluir)
         df_prueba = amp_p.df
         for a in amp_p.advertencias:
             if a not in advertencias:

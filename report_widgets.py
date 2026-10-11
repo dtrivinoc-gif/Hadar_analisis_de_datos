@@ -20,8 +20,15 @@ REPORTE_COLOR_ROJO = "#DC2626"
 
 # Opciones de formato de texto deliberadamente acotadas (espíritu Hadar: lo
 # necesario, no todo lo que existe en Word).
-REPORTE_FUENTES = ["Arial", "Calibri", "Times New Roman"]
+REPORTE_FUENTE_SERIFA = "Georgia"   # la misma serifa de la pestaña Gráficos
+REPORTE_FUENTES = [REPORTE_FUENTE_SERIFA, "Arial", "Calibri", "Times New Roman"]
 REPORTE_TAMANOS = [10, 12, 14, 18, 24, 32]
+
+# Estilo Tufte: la "tinta" son los datos, no el marco. Con True, las cajas no
+# llevan borde en reposo; el marco, el tirador de redimensionar y el botón de
+# actualizar aparecen solo al pasar el mouse o al seleccionar la caja.
+# Poner False para volver al marco fijo de antes.
+REPORTE_CAJA_SOLO_AL_USAR = True
 
 
 class EditableTextItem(QGraphicsTextItem):
@@ -60,6 +67,7 @@ class ReportBoxItem(QGraphicsRectItem):
 
     def __init__(self, kind, rect: QRectF, colors, ventana_principal=None, con_refresh=True, titulo=None):
         super().__init__(0, 0, rect.width(), rect.height())
+        self._hover = False
         self.kind = kind
         self.shape_kind = "rect"
         self.colors = colors
@@ -89,7 +97,7 @@ class ReportBoxItem(QGraphicsRectItem):
         self.titulo_calculo = None
         self.valor_crudo = None
 
-        fuente_base = QFont("Arial", 12)
+        fuente_base = QFont(REPORTE_FUENTE_SERIFA, 12)
 
         if kind == "texto":
             self.text_item = EditableTextItem(self)
@@ -113,15 +121,39 @@ class ReportBoxItem(QGraphicsRectItem):
             if titulo:
                 self.titulo_item = QGraphicsTextItem(titulo, self)
                 self.titulo_item.setDefaultTextColor(QColor(REPORTE_PAPEL_TINTA))
-                fuente_titulo = QFont()
-                fuente_titulo.setPointSize(9)
-                fuente_titulo.setBold(True)
+                fuente_titulo = QFont(REPORTE_FUENTE_SERIFA)
+                fuente_titulo.setPointSize(10)
                 self.titulo_item.setFont(fuente_titulo)
                 self.titulo_item.setPos(6, 2)
                 self.titulo_item.setTextWidth(max(20, rect.width() - 30))
             self.pixmap_item.setPos(4, self._alto_titulo())
             if con_refresh:  # las imágenes subidas a mano no llevan botón de actualizar
                 self._crear_boton_refresh(rect)
+        self._actualizar_cromo()
+
+    # -- "cromo" (marco, tirador, botón de actualizar): solo al usar ----
+    def _cromo_visible(self):
+        return (not REPORTE_CAJA_SOLO_AL_USAR) or self._hover or self.isSelected()
+
+    def _actualizar_cromo(self):
+        if self.btn_refresh is not None:
+            self.btn_refresh.setVisible(self._cromo_visible())
+        self.update()
+
+    def hoverEnterEvent(self, event):
+        self._hover = True
+        self._actualizar_cromo()
+        super().hoverEnterEvent(event)
+
+    def hoverLeaveEvent(self, event):
+        self._hover = False
+        self._actualizar_cromo()
+        super().hoverLeaveEvent(event)
+
+    def itemChange(self, change, value):
+        if change == QGraphicsItem.GraphicsItemChange.ItemSelectedHasChanged:
+            self._actualizar_cromo()
+        return super().itemChange(change, value)
 
     def _alto_titulo(self):
         return 24 if self.titulo_item is not None else 4
@@ -173,9 +205,9 @@ class ReportBoxItem(QGraphicsRectItem):
         color_titulo = REPORTE_PAPEL_MUTED
         color_valor = REPORTE_PAPEL_TINTA
         html = (
-            "<div style='text-align:center'>"
-            f"<span style='font-size:10pt;color:{color_titulo}'>{titulo}</span><br>"
-            f"<span style='font-size:20pt;font-weight:bold;color:{color_valor}'>{valor_str}</span>"
+            f"<div style=\"text-align:center; font-family:'{REPORTE_FUENTE_SERIFA}'\">"
+            f"<span style='font-size:9pt;color:{color_titulo}'>{titulo}</span><br>"
+            f"<span style='font-size:24pt;color:{color_valor}'>{valor_str}</span>"
             "</div>"
         )
         self.text_item.setHtml(html)
@@ -187,8 +219,10 @@ class ReportBoxItem(QGraphicsRectItem):
         color_titulo = REPORTE_PAPEL_MUTED
         color_texto = REPORTE_PAPEL_TINTA
         html = (
-            f"<span style='font-size:10pt;font-weight:bold;color:{color_titulo}'>{titulo}</span><br>"
+            f"<div style=\"font-family:'{REPORTE_FUENTE_SERIFA}'\">"
+            f"<span style='font-size:10pt;color:{color_titulo}'>{titulo}</span><br>"
             f"<span style='font-size:9pt;color:{color_texto}'>{cuerpo_html}</span>"
+            "</div>"
         )
         self.text_item.setHtml(html)
         self.text_item.setTextWidth(max(20, self.rect().width() - 16))
@@ -217,7 +251,7 @@ class ReportBoxItem(QGraphicsRectItem):
     # -- interacción: mover / redimensionar / refrescar -----------------
     def mousePressEvent(self, event):
         pos = event.pos()
-        if self.btn_refresh is not None:
+        if self.btn_refresh is not None and self.btn_refresh.isVisible():
             zona_boton = self.btn_refresh.mapToParent(self.btn_refresh.boundingRect()).boundingRect()
             if zona_boton.contains(pos):
                 self.hacer_refresh()
@@ -281,18 +315,29 @@ class ReportBoxItem(QGraphicsRectItem):
                 self.scene().removeItem(self)
 
     def paint(self, painter, option, widget=None):
-        if self.shape_kind == "ellipse":
-            painter.setBrush(self.brush())
-            painter.setPen(self.pen())
+        activo = self._cromo_visible()
+        es_elipse = self.shape_kind == "ellipse"
+        # El marco se ve: en reposo solo si la forma ES el contenido (óvalo) o si
+        # se desactivó el modo limpio; al usar la caja, fino y discreto.
+        if self.isSelected():
+            pluma = QPen(QColor(COLOR_ACCENT_2), 1)
+        elif self._hover:
+            pluma = QPen(QColor(REPORTE_PAPEL_BORDE), 1)
+        elif es_elipse or not REPORTE_CAJA_SOLO_AL_USAR:
+            pluma = self.pen()
+        else:
+            pluma = QPen(Qt.PenStyle.NoPen)
+        painter.setBrush(self.brush())
+        painter.setPen(pluma)
+        if es_elipse:
             painter.drawEllipse(self.rect())
         else:
-            painter.setBrush(self.brush())
-            painter.setPen(self.pen())
-            painter.drawRoundedRect(self.rect(), 6, 6)
-        # Tirador visual de redimensionar, esquina inferior derecha.
+            painter.drawRect(self.rect())
+        if not activo:
+            return
+        # Tirador de redimensionar, esquina inferior derecha.
         r = self.rect()
-        pluma = QPen(QColor(REPORTE_PAPEL_MUTED), 1)
-        painter.setPen(pluma)
+        painter.setPen(QPen(QColor(REPORTE_PAPEL_MUTED), 1))
         painter.drawLine(int(r.width() - 10), int(r.height() - 2), int(r.width() - 2), int(r.height() - 10))
         painter.drawLine(int(r.width() - 6), int(r.height() - 2), int(r.width() - 2), int(r.height() - 6))
 

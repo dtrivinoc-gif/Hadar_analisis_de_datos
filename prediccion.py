@@ -649,6 +649,50 @@ class ResultadoEntrenamiento:
 # ----------------------------------------------------------------------
 # Entrenar
 # ----------------------------------------------------------------------
+def diagnosticar_variables(df: pd.DataFrame, objetivo: str, columnas: list, tipo: str) -> list:
+    """Busca columnas que podrían ser «trampa» (contener ya la respuesta).
+
+    Solo AVISA: nunca quita columnas, el usuario decide. Devuelve [(columna, motivo)].
+    Es barato a propósito (trabaja con una muestra y mira solo categorías con
+    muchas filas cada una) para no pesar en archivos grandes.
+      - Número casi idéntico al objetivo numérico (correlación >= UMBRAL_FUGA).
+      - Categoría/sí-no cuyos valores casi determinan el objetivo, y que además
+        acierta bastante más que simplemente responder lo más frecuente."""
+    muestra = df if len(df) <= MUESTRA_DIAGNOSTICO else df.sample(MUESTRA_DIAGNOSTICO, random_state=0)
+    y = muestra[objetivo]
+    yn = pd.to_numeric(y, errors="coerce") if tipo == "regresion" else None
+    y_txt = y.astype(str) if tipo == "clasificacion" else None
+    salida = []
+    for c in columnas:
+        if c not in muestra.columns or c == objetivo:
+            continue
+        s = muestra[c]
+        try:
+            t = tipo_columna(s)
+            if tipo == "regresion" and t in ("numerica", "numerica_texto"):
+                xn = pd.to_numeric(s, errors="coerce")
+                ok = xn.notna() & yn.notna()
+                if ok.sum() >= MINIMO_FILAS and xn[ok].nunique() > 1 and yn[ok].nunique() > 1:
+                    r = abs(float(np.corrcoef(xn[ok].to_numpy(float), yn[ok].to_numpy(float))[0, 1]))
+                    if np.isfinite(r) and r >= UMBRAL_FUGA:
+                        salida.append((str(c), f"es casi una copia de «{objetivo}» (correlación {r:.3f})"))
+            elif tipo == "clasificacion" and t in ("categorica", "booleana"):
+                nn = int(s.notna().sum())
+                nun = int(s.nunique(dropna=True))
+                # pocas categorías y con bastantes filas cada una (si no, acertar es trivial)
+                if nn < MINIMO_FILAS or not (2 <= nun <= 50) or nn / nun < 20:
+                    continue
+                par = pd.DataFrame({"x": s.astype(str), "y": y_txt})[s.notna().to_numpy()]
+                por_cat = par.groupby("x")["y"].agg(lambda v: v.value_counts().iloc[0])
+                pureza = float(por_cat.sum() / len(par))
+                frecuente = float(par["y"].value_counts(normalize=True).iloc[0])
+                if pureza >= 0.995 and pureza - frecuente >= 0.02:
+                    salida.append((str(c), f"sus valores casi determinan «{objetivo}» ({pureza * 100:.1f}% de las filas)"))
+        except Exception:
+            continue
+    return salida
+
+
 def _crear_modelo(tipo, config, mascara, n_filas, n_iter=None, parar_antes=True):
     from sklearn.ensemble import HistGradientBoostingClassifier, HistGradientBoostingRegressor
     clase = HistGradientBoostingRegressor if tipo == "regresion" else HistGradientBoostingClassifier
@@ -867,6 +911,14 @@ def entrenar(df: pd.DataFrame, config: ConfigPrediccion, columnas: list,
             advertencias.append(
                 "Hay una columna de fecha. Si vas a predecir el futuro, prueba «Por fecha»: es más exigente y se "
                 "parece más a lo que pasará en la realidad.")
+
+    # --- columnas que podrían contener ya la respuesta (solo aviso) ----
+    sospechosas = diagnosticar_variables(datos, obj, columnas, tipo)
+    if sospechosas:
+        lista = "; ".join(f"«{c}» {motivo}" for c, motivo in sospechosas[:4])
+        advertencias.append(
+            "Ojo, estas columnas podrían ser una trampa (ya contienen la respuesta o algo que solo se sabe "
+            "después): " + lista + ". Si no las tendrías al momento de predecir, desmárcalas en el Paso 2.")
 
     # --- partir en pruebas --------------------------------------------
     partes = _separar(tipo, config, yt, n, fechas, grupos)

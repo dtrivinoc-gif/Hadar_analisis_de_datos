@@ -16,11 +16,24 @@ from PySide6.QtGui import QColor, QFont, QPainter, QPainterPath, QPen, QBrush, Q
 from PySide6.QtWidgets import (
     QWidget, QMainWindow, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QComboBox, QListWidget, QTableView, QTabWidget, QScrollArea, QFrame,
-    QLineEdit, QRadioButton, QHeaderView, QCheckBox, QTabBar, QSpinBox,
+    QLineEdit, QRadioButton, QHeaderView, QCheckBox, QTabBar, QSpinBox, QMessageBox, QDialog,
+    QSizePolicy,
 )
 
 from .config import CHART_TYPES, DONUT_PALETTE, COLOR_ACCENT, COLOR_ACCENT_3, COLOR_HOVER, COLOR_DANGER
 from .io_datos import fetch_uf_online
+from .filtro_filas import aplicar_filtro, describir_filtro, DialogoFiltroFilas
+
+# Tipografía y color de las OPCIONES de cada gráfico (mismo estilo "Tufte" de la
+# pestaña Frecuencias). Solo afecta a los controles, no al gráfico en sí.
+_FUENTE_SERIFA = '"Georgia", "Cambria", "Times New Roman", serif'
+
+
+def _rgba(color_hex, alfa):
+    """'#6366f1' + 0.15 -> 'rgba(99, 102, 241, 0.15)' para usar en QSS."""
+    c = QColor(color_hex)
+    return f"rgba({c.red()}, {c.green()}, {c.blue()}, {alfa})"
+
 
 # ----------------------------------------------------------------------------
 # Worker para consultar la UF online
@@ -216,6 +229,7 @@ def _es_etiqueta_real(etiqueta):
 class ChartPanel(QWidget):
     removeRequested = Signal(object)
     categoryClicked = Signal(str, object)
+    panelRequested = Signal(object)   # "Al Panel": pide enviar este gráfico a la pestaña Panel
 
     def __init__(self, colors, parent=None):
         super().__init__(parent)
@@ -227,6 +241,8 @@ class ChartPanel(QWidget):
         self._bar_xvals = []
         self.x_es_fecha = False
         self._click_habilitado = True
+        self.filtro = None            # filtro de filas de ESTE gráfico (ver filtro_filas.py)
+        self._proveedor_df = None     # función que entrega el df con el que se pueden listar valores
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -236,27 +252,40 @@ class ChartPanel(QWidget):
         card_layout = QVBoxLayout(self.card)
         outer.addWidget(self.card)
 
-        controls_top = QHBoxLayout()
-        card_layout.addLayout(controls_top)
-        controls_bottom = QHBoxLayout()
-        card_layout.addLayout(controls_bottom)
+        # ---- OPCIONES del gráfico ----------------------------------------
+        # Diseño "Tufte" (como Frecuencias): sin cajas, cada opción con su
+        # rótulo chico arriba y una línea fina debajo. Los widgets, sus
+        # nombres y lo que hacen son los de siempre; el gráfico de más abajo
+        # no se toca.
+        self.opciones = QWidget()
+        self.opciones.setObjectName("gfxOpciones")
+        opciones_layout = QVBoxLayout(self.opciones)
+        opciones_layout.setContentsMargins(4, 2, 4, 6)
+        opciones_layout.setSpacing(12)
+        card_layout.addWidget(self.opciones)
 
-        controls_top.addWidget(QLabel("Nombre:"))
+        fila_1 = QHBoxLayout()
+        fila_1.setSpacing(24)
+        opciones_layout.addLayout(fila_1)
+        fila_2 = QHBoxLayout()
+        fila_2.setSpacing(24)
+        opciones_layout.addLayout(fila_2)
+
+        # Fila 1: qué gráfico es y cómo se calcula.
         self.name_edit = QLineEdit()
         self.name_edit.setPlaceholderText("Sin título")
         self.name_edit.setMaximumWidth(160)
         self.name_edit.setToolTip(
             "Nombre opcional para identificar este gráfico y usarlo como título en el Reporte."
         )
-        controls_top.addWidget(self.name_edit)
+        self.grp_nombre, _ = self._grupo_opcion("NOMBRE", self.name_edit)
+        fila_1.addWidget(self.grp_nombre, 0, Qt.AlignBottom)
 
-        controls_top.addWidget(QLabel("Tipo:"))
         self.combo_type = QComboBox()
         self.combo_type.addItems(CHART_TYPES)
-        controls_top.addWidget(self.combo_type)
+        self.grp_tipo, _ = self._grupo_opcion("TIPO", self.combo_type)
+        fila_1.addWidget(self.grp_tipo, 0, Qt.AlignBottom)
 
-        self.lbl_agg = QLabel("Calcular:")
-        controls_top.addWidget(self.lbl_agg)
         self.combo_agg = QComboBox()
         self.combo_agg.addItems(["Automático", "Suma", "Promedio", "Máximo", "Mínimo", "Cada fila"])
         self.combo_agg.setToolTip(
@@ -265,21 +294,26 @@ class ChartPanel(QWidget):
             "Automático: suma los valores de cada categoría.\n"
             "Cada fila: no agrupa, dibuja una barra por fila de la tabla."
         )
-        controls_top.addWidget(self.combo_agg)
+        self.grp_agg, self.lbl_agg = self._grupo_opcion("CALCULAR", self.combo_agg)
+        fila_1.addWidget(self.grp_agg, 0, Qt.AlignBottom)
 
-        self.lbl_top = QLabel("Mostrar:")
-        controls_top.addWidget(self.lbl_top)
         self.spin_top = QSpinBox()
         self.spin_top.setRange(0, 1000)
         self.spin_top.setValue(15)
         self.spin_top.setPrefix("Top ")
         self.spin_top.setSpecialValueText("Todos")
         self.spin_top.setToolTip("Cuántas categorías se dibujan, de la mayor a la menor. 'Todos' las muestra todas.")
-        controls_top.addWidget(self.spin_top)
-        controls_top.addStretch()
+        self.grp_top, self.lbl_top = self._grupo_opcion("MOSTRAR", self.spin_top)
+        fila_1.addWidget(self.grp_top, 0, Qt.AlignBottom)
+        fila_1.addStretch()
 
-        self.lbl_eje_x = QLabel("Eje X:")
-        controls_bottom.addWidget(self.lbl_eje_x)
+        self.btn_delete = QPushButton("✕")
+        self.btn_delete.setObjectName("gfxBorrar")
+        self.btn_delete.setToolTip("Quitar este gráfico")
+        self.btn_delete.setFixedWidth(34)
+        fila_1.addWidget(self.btn_delete, 0, Qt.AlignTop)
+
+        # Fila 2: ejes y acciones.
         self.combo_x = QComboBox()
         # Sin esto, el combo se ensancha solo según el nombre de columna más
         # largo que le carguen (ver update_axis_choices) -- con columnas
@@ -290,20 +324,20 @@ class ChartPanel(QWidget):
         self.combo_x.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
         self.combo_x.setMinimumContentsLength(14)
         self.combo_x.setMaximumWidth(180)
-        controls_bottom.addWidget(self.combo_x)
+        self.grp_x, self.lbl_eje_x = self._grupo_opcion("EJE X", self.combo_x)
+        fila_2.addWidget(self.grp_x, 0, Qt.AlignBottom)
 
-        self.lbl_eje_y = QLabel("Eje Y:")
-        controls_bottom.addWidget(self.lbl_eje_y)
         self.combo_y = QComboBox()
         self.combo_y.addItem("Conteo")
         self.combo_y.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
         self.combo_y.setMinimumContentsLength(14)
         self.combo_y.setMaximumWidth(180)
-        controls_bottom.addWidget(self.combo_y)
+        self.grp_y, self.lbl_eje_y = self._grupo_opcion("EJE Y", self.combo_y)
+        fila_2.addWidget(self.grp_y, 0, Qt.AlignBottom)
 
         self.btn_generate = QPushButton("Generar")
-        self.btn_generate.setObjectName("accentButton")
-        controls_bottom.addWidget(self.btn_generate)
+        self.btn_generate.setObjectName("gfxGenerar")
+        fila_2.addWidget(self.btn_generate, 0, Qt.AlignBottom)
 
         self.chk_anotaciones = QCheckBox("Anotaciones")
         self.chk_anotaciones.setChecked(True)
@@ -311,13 +345,24 @@ class ChartPanel(QWidget):
             "Muestra valores directamente sobre el gráfico y una línea de referencia con el promedio."
         )
         self.chk_anotaciones.toggled.connect(lambda: self.render_requested())
-        controls_bottom.addWidget(self.chk_anotaciones)
-        controls_bottom.addStretch()
+        fila_2.addWidget(self.chk_anotaciones, 0, Qt.AlignBottom)
 
-        self.btn_delete = QPushButton("X")
-        self.btn_delete.setObjectName("dangerButton")
-        self.btn_delete.setFixedWidth(32)
-        controls_bottom.addWidget(self.btn_delete)
+        self.btn_filtro = QPushButton("Filtrar filas")
+        self.btn_filtro.setToolTip("Dibuja este gráfico solo con ciertas filas (por ejemplo, una máquina o un producto).")
+        self.btn_filtro.clicked.connect(self._abrir_filtro)
+        fila_2.addWidget(self.btn_filtro, 0, Qt.AlignBottom)
+
+        self.btn_panel = QPushButton("Al Panel")
+        self.btn_panel.setToolTip("Muestra este gráfico también en la pestaña Panel.")
+        self.btn_panel.clicked.connect(lambda: self.panelRequested.emit(self))
+        fila_2.addWidget(self.btn_panel, 0, Qt.AlignBottom)
+
+        # Resumen del filtro de filas: ocupa lo que sobre y NO exige ancho
+        # (Ignored), para que un filtro largo no ensanche la fila.
+        self.lbl_filtro = QLabel("")
+        self.lbl_filtro.setObjectName("gfxFiltro")
+        self.lbl_filtro.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        fila_2.addWidget(self.lbl_filtro, 1, Qt.AlignBottom)
 
         self.plot_container = QVBoxLayout()
         card_layout.addLayout(self.plot_container)
@@ -328,17 +373,34 @@ class ChartPanel(QWidget):
         self.combo_type.currentTextChanged.connect(self._on_tipo_changed)
 
         self._render_callback = None
+        self._estilo_opciones()
         self._on_tipo_changed(self.combo_type.currentText())
 
     def set_render_callback(self, callback):
         self._render_callback = callback
 
+    def set_proveedor_df(self, funcion):
+        """`funcion()` devuelve el df actual: se usa para listar los valores
+        posibles cuando se elige el filtro de filas."""
+        self._proveedor_df = funcion
+
+    def _abrir_filtro(self):
+        df = self._proveedor_df() if self._proveedor_df else None
+        if df is None or df.empty:
+            QMessageBox.information(self, "Sin datos", "Carga datos primero.")
+            return
+        dlg = DialogoFiltroFilas(df, self.filtro, titulo="Filtrar filas del gráfico", parent=self)
+        if dlg.exec() == QDialog.Accepted:
+            self.filtro = dlg.get_filtro()
+            texto = describir_filtro(self.filtro)
+            self.lbl_filtro.setText(f"Solo donde {texto}" if texto else "")
+            self.lbl_filtro.setToolTip(texto)
+            self.render_requested()
+
     def _on_tipo_changed(self, tipo):
         es_heatmap = (tipo == "Mapa de Calor (Correlación)")
-        self.lbl_eje_x.setVisible(not es_heatmap)
-        self.combo_x.setVisible(not es_heatmap)
-        self.lbl_eje_y.setVisible(not es_heatmap)
-        self.combo_y.setVisible(not es_heatmap)
+        self.grp_x.setVisible(not es_heatmap)
+        self.grp_y.setVisible(not es_heatmap)
         self._actualizar_controles()
 
     def _actualizar_controles(self):
@@ -347,10 +409,8 @@ class ChartPanel(QWidget):
         y_es_conteo = self.combo_y.currentText() == "Conteo"
         ver_agg = tipo in ("Barras", "Líneas") and not y_es_conteo
         ver_top = tipo == "Barras"
-        self.lbl_agg.setVisible(ver_agg)
-        self.combo_agg.setVisible(ver_agg)
-        self.lbl_top.setVisible(ver_top)
-        self.spin_top.setVisible(ver_top)
+        self.grp_agg.setVisible(ver_agg)
+        self.grp_top.setVisible(ver_top)
 
     def render_requested(self):
         if self._render_callback:
@@ -388,8 +448,83 @@ class ChartPanel(QWidget):
         self.plot_widget = None
         self.donut_widget = None
 
+    def _grupo_opcion(self, texto, control):
+        """Una opción = rótulo chico arriba + el control debajo. Devuelve
+        (contenedor, rótulo). Se muestra u oculta el contenedor completo."""
+        grupo = QWidget()
+        grupo.setObjectName("gfxGrupo")
+        lay = QVBoxLayout(grupo)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(2)
+        rotulo = QLabel(texto)
+        rotulo.setObjectName("gfxEtiqueta")
+        lay.addWidget(rotulo)
+        lay.addWidget(control)
+        return grupo, rotulo
+
+    def _estilo_opciones(self):
+        """Hoja de estilo SOLO de las opciones (self.opciones); el gráfico
+        queda fuera de este bloque y se ve exactamente igual que antes."""
+        c = self.colors
+        texto = c.get("text", "#111111")
+        apagado = c.get("muted", "#777777")
+        borde = c.get("border", "#dddddd")
+        tarjeta = c.get("card", c.get("bg", "#ffffff"))
+        acento = COLOR_ACCENT
+        peligro = COLOR_DANGER
+        f = _FUENTE_SERIFA
+        self.opciones.setStyleSheet(f"""
+            QWidget#gfxOpciones, QWidget#gfxGrupo {{ background: transparent; }}
+            QLabel {{ background: transparent; font-family: {f}; color: {texto}; }}
+            QLabel#gfxEtiqueta {{
+                font-size: 10px; letter-spacing: 1px; color: {apagado};
+            }}
+            QLabel#gfxFiltro {{
+                font-size: 12px; font-style: italic; color: {apagado};
+            }}
+            QLineEdit, QComboBox, QSpinBox {{
+                background: transparent; border: none; border-radius: 0;
+                border-bottom: 1px solid {borde}; padding: 3px 2px;
+                font-family: {f}; font-size: 13px; color: {texto};
+            }}
+            QLineEdit:focus, QComboBox:focus, QSpinBox:focus {{
+                border-bottom: 1px solid {acento};
+            }}
+            QComboBox QAbstractItemView {{
+                background: {tarjeta}; color: {texto}; border: 1px solid {borde};
+                selection-background-color: {_rgba(acento, 0.15)};
+                selection-color: {texto}; outline: 0;
+            }}
+            QCheckBox {{
+                background: transparent; font-family: {f}; font-size: 13px;
+                color: {texto}; spacing: 6px; padding: 4px 2px;
+            }}
+            QPushButton {{
+                background: transparent; border: none; border-radius: 0;
+                border-bottom: 1px solid {borde}; padding: 4px 6px;
+                font-family: {f}; font-size: 13px; color: {texto};
+            }}
+            QPushButton:hover {{
+                background: transparent; color: {acento};
+                border-bottom: 1px solid {acento};
+            }}
+            QPushButton#gfxGenerar {{
+                color: {acento}; font-weight: 700; border-bottom: 1px solid {acento};
+            }}
+            QPushButton#gfxGenerar:hover {{
+                background: transparent; color: {acento}; border-bottom: 2px solid {acento};
+            }}
+            QPushButton#gfxBorrar {{
+                color: {apagado}; border-bottom: none; padding: 2px 8px; font-size: 14px;
+            }}
+            QPushButton#gfxBorrar:hover {{
+                background: transparent; color: {peligro}; border-bottom: none;
+            }}
+        """)
+
     def apply_theme(self, colors):
         self.colors = colors
+        self._estilo_opciones()
 
     @staticmethod
     def _parsear_fechas(serie_texto):
@@ -426,6 +561,16 @@ class ChartPanel(QWidget):
 
         if df is None or df.empty:
             return
+        if self.filtro:
+            df = aplicar_filtro(df, self.filtro)
+            if df.empty:
+                self._clear_plot_area()
+                self.categories = []
+                self._bar_xvals = []
+                aviso = QLabel("No hay filas que cumplan el filtro de este gráfico.")
+                aviso.setObjectName("muted")
+                self.plot_container.addWidget(aviso)
+                return
         if chart_type != "Mapa de Calor (Correlación)" and (not x_col or x_col not in df.columns):
             return
 
@@ -933,6 +1078,20 @@ class ChartPanel(QWidget):
     def nombre(self) -> str:
         return self.name_edit.text().strip()
 
+    def config_a_dict(self) -> dict:
+        """Lo mínimo para volver a dibujar este gráfico en otra parte (hoy, el
+        Panel): qué tipo es y con qué columnas. Son solo textos y números, así
+        que se puede guardar dentro del proyecto sin problema."""
+        return {
+            "nombre": self.nombre(),
+            "tipo": self.combo_type.currentText(),
+            "x": self.combo_x.currentText(),
+            "y": self.combo_y.currentText(),
+            "calcular": self.combo_agg.currentText(),
+            "top": int(self.spin_top.value()),
+            "filtro": self.filtro,
+        }
+
     def etiqueta(self) -> str:
         tipo = self.combo_type.currentText()
         if tipo == "Mapa de Calor (Correlación)":
@@ -943,6 +1102,9 @@ class ChartPanel(QWidget):
             if tipo in ("Barras", "Líneas") and y != "Conteo" and agg in _FUNCIONES_AGG:
                 y = f"{agg} de {y}"
             base = f"{tipo} — X: {self.combo_x.currentText()}, Y: {y}"
+        solo = describir_filtro(self.filtro)
+        if solo:
+            base += f", solo donde {solo}"
         nombre = self.nombre()
         return f"{nombre} ({base})" if nombre else base
 

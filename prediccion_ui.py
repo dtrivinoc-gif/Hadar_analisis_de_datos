@@ -22,7 +22,7 @@ from PySide6.QtCore import QPointF, Qt, QThread, Signal
 from PySide6.QtGui import QColor, QFont, QPainter, QPen
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog,
-    QFrame, QGridLayout, QHBoxLayout, QHeaderView, QLabel, QMessageBox, QProgressBar,
+    QFrame, QGridLayout, QHBoxLayout, QHeaderView, QLabel, QMenu, QMessageBox, QProgressBar,
     QPushButton, QScrollArea, QSpinBox, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
@@ -33,6 +33,7 @@ try:
 except Exception:  # sin pyqtgraph se omite solo el gráfico
     pg = None
 from .relacional import Enlace, SIN_FECHA, enlaces_disponibles, preparar
+from .prediccion_pdf import ContextoPDF, exportar_pdf
 from .prediccion import _fmt as _formatear
 from .prediccion import (
     ConfigPrediccion, TIPOS_LEGIBLES, columnas_a_usar, elegir_columna_id, entrenar,
@@ -124,7 +125,7 @@ class _Mancuerna(QWidget):
         p.setPen(_color_texto(self, 255))
         p.drawText(int(g["ta"]), y + 24, self._ta)
         p.drawText(int(g["tb"]), (y - 12) if g["b_arriba"] else (y + 24), self._tb)
-        if self._brecha and abs(g["xb"] - g["xa"]) > fm.horizontalAdvance(self._brecha) + 16:
+        if self._brecha and not g["b_arriba"] and abs(g["xb"] - g["xa"]) > fm.horizontalAdvance(self._brecha) + 16:
             p.setPen(QColor(ACENTO))
             p.drawText(int((g["xa"] + g["xb"]) / 2 - fm.horizontalAdvance(self._brecha) / 2), y - 10, self._brecha)
         p.end()
@@ -239,6 +240,7 @@ class PanelPrediccion(QWidget):
         self._claves_forzadas = set()
         self._rel_cache = []
         self._rel_cache_firma = None
+        self._contexto_pdf = None      # foto de la configuración al entrenar (para el PDF)
         self._construir()
         self.aplicar_tema(self.colors)
 
@@ -546,6 +548,18 @@ class PanelPrediccion(QWidget):
         self.btn_predecir = QPushButton("Generar predicciones…")
         self.btn_predecir.clicked.connect(self._generar_predicciones)
         fila2.addWidget(self.btn_predecir)
+        self.btn_pdf = QPushButton("Exportar PDF ▾")
+        menu_pdf = QMenu(self.btn_pdf)
+        accion_todo = menu_pdf.addAction("Todo (configuración y resultados)")
+        accion_res = menu_pdf.addAction("Solo los resultados del modelo")
+        accion_todo.triggered.connect(lambda: self._exportar_pdf("todo"))
+        accion_res.triggered.connect(lambda: self._exportar_pdf("resultados"))
+        self.btn_pdf.setMenu(menu_pdf)
+        # la flecha ya va en el texto: se oculta la que dibuja Qt para que no salgan dos
+        self.btn_pdf.setStyleSheet("QPushButton::menu-indicator { image: none; width: 0px; }")
+        self.btn_pdf.setToolTip("Guarda un informe en PDF: todo (con la configuración) o solo los resultados.")
+        self.btn_pdf.setEnabled(False)
+        fila2.addWidget(self.btn_pdf)
         self.lbl_pred = QLabel("")
         self.lbl_pred.setObjectName("muted")
         self.lbl_pred.setWordWrap(True)
@@ -1055,6 +1069,8 @@ class PanelPrediccion(QWidget):
         self.btn_entrenar.setEnabled(not entrenando and self._objetivo_actual() is not None)
         self.btn_predecir.setEnabled(
             not entrenando and self._resultado is not None and self._df_prueba() is not None)
+        self.btn_pdf.setEnabled(
+            not entrenando and self._resultado is not None and self._contexto_pdf is not None)
         if self._resultado is not None and self._df_prueba() is None:
             self.btn_predecir.setToolTip("Elige una tabla de prueba (arriba) para poder predecir sobre ella.")
         else:
@@ -1087,6 +1103,7 @@ class PanelPrediccion(QWidget):
             return
         self._resultado = None
         self.card_resultado.setVisible(False)
+        self._contexto_pdf = self._capturar_contexto(columnas)
         self.lbl_estado.setText("Preparando…")
         self.barra.setVisible(True)
         self._entrenando = True
@@ -1168,6 +1185,7 @@ class PanelPrediccion(QWidget):
     def _mostrar_resultado(self, r):
         lay = self.resultado_lay
         _vaciar(lay)
+        self._df_revision = None        # si este resultado no trae casos, no queda la lista del anterior
         nivel, titulo, frase = r.veredicto()
         color = COLOR_NIVEL.get(nivel, GRIS)
 
@@ -1391,6 +1409,69 @@ class PanelPrediccion(QWidget):
             QMessageBox.critical(self, "Error al guardar", str(e))
             return
         QMessageBox.information(self, "Lista guardada", f"Guardada en:\n{ruta}")
+
+    # ------------------------------------------------------------------
+    # Exportar a PDF
+    # ------------------------------------------------------------------
+    def _capturar_contexto(self, columnas):
+        """Foto de la configuración usada al entrenar: así el PDF describe lo que de
+        verdad se entrenó, aunque después cambies algo en la pantalla."""
+        cfg = ConfigPrediccion.from_dict(self._config.to_dict())
+        cambios = self._config.cambios_columnas or {}
+        info = self._prep.info if self._prep is not None else {}
+        usadas = set(columnas)
+        ignoradas = []
+        for sug in self._sugerencias:
+            if sug.nombre in usadas:
+                continue
+            if cambios.get(sug.nombre) == "ignorar":
+                motivo = "Desmarcada a mano"
+            else:
+                motivo = sug.motivo or info.get(sug.nombre, "")
+            ignoradas.append((sug.nombre, motivo))
+        activos = []
+        if cfg.usar_relaciones and self._prep is not None:
+            desactivados = set(cfg.enlaces_desactivados or [])
+            activos = [e.texto() for e in self._enlaces_lista if e.clave() not in desactivados]
+        return ContextoPDF(
+            config=cfg.to_dict(),
+            columnas_usadas=list(columnas),
+            columnas_ignoradas=ignoradas,
+            marcadas_a_mano=[c for c in columnas if cambios.get(c) == "usar"],
+            columnas_de_otras_tablas=list(self._prep.columnas_nuevas) if self._prep is not None else [],
+            relaciones_activas=activos,
+            relaciones_info=self.lbl_rel_info.text(),
+        )
+
+    def _exportar_pdf(self, modo):
+        """modo = "todo" (configuración + resultados) o "resultados"."""
+        if self._resultado is None or self._contexto_pdf is None:
+            return
+        import os
+        carpeta = ""
+        try:
+            from .proyecto import ruta_carpeta_proyectos
+            carpeta = ruta_carpeta_proyectos()
+        except Exception:
+            pass
+        nombre = re.sub(r"[^A-Za-z0-9_-]+", "_", str(self._resultado.objetivo)).strip("_")[:40] or "modelo"
+        sufijo = "completo" if modo == "todo" else "resultados"
+        ruta, _ = QFileDialog.getSaveFileName(
+            self, "Exportar a PDF", os.path.join(carpeta, f"prediccion_{nombre}_{sufijo}.pdf"), "PDF (*.pdf)")
+        if not ruta:
+            return
+        if not ruta.lower().endswith(".pdf"):
+            ruta += ".pdf"
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            exportar_pdf(ruta, self._resultado, self._contexto_pdf, modo, revision=self._df_revision)
+        except Exception as e:
+            QApplication.restoreOverrideCursor()
+            QMessageBox.critical(self, "No se pudo crear el PDF", str(e))
+            return
+        QApplication.restoreOverrideCursor()
+        self.lbl_pred.setText(f"PDF guardado: {ruta}")
+        QMessageBox.information(self, "PDF guardado", f"Guardado en:\n{ruta}")
 
     # ------------------------------------------------------------------
     # Predecir y guardar

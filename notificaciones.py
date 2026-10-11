@@ -56,17 +56,22 @@ def guardar_configuracion(config):
         json.dump(config, f, ensure_ascii=False, indent=2)
 
 
-def _armar_mensaje(regla, valor_actual):
-    valor_texto = (
-        "sin datos" if valor_actual is None
-        else f"{valor_actual:,.2f}".replace(",", ".")
-    )
+def _armar_mensaje(regla, valor_actual, detalle=None):
     asunto = f"ALARMA Hadar: {regla['nombre']}"
-    cuerpo = (
-        f"¡ALARMA! {regla['nombre']}\n\n"
-        f"Condición: {regla['tipo']} · {regla['objetivo']} {regla['operador']} {regla['umbral']}\n"
-        f"Valor actual: {valor_texto}\n"
-    )
+    if detalle:
+        # Alarmas de tipo Columna: el detalle ya viene armado (columna,
+        # condición, filtro, cuántas filas cumplen).
+        cuerpo = f"¡ALARMA! {regla['nombre']}\n\n{detalle}"
+    else:
+        valor_texto = (
+            "sin datos" if valor_actual is None
+            else f"{valor_actual:,.2f}".replace(",", ".")
+        )
+        cuerpo = (
+            f"¡ALARMA! {regla['nombre']}\n\n"
+            f"Condición: {regla['tipo']} · {regla['objetivo']} {regla['operador']} {regla['umbral']}\n"
+            f"Valor actual: {valor_texto}\n"
+        )
     if regla.get("mensaje"):
         cuerpo += f"\nNota: {regla['mensaje']}\n"
     return asunto, cuerpo
@@ -123,7 +128,7 @@ class _PuenteResultado(QObject):
 
 
 def disparar_envio_correo(host, destinatario, regla, valor_actual, on_resultado=None,
-                           verificar_habilitado=True):
+                           verificar_habilitado=True, detalle=None):
     """Manda el correo de una alarma en un hilo aparte.
 
     `host` es la ventana principal (HadarApp): necesita una lista
@@ -143,7 +148,7 @@ def disparar_envio_correo(host, destinatario, regla, valor_actual, on_resultado=
             on_resultado(False, "Notificaciones por correo no configuradas.")
         return
 
-    asunto, cuerpo = _armar_mensaje(regla, valor_actual)
+    asunto, cuerpo = _armar_mensaje(regla, valor_actual, detalle)
 
     hilo = QThread()
     worker = CorreoWorker(config, destinatario, asunto, cuerpo)

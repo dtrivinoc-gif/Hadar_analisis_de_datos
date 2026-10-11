@@ -59,6 +59,18 @@ _COLOR_CONEXION_MANUAL = "#C9C9D6"
 _TOLERANCIA_PUNTO_PX = 12
 _TOLERANCIA_LINEA_PX = 6
 
+# Estilo de "subpestaña" (texto sin caja, con línea inferior índigo cuando está
+# activo): el mismo de Preguntas / Entrenar un modelo en Predicción. También
+# existe como QSS_SUBPESTANA en main_window.py; si se cambia uno, cambiar el otro.
+QSS_SUBPESTANA = (
+    "QPushButton{background: transparent; border: none; border-bottom: 2px solid transparent; "
+    "border-radius: 0; padding: 6px 14px; font-weight: 600; color: #a1a1aa;} "
+    "QPushButton:checked{color: #6366f1; border-bottom: 2px solid #6366f1;} "
+    "QPushButton:hover{background: transparent; color: #6366f1;} "
+    "QPushButton:pressed{background: transparent;} "
+    "QPushButton:disabled{color: rgba(127,127,127,0.6);}"
+)
+
 
 def _epoch_a_timestamp(valor_epoch_seg):
     return pd.Timestamp(valor_epoch_seg, unit="s")
@@ -405,12 +417,16 @@ class LineaTiempoPanel(QWidget):
             "para salir del modo."
         )
         self.btn_conectar_manual.toggled.connect(self._on_toggle_conectar_manual)
+        self.btn_conectar_manual.setCursor(Qt.PointingHandCursor)
+        self.btn_conectar_manual.setStyleSheet(QSS_SUBPESTANA)
         toolbar2.addWidget(self.btn_conectar_manual)
 
         toolbar2.addStretch()
 
         self.btn_metricas_tiempo = QPushButton("Métricas de tiempo")
         self.btn_metricas_tiempo.clicked.connect(self._abrir_metricas_tiempo)
+        self.btn_metricas_tiempo.setCursor(Qt.PointingHandCursor)
+        self.btn_metricas_tiempo.setStyleSheet(QSS_SUBPESTANA)
         toolbar2.addWidget(self.btn_metricas_tiempo)
 
         btn_actualizar_vista = QPushButton("Actualizar")
@@ -419,6 +435,8 @@ class LineaTiempoPanel(QWidget):
             "(normalmente se actualiza sola; este botón es por si acaso)."
         )
         btn_actualizar_vista.clicked.connect(self.refrescar_vista)
+        btn_actualizar_vista.setCursor(Qt.PointingHandCursor)
+        btn_actualizar_vista.setStyleSheet(QSS_SUBPESTANA)
         toolbar2.addWidget(btn_actualizar_vista)
 
         layout.addLayout(toolbar2)
@@ -501,6 +519,8 @@ class LineaTiempoPanel(QWidget):
         pie = QHBoxLayout()
         self.btn_actualizar_anomalias = QPushButton("Actualizar anomalías en este rango")
         self.btn_actualizar_anomalias.clicked.connect(self._actualizar_anomalias_en_rango)
+        self.btn_actualizar_anomalias.setCursor(Qt.PointingHandCursor)
+        self.btn_actualizar_anomalias.setStyleSheet(QSS_SUBPESTANA)
         pie.addWidget(self.btn_actualizar_anomalias)
         self.lbl_estado = QLabel("")
         self.lbl_estado.setObjectName("muted")

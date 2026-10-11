@@ -5,6 +5,7 @@ Frecuencias, Narrativa, Reporte), y conecta entre sí todos los módulos
 del resto de la app.
 """
 import os
+import time
 import hashlib
 import json
 
@@ -12,20 +13,19 @@ import numpy as np
 import pandas as pd
 import pyqtgraph as pg
 
-from PySide6.QtCore import Qt, QThread, QTimer, QRectF, QVariantAnimation, QEasingCurve
+from PySide6.QtCore import Qt, QThread, QTimer, QVariantAnimation, QEasingCurve
 from PySide6.QtGui import (
     QColor, QFont, QIcon, QPixmap, QPainter, QPen, QBrush,
-    QPageSize, QTextCharFormat, QTextDocument,
+    QPageSize, QTextDocument,
 )
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QLabel, QPushButton, QComboBox, QListWidget, QListWidgetItem,
     QAbstractItemView, QTableView, QTabWidget, QScrollArea, QFrame,
     QLineEdit, QMessageBox, QFileDialog, QRadioButton, QButtonGroup,
-    QHeaderView, QInputDialog, QGraphicsView, QGraphicsScene,
-    QGraphicsRectItem, QTabBar, QDialog, QApplication, QTextBrowser,
-    QDialogButtonBox, QToolButton, QMenu, QFormLayout,
-    QTreeWidget, QTreeWidgetItem, QSizePolicy, QSpinBox,
+    QHeaderView, QInputDialog, QDialog, QApplication, QTextBrowser,
+    QDialogButtonBox, QFormLayout,
+    QTreeWidget, QTreeWidgetItem, QSizePolicy, QSpinBox, QStackedWidget,
 )
 from PySide6.QtPrintSupport import QPrinter
 
@@ -41,10 +41,12 @@ from .io_datos import (
     cast_valor_a_dtype,
 )
 from .table_model import PandasTableModel
-from .graficos import UfWorker, ChartPanel, render_boxplot, build_stylesheet, create_stat_card, set_card_alarma
+from .graficos import UfWorker, build_stylesheet
+from .graficos_ui import PanelGraficos
 from .indicadores import (
-    Indicador, sugerir_indicadores_por_defecto, IndicadorCard, DialogoIndicador,
+    Indicador, sugerir_indicadores_por_defecto, DialogoIndicador,
 )
+from .indicadores_vista import VistaIndicadores, columna_fecha_para
 from .excel_transform import DialogoTransformacionExcel
 from .linaje_grafo import construir_grafo_linaje
 from .linaje_ui import PanelLinaje
@@ -53,10 +55,8 @@ from .procedencia import (
     ORIGEN_ARCHIVO, ORIGEN_SQL_SERVER, evento_de_origen,
     estado_de_actualizacion, frase_desactualizacion,
 )
-from .report_widgets import (
-    ReportBoxItem, REPORTE_PAPEL_BG, REPORTE_PAPEL_BORDE, REPORTE_PAPEL_TINTA,
-    REPORTE_COLOR_ROJO, REPORTE_FUENTES, REPORTE_TAMANOS,
-)
+from .metricas_ui import PanelMetricas
+from .reporte_ui import PanelReporte
 from .memoria import MemoriaHadar
 from .proyecto import guardar_proyecto, abrir_proyecto, ruta_carpeta_proyectos, EXTENSION
 from .aprendizaje_adaptativo import actualizar_linea_base
@@ -68,11 +68,16 @@ from .dialogo_nota import DialogoNota
 from .ontologia_ui import DialogoEsquemaOntologia
 from .ontologia import inferir_relaciones, enriquecer_tabla_con_relaciones
 from .contagio import explorar_linaje, columna_clave_de_tabla
-from .alarmas import AlarmaHadar, AlarmaCard, DialogoAlarma, calcular_valor_actual, evaluar_regla
+from .alarmas import (
+    AlarmaHadar, AlarmaCard, DialogoAlarma, calcular_valor_actual, evaluar_regla,
+    evaluar_columna, texto_detalle_columna,
+)
 from .notificaciones import DialogoConfiguracionCorreo, disparar_envio_correo, cargar_configuracion
 from .linea_tiempo_ui import LineaTiempoPanel
-from .panel import PanelControl
+from .panel import PanelControl, tendencia_indicador, variacion_indicador
 from .prediccion_ui import PanelPrediccion
+from .pronosticos_ui import PanelPalabras
+from .frecuencias_ui import PanelFrecuencias
 from .linea_tiempo import parsear_fechas
 from .limpieza import (
     detectar_limpieza_sugerida, agrupar_por_tipo,
@@ -87,6 +92,27 @@ from .dialogos_limpieza import DialogoRevisarCaracteres
 # texto real que alguien pueda haber escrito) para no confundir un dato
 # real llamado, por ejemplo, "vacío" con una celda efectivamente vacía.
 VALOR_VACIO_FILTRO = "(vacíos)"
+
+# Estilo de "subpestaña" (texto sin caja, con línea inferior en el color de
+# énfasis cuando está activa). Es el mismo de Preguntas / Entrenar un modelo en
+# Predicción y se reutiliza en Narrativa: un solo lugar para cambiarlo.
+# border-radius: 0 y los estados pressed/disabled evitan que se cuele el estilo
+# de caja del tema global (p. ej. el de "accentButton").
+QSS_SUBPESTANA = (
+    "QPushButton{background: transparent; border: none; border-bottom: 2px solid transparent; "
+    "border-radius: 0; padding: 6px 14px; font-weight: 600; color: #a1a1aa;} "
+    "QPushButton:checked{color: #6366f1; border-bottom: 2px solid #6366f1;} "
+    "QPushButton:hover{background: transparent; color: #6366f1;} "
+    "QPushButton:pressed{background: transparent;} "
+    "QPushButton:disabled{color: rgba(127,127,127,0.6);}"
+)
+# Versión para la barra de un QTabWidget (Informe / Linaje en Narrativa).
+QSS_SUBPESTANA_TABBAR = (
+    "QTabBar::tab{background: transparent; border: none; border-bottom: 2px solid transparent; "
+    "border-radius: 0; padding: 6px 14px; margin-right: 8px; font-weight: 600; color: #a1a1aa;} "
+    "QTabBar::tab:selected{color: #6366f1; border-bottom: 2px solid #6366f1;} "
+    "QTabBar::tab:hover:!selected{color: #6366f1;}"
+)
 
 # Etiquetas legibles para cada "tipo" de anomalía que devuelve
 # SemanticAnomalyDetector.detect_all() (ver anomalias.py) -- se usan tanto
@@ -648,10 +674,10 @@ class HadarApp(QMainWindow):
         fila_sql_server.addWidget(self.btn_actualizar_fuente)
         sidebar_layout.addLayout(fila_sql_server)
 
-        btn_conectar_pos = QPushButton("Conectar al POS...")
+        btn_conectar_pos = QPushButton("Conectar por WiFi...")
         btn_conectar_pos.setToolTip(
-            "Se conecta EN VIVO al PC del POS en la misma red wifi, para "
-            "traer sus tablas de ventas, productos, fiado, etc."
+            "Se conecta EN VIVO a otro equipo de la misma red wifi (por ahora, "
+            "el POS de Hadar) para traer sus tablas: ventas, productos, fiado, etc."
         )
         btn_conectar_pos.clicked.connect(self._conectar_pos)
         sidebar_layout.addWidget(btn_conectar_pos)
@@ -940,17 +966,43 @@ class HadarApp(QMainWindow):
         Por eso acá se cambia el ancho en 1px y se vuelve al original: eso
         sí garantiza dos resizeEvent reales, que es lo que pyqtgraph
         necesita para recalcular su viewport."""
+        t0 = time.perf_counter()
         for i in range(self.tabview.count()):
-            widget = self.tabview.widget(i)
-            if widget is None:
-                continue
-            widget.updateGeometry()
-            for plot in widget.findChildren(pg.PlotWidget):
-                tam = plot.size()
-                plot.resize(tam.width() + 1, tam.height())
-                plot.resize(tam)
-                plot.getViewBox().updateAutoRange()
+            self._refrescar_pestana(self.tabview.widget(i))
         QApplication.processEvents()
+        self._medir_tiempo("refrescar gráficos de todas las pestañas", t0)
+
+    def _refrescar_pestana(self, widget):
+        """Mismo 'despertar' de gráficos de _refrescar_todas_las_pestanas,
+        pero para UNA sola pestaña."""
+        if widget is None:
+            return
+        widget.updateGeometry()
+        for plot in widget.findChildren(pg.PlotWidget):
+            tam = plot.size()
+            plot.resize(tam.width() + 1, tam.height())
+            plot.resize(tam)
+            plot.getViewBox().updateAutoRange()
+
+    def _al_cambiar_pestana(self, indice):
+        """Al cambiar de pestaña solo hace falta despertar los gráficos de
+        la que se está mostrando: las demás siguen ocultas y se despiertan
+        cuando les toque (o con showEvent / animación de la barra lateral,
+        que sí refrescan todas). Antes se redimensionaban los gráficos de
+        TODAS las pestañas en cada clic, lo que hacía lenta la app cuando
+        había muchos gráficos."""
+        t0 = time.perf_counter()
+        self._refrescar_pestana(self.tabview.widget(indice))
+        QApplication.processEvents()
+        self._medir_tiempo(f"cambiar a la pestaña «{self.tabview.tabText(indice)}»", t0)
+
+    @staticmethod
+    def _medir_tiempo(etiqueta, t0, umbral=0.15):
+        """Escribe en la terminal cuánto tardó algo, solo si tardó más de
+        'umbral' segundos (para encontrar qué hace lenta a la app)."""
+        dt = time.perf_counter() - t0
+        if dt > umbral:
+            print(f"[Hadar · tiempo] {etiqueta}: {dt:.2f} s")
 
     def showEvent(self, event):
         super().showEvent(event)
@@ -1189,14 +1241,24 @@ class HadarApp(QMainWindow):
             panel.apply_theme(self.colors)
             if self.filtered_df is not None:
                 panel.render(self.filtered_df)
+        if hasattr(self, "panel_graficos"):
+            self.panel_graficos.aplicar_tema(self.colors)
         if hasattr(self, "panel_linea_tiempo"):
             self.panel_linea_tiempo.aplicar_tema(self.colors)
         if hasattr(self, "panel_control"):
             self.panel_control.aplicar_tema(self.colors)
+        if hasattr(self, "indicadores_vista"):
+            self._actualizar_indicadores()
         if hasattr(self, "panel_prediccion"):
             self.panel_prediccion.aplicar_tema(self.colors)
-        if hasattr(self, "reporte_view"):
-            self.reporte_view.setBackgroundBrush(QBrush(QColor(self.colors["bg"])))
+        if hasattr(self, "panel_palabras"):
+            self.panel_palabras.aplicar_tema(self.colors)
+        if hasattr(self, "panel_frecuencias"):
+            self.panel_frecuencias.aplicar_tema(self.colors)
+        if hasattr(self, "panel_reporte"):
+            self.panel_reporte.aplicar_tema(self.colors)
+        if hasattr(self, "panel_metricas"):
+            self.panel_metricas.aplicar_tema(self.colors)
         if hasattr(self, "panel_linaje"):
             self.panel_linaje.mostrar(self.panel_linaje._grafo, self.colors)
         if self.filtered_df is not None:
@@ -1621,25 +1683,10 @@ class HadarApp(QMainWindow):
         # dataset actual (ej. se cargó un archivo distinto) -- si no se
         # quitaran, quedarían mostrando el último valor calculado como si
         # todavía fuera válido.
-        if hasattr(self, "metricas_bloques"):
-            for bloque in list(self.metricas_bloques):
-                if bloque["columna"] not in num_cols:
-                    self._quitar_bloque_metrica(bloque)
+        if hasattr(self, "panel_metricas"):
+            self.panel_metricas.podar_columnas(num_cols)
 
-        self.freq_col_list.blockSignals(True)
-        selected_before = [item.text() for item in self.freq_col_list.selectedItems()]
-        self.freq_col_list.clear()
-        for c in all_cols:
-            item = QListWidgetItem(c)
-            self.freq_col_list.addItem(item)
-        if selected_before:
-            for i in range(self.freq_col_list.count()):
-                item = self.freq_col_list.item(i)
-                if item.text() in selected_before:
-                    item.setSelected(True)
-        elif self.freq_col_list.count():
-            self.freq_col_list.item(0).setSelected(True)
-        self.freq_col_list.blockSignals(False)
+        self.panel_frecuencias.poblar_columnas(all_cols)
 
         if hasattr(self, "panel_linea_tiempo"):
             self.panel_linea_tiempo.refrescar_datos()
@@ -1677,7 +1724,7 @@ class HadarApp(QMainWindow):
         # cambiar de pestaña, la que recién se muestra puede traer
         # geometría vieja en sus PlotWidget si algo cambió mientras estaba
         # oculta (ver _refrescar_todas_las_pestanas).
-        self.tabview.currentChanged.connect(lambda _i: self._refrescar_todas_las_pestanas())
+        self.tabview.currentChanged.connect(self._al_cambiar_pestana)
 
         tab_datos = QWidget()
         tab_graficos = QWidget()
@@ -1744,6 +1791,8 @@ class HadarApp(QMainWindow):
             self.panel_control.notificar_cambio()
         if hasattr(self, "panel_prediccion"):
             self.panel_prediccion.notificar_cambio()
+        if hasattr(self, "panel_palabras"):
+            self.panel_palabras.notificar_cambio()
 
     # ------------------------------------------------------------------
     # TAB PREDICCIÓN (ver prediccion.py y prediccion_ui.py)
@@ -1751,8 +1800,52 @@ class HadarApp(QMainWindow):
     def _build_tab_prediccion(self, tab):
         layout = QVBoxLayout(tab)
         layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        # Dos formas de predecir dentro de la misma pestaña:
+        #   "Preguntas"  -> palabras clave (pronosticos_ui.py): ¿cuándo se acaba?, ¿cuánto venderé?...
+        #   "Modelo"     -> entrenar un modelo para predecir una columna (prediccion_ui.py)
+        barra = QWidget()
+        fila = QHBoxLayout(barra)
+        fila.setContentsMargins(18, 10, 18, 0)
+        fila.setSpacing(8)
+        self.btn_pred_preguntas = QPushButton("Preguntas")
+        self.btn_pred_modelo = QPushButton("Entrenar un modelo")
+        self.btn_pred_preguntas.setToolTip("Cuándo, cuánto o qué pasaría: ventas futuras, stock que se acaba, fallas…")
+        self.btn_pred_modelo.setToolTip("Adivinar el valor de una columna fila por fila, aprendiendo de las demás.")
+        self.pred_grupo = QButtonGroup(self)
+        self.pred_grupo.setExclusive(True)
+        for i, b in enumerate((self.btn_pred_preguntas, self.btn_pred_modelo)):
+            b.setCheckable(True)
+            b.setCursor(Qt.PointingHandCursor)
+            b.setStyleSheet(QSS_SUBPESTANA)
+            self.pred_grupo.addButton(b, i)
+            fila.addWidget(b)
+        fila.addStretch(1)
+        layout.addWidget(barra)
+
+        self.pred_pila = QStackedWidget()
+        self.panel_palabras = PanelPalabras(host=self)
         self.panel_prediccion = PanelPrediccion(host=self)
-        layout.addWidget(self.panel_prediccion)
+        self.pred_pila.addWidget(self.panel_palabras)
+        self.pred_pila.addWidget(self.panel_prediccion)
+        layout.addWidget(self.pred_pila)
+        self.pred_grupo.idClicked.connect(self.pred_pila.setCurrentIndex)
+        self.btn_pred_preguntas.setChecked(True)
+        self.panel_palabras.sugiere_modelo.connect(self.btn_pred_modelo.click)
+
+    def _prediccion_a_dict(self):
+        """Lo que se guarda en el .hadarproy: la configuración del modelo (como siempre) y,
+        dentro de la clave "palabras", la de las preguntas. Los proyectos antiguos no traen
+        "palabras" y abren igual."""
+        if hasattr(self, "panel_prediccion"):
+            base = dict(self.panel_prediccion.config_a_dict())
+        else:
+            base = dict(self.prediccion_config or {})
+        if hasattr(self, "panel_palabras"):
+            base["palabras"] = self.panel_palabras.config_a_dict()
+        elif "palabras" in (self.prediccion_config or {}):
+            base["palabras"] = self.prediccion_config["palabras"]
+        return base
 
     # ------------------------------------------------------------------
     # TAB LÍNEA DE TIEMPO
@@ -1829,6 +1922,8 @@ class HadarApp(QMainWindow):
         self.btn_editar_datos = QPushButton("Editar Datos: Desactivado")
         self.btn_editar_datos.setCheckable(True)
         self.btn_editar_datos.toggled.connect(self._toggle_edicion_datos)
+        self.btn_editar_datos.setCursor(Qt.PointingHandCursor)
+        self.btn_editar_datos.setStyleSheet(QSS_SUBPESTANA)
         fila_acciones.addWidget(self.btn_editar_datos)
 
         self.btn_nota_celda = QPushButton("Agregar Nota")
@@ -1837,6 +1932,8 @@ class HadarApp(QMainWindow):
             "marca como anomalía también quedan anotadas automáticamente aquí."
         )
         self.btn_nota_celda.clicked.connect(self._abrir_dialogo_nota)
+        self.btn_nota_celda.setCursor(Qt.PointingHandCursor)
+        self.btn_nota_celda.setStyleSheet(QSS_SUBPESTANA)
         fila_acciones.addWidget(self.btn_nota_celda)
 
         self.btn_ver_esquema = QPushButton("Ver esquema")
@@ -1847,6 +1944,8 @@ class HadarApp(QMainWindow):
         )
         self.btn_ver_esquema.clicked.connect(self._abrir_ventana_esquema)
         self.btn_ver_esquema.setVisible(False)
+        self.btn_ver_esquema.setCursor(Qt.PointingHandCursor)
+        self.btn_ver_esquema.setStyleSheet(QSS_SUBPESTANA)
         fila_acciones.addWidget(self.btn_ver_esquema)
         fila_acciones.addStretch()
         layout.addLayout(fila_acciones)
@@ -2563,8 +2662,8 @@ class HadarApp(QMainWindow):
                 fuentes_datos=self.fuentes_datos,
                 ml_multivariado_activado=self.ml_multivariado_activado,
                 procedencia=self.procedencia.a_lista(),
-                prediccion=(self.panel_prediccion.config_a_dict()
-                            if hasattr(self, "panel_prediccion") else self.prediccion_config),
+                prediccion=self._prediccion_a_dict(),
+                panel=getattr(self, "panel_config", None),
             )
         except Exception as e:
             QMessageBox.critical(self, "Error al guardar el proyecto", str(e))
@@ -2641,9 +2740,13 @@ class HadarApp(QMainWindow):
         self.table_model.cargar_notas_manuales(datos_proyecto.notas_manuales)
 
         self.indicadores = [Indicador.from_dict(d) for d in datos_proyecto.indicadores_dict]
+        # Lo elegido en Personalizar del Panel (indicadores, gráficos propios...).
+        self.panel_config = {"indicadores": None, "col_valor": None, **(datos_proyecto.panel or {})}
         self.prediccion_config = datos_proyecto.prediccion
         if hasattr(self, "panel_prediccion"):
             self.panel_prediccion.cargar_config(self.prediccion_config)
+        if hasattr(self, "panel_palabras"):
+            self.panel_palabras.cargar_config((self.prediccion_config or {}).get("palabras"))
 
         nombre_proyecto = os.path.splitext(os.path.basename(path))[0]
         sufijo_multi_tabla = (
@@ -2787,7 +2890,7 @@ class HadarApp(QMainWindow):
         # la selección/valor después de refrescar todas las listas.
         filtro_col_antes = self.datos_filter_col.currentText()
         panels_antes = [(p, p.combo_x.currentText(), p.combo_y.currentText()) for p in self.chart_panels]
-        seleccion_frecuencias = [item.text() for item in self.freq_col_list.selectedItems()]
+        seleccion_frecuencias = self.panel_frecuencias.columnas_seleccionadas()
 
         self.df.rename(columns={nombre_actual: nuevo_nombre}, inplace=True)
         self._cache_fechas = None
@@ -2803,10 +2906,8 @@ class HadarApp(QMainWindow):
                 ind.formula = ind.formula.replace(f"'{nombre_actual}'", f"'{nuevo_nombre}'")
                 ind.formula = ind.formula.replace(f'"{nombre_actual}"', f'"{nuevo_nombre}"')
 
-        for bloque in getattr(self, "metricas_bloques", []):
-            if bloque["columna"] == nombre_actual:
-                bloque["columna"] = nuevo_nombre
-                bloque["lbl_titulo"].setText(f"<b>Métricas: {nuevo_nombre}</b>")
+        if hasattr(self, "panel_metricas"):
+            self.panel_metricas.renombrar_columna(nombre_actual, nuevo_nombre)
 
         self.refresh_all_column_lists()
 
@@ -2819,9 +2920,7 @@ class HadarApp(QMainWindow):
                 panel.combo_y.setCurrentText(nuevo_nombre)
         if nombre_actual in seleccion_frecuencias:
             objetivo = [nuevo_nombre if c == nombre_actual else c for c in seleccion_frecuencias]
-            for i in range(self.freq_col_list.count()):
-                item = self.freq_col_list.item(i)
-                item.setSelected(item.text() in objetivo)
+            self.panel_frecuencias.seleccionar_columnas(objetivo)
 
         self.apply_table_filter()
 
@@ -3051,46 +3150,13 @@ class HadarApp(QMainWindow):
     # TAB GRÁFICOS
     # ------------------------------------------------------------------
     def _build_tab_graficos(self, tab):
+        # Todo el contenido de esta pestaña vive en graficos_ui.py. Se le
+        # entrega la MISMA lista self.chart_panels para que el resto de
+        # main_window (tema, renombrar columnas, Reporte) siga viéndola.
         layout = QVBoxLayout(tab)
-
-        self.charts_scroll = QScrollArea()
-        self.charts_scroll.setWidgetResizable(True)
-        self.charts_container = QWidget()
-        self.charts_layout = QVBoxLayout(self.charts_container)
-        self.charts_layout.addStretch()
-        self.charts_scroll.setWidget(self.charts_container)
-        layout.addWidget(self.charts_scroll)
-
-        btn_add = QPushButton("+ Agregar Gráfico")
-        btn_add.setObjectName("accentButton")
-        btn_add.clicked.connect(self.add_chart_panel)
-        layout.addWidget(btn_add)
-
-        self.add_chart_panel()
-
-    def add_chart_panel(self):
-        panel = ChartPanel(self.colors)
-        panel.set_render_callback(lambda p: p.render(self.filtered_df))
-        panel.removeRequested.connect(self.remove_chart_panel)
-        panel.categoryClicked.connect(self._on_category_clicked)
-        self.charts_layout.insertWidget(self.charts_layout.count() - 1, panel)
-        self.chart_panels.append(panel)
-
-        if self.df is not None:
-            all_cols = self.df.columns.tolist()
-            num_cols = self.df.select_dtypes(include=[np.number]).columns.tolist()
-            panel.update_axis_choices(all_cols, num_cols)
-
-        if self.filtered_df is not None:
-            panel.render(self.filtered_df)
-
-    def remove_chart_panel(self, panel):
-        if len(self.chart_panels) <= 1:
-            QMessageBox.warning(self, "Atención", "Debes mantener al menos un gráfico.")
-            return
-        self.chart_panels.remove(panel)
-        panel.setParent(None)
-        panel.deleteLater()
+        layout.setContentsMargins(0, 0, 0, 0)
+        self.panel_graficos = PanelGraficos(host=self, paneles=self.chart_panels)
+        layout.addWidget(self.panel_graficos)
 
     def _on_category_clicked(self, columna, valor):
         self.filtro_grafico = {"columna": columna, "valor": valor}
@@ -3101,190 +3167,57 @@ class HadarApp(QMainWindow):
     # TAB MÉTRICAS
     # ------------------------------------------------------------------
     def _build_tab_metricas(self, tab):
+        # Todo el contenido de esta pestaña vive en metricas_ui.py.
         layout = QVBoxLayout(tab)
-
-        toolbar = QHBoxLayout()
-        btn_agregar = QPushButton("+ Agregar métrica de otra columna")
-        btn_agregar.setObjectName("accentButton")
-        btn_agregar.clicked.connect(lambda: self._agregar_bloque_metrica())
-        toolbar.addWidget(btn_agregar)
-        toolbar.addStretch()
-        layout.addLayout(toolbar)
-
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        contenedor = QWidget()
-        self.metricas_layout = QVBoxLayout(contenedor)
-        self.metricas_layout.addStretch()  # empuja los bloques hacia arriba
-        scroll.setWidget(contenedor)
-        layout.addWidget(scroll, stretch=1)
-
-        self.metricas_bloques = []  # cada uno: dict con columna/frame/cards/lbls/plot
+        layout.setContentsMargins(0, 0, 0, 0)
+        self.panel_metricas = PanelMetricas(host=self)
+        layout.addWidget(self.panel_metricas)
         self._actualizar_metricas()
 
-    def _columnas_numericas_disponibles_para_metricas(self):
-        if self.df is None:
-            return []
-        ya_agregadas = {b["columna"] for b in self.metricas_bloques}
-        return [
-            str(c) for c in self.df.columns
-            if pd.api.types.is_numeric_dtype(self.df[c]) and str(c) not in ya_agregadas
-        ]
+    @property
+    def metricas_bloques(self):
+        """Los bloques de la pestaña Métricas (ver metricas_ui.py). Otros
+        módulos (Reporte, Alarma) los siguen leyendo desde aquí."""
+        panel = getattr(self, "panel_metricas", None)
+        return panel.bloques if panel is not None else []
+
+    # Puentes hacia metricas_ui.py, para quien todavía llame a los nombres de antes.
+    def _actualizar_metricas(self):
+        if hasattr(self, "panel_metricas"):
+            self.panel_metricas.actualizar()
 
     def _agregar_bloque_metrica(self, columna=None):
-        if self.df is None:
-            QMessageBox.information(self, "Sin datos", "Carga datos primero.")
-            return
-
-        if columna is None:
-            disponibles = self._columnas_numericas_disponibles_para_metricas()
-            if not disponibles:
-                QMessageBox.information(
-                    self, "Nada que agregar",
-                    "Ya agregaste todas las columnas numéricas disponibles, o no hay ninguna."
-                )
-                return
-            columna, ok = QInputDialog.getItem(
-                self, "Elegir columna", "¿Qué columna numérica quieres analizar?", disponibles, 0, False
-            )
-            if not ok or not columna:
-                return
-
-        frame = QFrame()
-        frame.setObjectName("card")
-        frame_layout = QVBoxLayout(frame)
-
-        encabezado = QHBoxLayout()
-        lbl_titulo = QLabel(f"<b>Métricas: {columna}</b>")
-        encabezado.addWidget(lbl_titulo)
-        encabezado.addStretch()
-        btn_quitar = QPushButton("Quitar")
-        encabezado.addWidget(btn_quitar)
-        frame_layout.addLayout(encabezado)
-
-        cuerpo = QHBoxLayout()
-
-        columna_tarjetas = QVBoxLayout()
-        card_media, lbl_media = create_stat_card("Media")
-        card_mediana, lbl_mediana = create_stat_card("Mediana")
-        card_moda, lbl_moda = create_stat_card("Moda")
-        card_std, lbl_std = create_stat_card("Desviación Std")
-        for card in (card_media, card_mediana, card_moda, card_std):
-            columna_tarjetas.addWidget(card)
-        cuerpo.addLayout(columna_tarjetas)
-
-        plot = pg.PlotWidget()
-        plot.setMinimumHeight(220)
-        plot.setMinimumWidth(280)
-        cuerpo.addWidget(plot, stretch=1)
-
-        frame_layout.addLayout(cuerpo)
-
-        bloque = {
-            "columna": columna,
-            "frame": frame,
-            "lbl_titulo": lbl_titulo,
-            "cards": {"Media": card_media, "Mediana": card_mediana, "Moda": card_moda, "Desviación Std": card_std},
-            "lbls": {"Media": lbl_media, "Mediana": lbl_mediana, "Moda": lbl_moda, "Desviación Std": lbl_std},
-            "plot": plot,
-        }
-        btn_quitar.clicked.connect(lambda: self._quitar_bloque_metrica(bloque))
-
-        # Se inserta antes del stretch final, para que los bloques nuevos
-        # se apilen de arriba hacia abajo y el espacio vacío quede al fondo.
-        self.metricas_layout.insertWidget(self.metricas_layout.count() - 1, frame)
-        self.metricas_bloques.append(bloque)
-        self._recalcular_bloque_metrica(bloque)
-        self._actualizar_alarmas()
+        self.panel_metricas.agregar_bloque(columna)
 
     def _quitar_bloque_metrica(self, bloque):
-        bloque["frame"].setParent(None)
-        bloque["frame"].deleteLater()
-        if bloque in self.metricas_bloques:
-            self.metricas_bloques.remove(bloque)
-        # Las alarmas de tipo Métrica sobre esta columna NO se borran ni se
-        # desactivan -- siguen evaluándose y pueden seguir mandando correo,
-        # simplemente ya no tienen dónde pintarse en esta pestaña.
-
-    def _recalcular_bloque_metrica(self, bloque):
-        columna = bloque["columna"]
-        if self.filtered_df is None or self.filtered_df.empty or columna not in self.filtered_df.columns:
-            return
-        data = pd.to_numeric(self.filtered_df[columna], errors="coerce").dropna()
-        if data.empty:
-            return
-
-        bloque["lbls"]["Media"].setText(f"{data.mean():,.2f}")
-        bloque["lbls"]["Mediana"].setText(f"{data.median():,.2f}")
-        moda = data.mode()
-        bloque["lbls"]["Moda"].setText(f"{moda.iloc[0]:,.2f}" if not moda.empty else "N/A")
-        bloque["lbls"]["Desviación Std"].setText(f"{data.std():,.2f}")
-
-        plot = bloque["plot"]
-        plot.setBackground(self.colors["card"])
-        plot.getAxis("bottom").setPen(pg.mkPen(self.colors["muted"]))
-        plot.getAxis("bottom").setTextPen(pg.mkPen(self.colors["text"]))
-        render_boxplot(plot, data, self.colors)
-
-    def _actualizar_metricas(self):
-        if not hasattr(self, "metricas_bloques"):
-            return
-        for bloque in self.metricas_bloques:
-            self._recalcular_bloque_metrica(bloque)
-        self._actualizar_alarmas()
+        self.panel_metricas.quitar_bloque(bloque)
 
     # ------------------------------------------------------------------
     # TAB INDICADORES
     # ------------------------------------------------------------------
     def _build_tab_indicadores(self, tab):
+        # Vista tipográfica (ver indicadores_vista.py): una tabla, no tarjetas.
         layout = QVBoxLayout(tab)
-
-        toolbar = QHBoxLayout()
-        btn_nuevo = QPushButton("+ Nuevo Indicador")
-        btn_nuevo.setObjectName("accentButton")
-        btn_nuevo.clicked.connect(self._abrir_dialogo_nuevo_indicador)
-        toolbar.addWidget(btn_nuevo)
-
-        btn_sugerir = QPushButton("Sugerir Automáticamente")
-        btn_sugerir.clicked.connect(self._sugerir_indicadores_auto)
-        toolbar.addWidget(btn_sugerir)
-
-        toolbar.addStretch()
-
-        btn_guardar = QPushButton("Guardar Indicadores")
-        btn_guardar.clicked.connect(self._guardar_indicadores)
-        toolbar.addWidget(btn_guardar)
-
-        btn_cargar = QPushButton("Cargar Indicadores")
-        btn_cargar.clicked.connect(self._cargar_indicadores)
-        toolbar.addWidget(btn_cargar)
-        layout.addLayout(toolbar)
-
-        aviso = QLabel(
-            "Crea tus propios indicadores: una operación básica sobre una columna (suma, promedio, "
-            "conteo, etc.) o una fórmula simple combinando columnas. Se recalculan solos cada vez que "
-            "cambian los datos o los filtros."
-        )
-        aviso.setObjectName("muted")
-        aviso.setWordWrap(True)
-        layout.addWidget(aviso)
-
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        contenedor = QWidget()
-        self.indicadores_grid = QGridLayout(contenedor)
-        scroll.setWidget(contenedor)
-        layout.addWidget(scroll, stretch=1)
+        layout.setContentsMargins(0, 0, 0, 0)
+        self.indicadores_vista = VistaIndicadores({
+            "nuevo": self._abrir_dialogo_nuevo_indicador,
+            "sugerir": self._sugerir_indicadores_auto,
+            "guardar": self._guardar_indicadores,
+            "cargar": self._cargar_indicadores,
+            "editar": self._editar_indicador,
+            "quitar": self._eliminar_indicador,
+            "panel": self._enviar_indicador_al_panel,
+        }, self.colors)
+        layout.addWidget(self.indicadores_vista)
 
         self.indicadores = []
-        self.indicador_widgets = []
         self._actualizar_indicadores()
 
     def _abrir_dialogo_nuevo_indicador(self):
         if self.df is None:
             QMessageBox.information(self, "Sin datos", "Carga datos primero.")
             return
-        dialogo = DialogoIndicador(list(self.df.columns), parent=self)
+        dialogo = DialogoIndicador(list(self.df.columns), parent=self, df=self.df)
         if dialogo.exec() == QDialog.DialogCode.Accepted:
             self.indicadores.append(dialogo.get_indicador())
             self._actualizar_indicadores()
@@ -3292,7 +3225,7 @@ class HadarApp(QMainWindow):
     def _editar_indicador(self, indicador):
         if self.df is None:
             return
-        dialogo = DialogoIndicador(list(self.df.columns), indicador=indicador, parent=self)
+        dialogo = DialogoIndicador(list(self.df.columns), indicador=indicador, parent=self, df=self.df)
         if dialogo.exec() == QDialog.DialogCode.Accepted:
             idx = self.indicadores.index(indicador)
             self.indicadores[idx] = dialogo.get_indicador()
@@ -3311,12 +3244,8 @@ class HadarApp(QMainWindow):
         self._actualizar_indicadores()
 
     def _actualizar_indicadores(self):
-        if not hasattr(self, "indicadores_grid"):
+        if not hasattr(self, "indicadores_vista"):
             return
-        for w in self.indicador_widgets:
-            w.setParent(None)
-            w.deleteLater()
-        self.indicador_widgets.clear()
 
         # self._ultimas_anomalias la llena la pestaña Narrativa al generar el
         # informe -- si todavía no se generó ninguna narrativa en esta
@@ -3327,23 +3256,47 @@ class HadarApp(QMainWindow):
         }
 
         df = self.filtered_df if self.filtered_df is not None else self.df
-        for i, indicador in enumerate(self.indicadores):
+        fechas = columna_fecha_para(self, df)[1] if df is not None and not df.empty else None
+        en_panel = self.panel_control.nombres_en_panel() if hasattr(self, "panel_control") else set()
+        filas = []
+        for indicador in self.indicadores:
             valor = indicador.calcular(df) if df is not None else None
             regla = next(
                 (r for r in self.reglas_alarma if r["tipo"] == "Indicador" and r["objetivo"] == indicador.nombre),
                 None,
             )
             en_alarma = evaluar_regla(regla, valor) if regla else False
-            card = IndicadorCard(
-                indicador, valor, self._editar_indicador, self._eliminar_indicador,
-                en_alarma=en_alarma, mensaje_alarma=regla.get("mensaje") if regla else None,
-                columnas_con_anomalias=columnas_con_anomalias,
-            )
-            self.indicadores_grid.addWidget(card, i // 4, i % 4)
-            self.indicador_widgets.append(card)
+            hay_df = df is not None and not df.empty
+            filas.append({
+                "indicador": indicador,
+                "valor": valor,
+                "variacion": variacion_indicador(indicador, df, fechas) if hay_df else None,
+                "tendencia": tendencia_indicador(indicador, df, fechas) if hay_df else [],
+                "en_alarma": en_alarma,
+                "mensaje_alarma": regla.get("mensaje") if regla else None,
+                "columnas_afectadas": sorted(indicador.columnas_de_las_que_depende() & columnas_con_anomalias),
+                "en_panel": indicador.nombre in en_panel,
+            })
+        self.indicadores_vista.mostrar(filas, self.colors, hay_datos=df is not None)
 
         self._actualizar_alarmas()
         self._notificar_panel()
+
+    def _enviar_indicador_al_panel(self, indicador):
+        if not hasattr(self, "panel_control"):
+            return
+        resultado = self.panel_control.enviar_indicador(indicador.nombre)
+        mensajes = {
+            "ok": f"Listo: '{indicador.nombre}' ya aparece en la pestaña Panel.",
+            "ya": f"'{indicador.nombre}' ya estaba en el Panel.",
+            "lleno": "El Panel ya muestra 4 indicadores.\n"
+                     "Quita uno en Panel → Personalizar y vuelve a intentarlo.",
+            "invalido": "Este indicador usa columnas que no están en la tabla que el Panel está "
+                        "mostrando ahora, así que no se puede enviar.",
+        }
+        QMessageBox.information(self, "Panel", mensajes.get(resultado, "Listo."))
+        if resultado == "ok":
+            self._actualizar_indicadores()   # para que la fila diga que ya está en el Panel
 
     def _guardar_indicadores(self):
         if not self.indicadores:
@@ -3382,63 +3335,15 @@ class HadarApp(QMainWindow):
     # TAB FRECUENCIAS
     # ------------------------------------------------------------------
     def _build_tab_frecuencias(self, tab):
+        # Todo el contenido de esta pestaña vive en frecuencias_ui.py.
         layout = QVBoxLayout(tab)
-
-        top = QHBoxLayout()
-        top.addWidget(QLabel("Columna(s) a analizar:"))
-        self.freq_col_list = QListWidget()
-        self.freq_col_list.setSelectionMode(QAbstractItemView.ExtendedSelection)
-        self.freq_col_list.setMaximumHeight(80)
-        self.freq_col_list.itemSelectionChanged.connect(
-            lambda: (self._update_frecuencias(), self._actualizar_alarmas())
+        layout.setContentsMargins(0, 0, 0, 0)
+        self.panel_frecuencias = PanelFrecuencias(
+            host=self,
+            valor_vacio=VALOR_VACIO_FILTRO,
+            etiquetas_anomalia=ETIQUETAS_TIPO_ANOMALIA,
         )
-        top.addWidget(self.freq_col_list, stretch=1)
-        layout.addLayout(top)
-
-        cards_row = QHBoxLayout()
-        self.card_freq_moda, self.lbl_freq_moda = create_stat_card("Más Frecuente (Moda)")
-        self.card_freq_menos, self.lbl_freq_menos = create_stat_card("Menos Frecuente")
-        self.card_freq_unicos, self.lbl_freq_unicos = create_stat_card("Categorías Únicas")
-        for card in (self.card_freq_moda, self.card_freq_menos, self.card_freq_unicos):
-            cards_row.addWidget(card)
-        layout.addLayout(cards_row)
-
-        # Resumen de anomalías (según el último informe generado en
-        # Narrativa) -- independiente de qué columna(s) esté mirando el
-        # usuario más arriba, así que no depende de freq_col_list.
-        cards_row_anomalias = QHBoxLayout()
-        self.card_freq_anomalia_top, self.lbl_freq_anomalia_top = create_stat_card(
-            "Anomalía Más Frecuente"
-        )
-        self.card_freq_anomalia_col, self.lbl_freq_anomalia_col = create_stat_card(
-            "Columna Más Afectada"
-        )
-        for card in (self.card_freq_anomalia_top, self.card_freq_anomalia_col):
-            cards_row_anomalias.addWidget(card)
-        layout.addLayout(cards_row_anomalias)
-        self.lbl_freq_anomalia_top.setText("Genera Narrativa primero")
-        self.lbl_freq_anomalia_col.setText("Genera Narrativa primero")
-
-        body_widget = QWidget()
-        body = QHBoxLayout(body_widget)
-
-        self.freq_table_model = PandasTableModel()
-        self.freq_table_view = QTableView()
-        self.freq_table_view.setModel(self.freq_table_model)
-        self.freq_table_view.setAlternatingRowColors(True)
-        self.freq_table_view.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        self.freq_table_view.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        self.freq_table_view.clicked.connect(self._mostrar_celda_en_status)
-        body.addWidget(self.freq_table_view, stretch=1)
-
-        self.freq_plot = pg.PlotWidget()
-        self.freq_plot.setMinimumWidth(320)
-        body.addWidget(self.freq_plot, stretch=1)
-
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setWidget(body_widget)
-        layout.addWidget(scroll, stretch=1)
+        layout.addWidget(self.panel_frecuencias)
 
     # ------------------------------------------------------------------
     # TAB NARRATIVA
@@ -3450,28 +3355,40 @@ class HadarApp(QMainWindow):
         self.btn_generar_narrativa = QPushButton("Generar Narrativa")
         self.btn_generar_narrativa.setObjectName("accentButton")
         self.btn_generar_narrativa.clicked.connect(self._generar_narrativa)
+        self.btn_generar_narrativa.setCursor(Qt.PointingHandCursor)
+        self.btn_generar_narrativa.setStyleSheet(QSS_SUBPESTANA)
         controls.addWidget(self.btn_generar_narrativa)
 
         self.btn_config_relaciones_temporales = QPushButton("Configurar relaciones de fechas")
         self.btn_config_relaciones_temporales.clicked.connect(self._configurar_relaciones_temporales)
+        self.btn_config_relaciones_temporales.setCursor(Qt.PointingHandCursor)
+        self.btn_config_relaciones_temporales.setStyleSheet(QSS_SUBPESTANA)
         controls.addWidget(self.btn_config_relaciones_temporales)
 
         self.btn_narrativa_exportar_pdf = QPushButton("Exportar a PDF")
         self.btn_narrativa_exportar_pdf.clicked.connect(self._narrativa_exportar_pdf)
+        self.btn_narrativa_exportar_pdf.setCursor(Qt.PointingHandCursor)
+        self.btn_narrativa_exportar_pdf.setStyleSheet(QSS_SUBPESTANA)
         controls.addWidget(self.btn_narrativa_exportar_pdf)
 
         self.btn_ml_multivariado = QPushButton("Detección por combinación (ML): Desactivado")
         self.btn_ml_multivariado.setCheckable(True)
         self.btn_ml_multivariado.toggled.connect(self._alternar_ml_multivariado)
+        self.btn_ml_multivariado.setCursor(Qt.PointingHandCursor)
+        self.btn_ml_multivariado.setStyleSheet(QSS_SUBPESTANA)
         controls.addWidget(self.btn_ml_multivariado)
 
         self.lbl_narrativa_estado = QLabel(
             "Genera un informe con los hallazgos automáticos de tus datos actuales."
         )
         self.lbl_narrativa_estado.setObjectName("muted")
-        controls.addWidget(self.lbl_narrativa_estado)
+        # En su propia línea y con salto de línea: antes iba al lado de los
+        # 4 botones y la fila entera exigía ~1270 px de ancho, lo que
+        # impedía achicar la ventana hacia los lados en pantallas de 1280.
+        self.lbl_narrativa_estado.setWordWrap(True)
         controls.addStretch()
         layout.addLayout(controls)
+        layout.addWidget(self.lbl_narrativa_estado)
 
         # Informe y Linaje son sub-pestañas DENTRO de Narrativa (no
         # pestañas del nivel superior): Linaje solo tiene sentido después
@@ -3480,6 +3397,8 @@ class HadarApp(QMainWindow):
         # del mismo botón "Generar Narrativa" deja esa dependencia clara,
         # en vez de una pestaña suelta que se ve rota si se abre primero.
         self.subtabs_narrativa = QTabWidget()
+        self.subtabs_narrativa.tabBar().setStyleSheet(QSS_SUBPESTANA_TABBAR)
+        self.subtabs_narrativa.tabBar().setCursor(Qt.PointingHandCursor)
         # Ocultas hasta generar Narrativa por primera vez: Linaje no tiene sentido
         # antes (necesita las relaciones y anomalías de un informe), y dejar el
         # espacio libre mientras tanto evita dos sub-pestañas que se ven rotas o
@@ -3493,6 +3412,7 @@ class HadarApp(QMainWindow):
             "Presiona \"Generar Narrativa\" para ver aquí el Informe y el Linaje."
         )
         self.lbl_narrativa_vacia.setObjectName("muted")
+        self.lbl_narrativa_vacia.setWordWrap(True)
         self.lbl_narrativa_vacia.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(self.lbl_narrativa_vacia, stretch=1)
 
@@ -3536,6 +3456,7 @@ class HadarApp(QMainWindow):
             "Genera Narrativa primero -- Linaje necesita las relaciones y anomalías de tu último informe."
         )
         self.lbl_linaje_estado.setObjectName("muted")
+        self.lbl_linaje_estado.setWordWrap(True)
         layout.addWidget(self.lbl_linaje_estado)
 
         buscar_row = QHBoxLayout()
@@ -4030,1024 +3951,32 @@ class HadarApp(QMainWindow):
         QMessageBox.information(self, "Listo", f"Narrativa exportada a:\n{path}")
 
     # ------------------------------------------------------------------
-    # TAB REPORTE (lienzo tipo Excel+Word)
+    # TAB REPORTE
     # ------------------------------------------------------------------
     def _build_tab_reporte(self, tab):
+        # Todo el contenido de esta pestaña vive en reporte_ui.py.
         layout = QVBoxLayout(tab)
+        layout.setContentsMargins(0, 0, 0, 0)
+        self.panel_reporte = PanelReporte(host=self)
+        layout.addWidget(self.panel_reporte)
 
-        barra = QHBoxLayout()
-        # Antes eran 10 botones "+X" en fila, y con "Línea de Tiempo" sumado
-        # ya no entraban en el ancho disponible (se veían cortados). En vez
-        # de acomodarlos apretados, se juntan en un solo botón desplegable
-        # -- así el espacio no vuelve a reventar el día que se agregue un
-        # tipo de bloque más.
-        btn_agregar = QToolButton()
-        btn_agregar.setText("+ Agregar bloque")
-        btn_agregar.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
-        btn_agregar.setObjectName("accentButton")
-        menu_agregar = QMenu(btn_agregar)
-        menu_agregar.addAction("Texto", self._reporte_agregar_texto)
-        menu_agregar.addAction("Gráfico", self._reporte_agregar_grafico)
-        menu_agregar.addAction("Métrica", self._reporte_agregar_metrica)
-        menu_agregar.addAction("Indicador", self._reporte_agregar_indicador)
-        menu_agregar.addAction("Frecuencias", self._reporte_agregar_frecuencias)
-        menu_agregar.addAction("Narrativa", self._reporte_agregar_narrativa)
-        menu_agregar.addAction("Esquema", self._reporte_agregar_esquema)
-        menu_agregar.addAction("Imagen", self._reporte_agregar_imagen)
-        menu_agregar.addAction("Cálculo", self._reporte_agregar_calculo)
-        menu_agregar.addAction("Línea de Tiempo", self._reporte_agregar_linea_tiempo)
-        btn_agregar.setMenu(menu_agregar)
-        barra.addWidget(btn_agregar)
-
-        btn_exportar = QPushButton("Exportar a PDF")
-        btn_exportar.setObjectName("accentButton")
-        barra.addStretch()
-        barra.addWidget(btn_exportar)
-        layout.addLayout(barra)
-
-        # Barra de hojas: cada hoja es una página independiente del reporte,
-        # con su propio lienzo y su propia numeración de recuadros.
-        barra_hojas = QHBoxLayout()
-        self.reporte_tabbar = QTabBar()
-        self.reporte_tabbar.setTabsClosable(True)
-        self.reporte_tabbar.setExpanding(False)
-        self.reporte_tabbar.setDrawBase(False)
-        self.reporte_tabbar.currentChanged.connect(self._reporte_cambiar_hoja)
-        self.reporte_tabbar.tabCloseRequested.connect(self._reporte_eliminar_hoja)
-        self.reporte_tabbar.tabBarDoubleClicked.connect(self._reporte_renombrar_hoja)
-        barra_hojas.addWidget(self.reporte_tabbar, stretch=1)
-        btn_nueva_hoja = QPushButton("+ Hoja")
-        btn_nueva_hoja.clicked.connect(lambda: self._reporte_nueva_hoja())
-        barra_hojas.addWidget(btn_nueva_hoja)
-        layout.addLayout(barra_hojas)
-
-        self._reporte_texto_activo = None
-        self._crear_barra_formato_texto(layout)
-
-        self.reporte_hojas = []
-        self.reporte_scene = None
-        self.reporte_view = QGraphicsView()
-        self.reporte_view.setRenderHint(QPainter.RenderHint.Antialiasing)
-        self.reporte_view.setBackgroundBrush(QBrush(QColor(self.colors["bg"])))
-        layout.addWidget(self.reporte_view, stretch=1)
-
-        btn_exportar.clicked.connect(self._reporte_exportar_pdf)
-
-        self._reporte_nueva_hoja("Hoja 1")
-
-    # -- barra fija de formato de texto (fuente/tamaño/negrita/rojo) --
-    def _crear_barra_formato_texto(self, layout_reporte):
-        """Fila de formato de texto SIEMPRE visible dentro de la pestaña
-        Reporte (no flotante encima del lienzo). Antes vivía como un widget
-        flotante hijo del viewport del QGraphicsView y se posicionaba a mano;
-        eso generaba una carrera de foco con los QComboBox (su lista
-        desplegable es una ventana aparte) que a veces impedía elegir fuente
-        o tamaño. Como fila fija de la pestaña, ese problema desaparece."""
-        barra = QFrame()
-        barra.setObjectName("card")
-        fila = QHBoxLayout(barra)
-        fila.setContentsMargins(8, 6, 8, 6)
-        fila.setSpacing(6)
-
-        self.lbl_barra_formato = QLabel("Formato de texto: elige un recuadro de texto (doble clic) para activarlo.")
-        self.lbl_barra_formato.setObjectName("muted")
-        # OJO: un QLabel de una sola línea (sin wrap) le pide a su layout,
-        # como mínimo, el ancho completo del texto -- a diferencia de un
-        # QTabBar (las pestañas de arriba, que sí achican/truncan solas),
-        # un QLabel normal NO cede nada por su cuenta. Como esta fila vive
-        # en el mismo QVBoxLayout que "Exportar a PDF" y "+ Hoja" (filas
-        # separadas, pero mismo ancho de página), ese mínimo tan largo
-        # terminaba empujando TODO lo demás de la pestaña Reporte fuera
-        # del ancho disponible. Ignored le dice al layout "no me uses de
-        # referencia para el mínimo": el texto se puede recortar sin que
-        # se lleve por delante los botones de las otras filas.
-        self.lbl_barra_formato.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
-        fila.addWidget(self.lbl_barra_formato, stretch=1)
-
-        fila.addWidget(QLabel("Fuente:"))
-        self.combo_fuente_texto = QComboBox()
-        self.combo_fuente_texto.addItems(REPORTE_FUENTES)
-        fila.addWidget(self.combo_fuente_texto)
-
-        fila.addWidget(QLabel("Tamaño:"))
-        self.combo_tamano_texto = QComboBox()
-        self.combo_tamano_texto.addItems([str(t) for t in REPORTE_TAMANOS])
-        fila.addWidget(self.combo_tamano_texto)
-
-        self.btn_negrita_texto = QPushButton("N")
-        self.btn_negrita_texto.setCheckable(True)
-        self.btn_negrita_texto.setFixedWidth(28)
-        self.btn_negrita_texto.setToolTip("Negrita")
-        font_negrita = self.btn_negrita_texto.font()
-        font_negrita.setBold(True)
-        self.btn_negrita_texto.setFont(font_negrita)
-        fila.addWidget(self.btn_negrita_texto)
-
-        self.btn_rojo_texto = QPushButton("A")
-        self.btn_rojo_texto.setCheckable(True)
-        self.btn_rojo_texto.setFixedWidth(28)
-        self.btn_rojo_texto.setToolTip("Resaltar en rojo")
-        self.btn_rojo_texto.setStyleSheet(
-            f"QPushButton {{ color: {REPORTE_COLOR_ROJO}; font-weight: bold; }}"
-        )
-        fila.addWidget(self.btn_rojo_texto)
-
-        self.barra_texto_reporte = barra
-        self.barra_texto_reporte.setEnabled(False)
-        layout_reporte.addWidget(barra)
-
-        self.combo_fuente_texto.currentTextChanged.connect(
-            lambda familia: self._reporte_aplicar_formato_texto(
-                lambda fmt: self._set_fuente_familia(fmt, familia)
-            )
-        )
-        self.combo_tamano_texto.currentTextChanged.connect(
-            lambda tam: self._reporte_aplicar_formato_texto(
-                lambda fmt: fmt.setFontPointSize(float(tam))
-            )
-        )
-        self.btn_negrita_texto.toggled.connect(
-            lambda activo: self._reporte_aplicar_formato_texto(
-                lambda fmt: fmt.setFontWeight(QFont.Weight.Bold if activo else QFont.Weight.Normal)
-            )
-        )
-        self.btn_rojo_texto.toggled.connect(
-            lambda activo: self._reporte_aplicar_formato_texto(
-                lambda fmt: fmt.setForeground(
-                    QColor(REPORTE_COLOR_ROJO) if activo else QColor(REPORTE_PAPEL_TINTA)
-                )
-            )
-        )
-
-    @staticmethod
-    def _set_fuente_familia(fmt, familia):
-        if hasattr(fmt, "setFontFamilies"):
-            fmt.setFontFamilies([familia])
-        else:
-            fmt.setFontFamily(familia)
-
-    def _reporte_mostrar_barra_texto(self, box_item):
-        """Se llama cuando el usuario entra a editar un recuadro de texto
-        (doble clic): activa la barra de formato y sincroniza sus controles
-        con el formato del texto en la posición actual del cursor."""
-        self._reporte_texto_activo = box_item
-        self.barra_texto_reporte.setEnabled(True)
-        self.lbl_barra_formato.setText("Formato de texto:")
-
-        cursor = box_item.text_item.textCursor()
-        fmt = cursor.charFormat()
-        fuente = fmt.font()
-
-        familia = fuente.family() or "Arial"
-        if familia not in REPORTE_FUENTES:
-            familia = "Arial"
-        self.combo_fuente_texto.blockSignals(True)
-        self.combo_fuente_texto.setCurrentText(familia)
-        self.combo_fuente_texto.blockSignals(False)
-
-        tam = int(fuente.pointSize()) if fuente.pointSize() > 0 else 12
-        if tam not in REPORTE_TAMANOS:
-            tam = min(REPORTE_TAMANOS, key=lambda t: abs(t - tam))
-        self.combo_tamano_texto.blockSignals(True)
-        self.combo_tamano_texto.setCurrentText(str(tam))
-        self.combo_tamano_texto.blockSignals(False)
-
-        self.btn_negrita_texto.blockSignals(True)
-        self.btn_negrita_texto.setChecked(fuente.bold())
-        self.btn_negrita_texto.blockSignals(False)
-
-        self.btn_rojo_texto.blockSignals(True)
-        self.btn_rojo_texto.setChecked(fmt.foreground().color().name().lower() == REPORTE_COLOR_ROJO.lower())
-        self.btn_rojo_texto.blockSignals(False)
-
-    def _reporte_ocultar_barra_texto(self, box_item):
-        # La barra ahora es una fila fija (no flotante), así que no hace
-        # falta ocultarla: se deja habilitada, apuntando al último recuadro
-        # de texto editado, para poder seguir ajustándole el formato aunque
-        # el cursor ya no esté parpadeando adentro.
-        pass
-
-    def _reporte_aplicar_formato_texto(self, modificar_formato):
-        """modificar_formato: función que recibe un QTextCharFormat y lo
-        modifica in-place. Se aplica a la selección actual del recuadro de
-        texto activo (o, si no hay selección, a lo próximo que se escriba)."""
-        box_item = self._reporte_texto_activo
-        if box_item is None or box_item.text_item is None:
-            return
-        text_item = box_item.text_item
-        try:
-            cursor = text_item.textCursor()
-            fmt = QTextCharFormat()
-            modificar_formato(fmt)
-            cursor.mergeCharFormat(fmt)
-        except RuntimeError:
-            return  # el recuadro fue eliminado mientras tanto
-
-        # Devolver el foco al recuadro se deja para el próximo ciclo de
-        # eventos (QTimer con delay 0): hacerlo de inmediato, todavía dentro
-        # del manejador de señal del combo, interfería con el cierre de su
-        # lista desplegable y a veces impedía que el cambio de fuente/tamaño
-        # se registrara — esa era la causa del bug de "no me deja escoger".
-        QTimer.singleShot(0, lambda: self._reporte_reenfocar_texto(text_item, cursor))
-
-    def _reporte_reenfocar_texto(self, text_item, cursor):
-        try:
-            text_item.setTextInteractionFlags(Qt.TextInteractionFlag.TextEditorInteraction)
-            # Para que el recuadro reciba de verdad las teclas (y no solo se
-            # vea "enfocado"), la vista que lo contiene también necesita el
-            # foco real del teclado — no basta con enfocar el ítem dentro de
-            # la escena. Sin esta línea, el cursor parpadeaba pero las teclas
-            # se iban a ningún lado (o al combo), bloqueando la escritura.
-            self.reporte_view.setFocus(Qt.FocusReason.OtherFocusReason)
-            text_item.setTextCursor(cursor)
-            text_item.setFocus(Qt.FocusReason.OtherFocusReason)
-        except RuntimeError:
-            pass  # el recuadro fue eliminado mientras tanto
-
-    def _reporte_nueva_hoja(self, nombre=None):
-        if nombre is None:
-            nombre = f"Hoja {len(self.reporte_hojas) + 1}"
-        scene = QGraphicsScene(0, 0, 850, 1100)
-        scene._offset = 0
-        pagina = QGraphicsRectItem(0, 0, 850, 1100)
-        pagina.setBrush(QBrush(QColor(REPORTE_PAPEL_BG)))
-        pagina.setPen(QPen(QColor(REPORTE_PAPEL_BORDE), 1))
-        pagina.setZValue(-1000)
-        scene.addItem(pagina)
-        self.reporte_hojas.append({"nombre": nombre, "scene": scene, "pagina": pagina})
-
-        self.reporte_tabbar.blockSignals(True)
-        idx = self.reporte_tabbar.addTab(nombre)
-        self.reporte_tabbar.blockSignals(False)
-        self.reporte_tabbar.setCurrentIndex(idx)
-        self._reporte_cambiar_hoja(idx)
-
-    def _reporte_cambiar_hoja(self, index):
-        if index < 0 or index >= len(self.reporte_hojas):
-            return
-        self.reporte_scene = self.reporte_hojas[index]["scene"]
-        self.reporte_view.setScene(self.reporte_scene)
-
-    def _reporte_renombrar_hoja(self, index):
-        if index < 0 or index >= len(self.reporte_hojas):
-            return
-        actual = self.reporte_hojas[index]["nombre"]
-        nuevo, ok = QInputDialog.getText(
-            self, "Renombrar hoja", "Nombre de la hoja:", QLineEdit.Normal, actual
-        )
-        if not ok or not nuevo.strip():
-            return
-        nuevo = nuevo.strip()
-        self.reporte_hojas[index]["nombre"] = nuevo
-        self.reporte_tabbar.setTabText(index, nuevo)
-
-    def _reporte_eliminar_hoja(self, index):
-        if index < 0 or index >= len(self.reporte_hojas):
-            return
-        if len(self.reporte_hojas) <= 1:
-            QMessageBox.information(
-                self, "No se puede eliminar", "Debe quedar al menos una hoja en el reporte."
-            )
-            return
-        resp = QMessageBox.question(
-            self, "Eliminar hoja",
-            f"¿Eliminar \"{self.reporte_hojas[index]['nombre']}\" y todo su contenido?"
-        )
-        if resp != QMessageBox.StandardButton.Yes:
-            return
-        del self.reporte_hojas[index]
-        self.reporte_tabbar.blockSignals(True)
-        self.reporte_tabbar.removeTab(index)
-        self.reporte_tabbar.blockSignals(False)
-        nuevo_index = max(0, self.reporte_tabbar.currentIndex())
-        self._reporte_cambiar_hoja(nuevo_index)
-
-    def _reporte_siguiente_posicion(self, ancho, alto):
-        """Posiciona cada recuadro nuevo en cascada dentro de la hoja activa,
-        para que no queden todos exactamente encima del anterior."""
-        escena = self.reporte_scene
-        offset = getattr(escena, "_offset", 0)
-        x = 40 + (offset % 6) * 25
-        y = 40 + (offset % 6) * 25
-        escena._offset = offset + 1
-        return QRectF(x, y, ancho, alto)
-
-    def _reporte_agregar_texto(self):
-        rect = self._reporte_siguiente_posicion(220, 100)
-        item = ReportBoxItem("texto", rect, self.colors, ventana_principal=self)
-        self.reporte_scene.addItem(item)
-
+    # La Línea de Tiempo manda hallazgos al Reporte llamando a estos dos
+    # métodos de la ventana principal; se dejan como puente hacia reporte_ui.py.
     def _reporte_agregar_anomalia_desde_linea_tiempo(self, anomalia):
-        rect = self._reporte_siguiente_posicion(280, 140)
-        item = ReportBoxItem("lista", rect, self.colors, ventana_principal=self)
-        cuerpo = anomalia.get("descripcion", "")
-        frase_memoria = anomalia.get("frase_memoria")
-        if frase_memoria:
-            cuerpo += f"<br><br>{frase_memoria}"
-        item.set_lista_text("Hallazgo — Línea de Tiempo", cuerpo)
-        self.reporte_scene.addItem(item)
+        self.panel_reporte._reporte_agregar_anomalia_desde_linea_tiempo(anomalia)
 
     def _reporte_agregar_metricas_tiempo(self, titulo, html):
-        # Se llama desde el botón "Enviar a Reporte" del diálogo "Ver
-        # métricas de tiempo" de la Línea de Tiempo -- son solo números y
-        # texto, así que va como bloque 'lista', igual que Frecuencias y
-        # que los hallazgos de anomalías, no como imagen.
-        rect = self._reporte_siguiente_posicion(300, 160)
-        item = ReportBoxItem("lista", rect, self.colors, ventana_principal=self)
-        item.set_lista_text(titulo, html)
-        self.reporte_scene.addItem(item)
-
-    def _reporte_agregar_linea_tiempo(self):
-        if not hasattr(self, "panel_linea_tiempo") or self.df is None or self.df.empty:
-            QMessageBox.information(self, "Sin datos", "Carga datos primero.")
-            return
-
-        panel = self.panel_linea_tiempo
-
-        def regenerar(panel=panel):
-            return panel.snapshot()
-
-        rect = self._reporte_siguiente_posicion(360, 300)
-        item = ReportBoxItem("imagen", rect, self.colors, ventana_principal=self, titulo=panel.nombre())
-        item.regenerar = regenerar
-        item.set_pixmap(regenerar())
-        self.reporte_scene.addItem(item)
-
-    def _reporte_agregar_grafico(self):
-        if not self.chart_panels:
-            QMessageBox.information(
-                self, "Sin gráficos",
-                "Primero genera al menos un gráfico en la pestaña Gráficos."
-            )
-            return
-        opciones = [f"{i + 1}. {p.etiqueta()}" for i, p in enumerate(self.chart_panels)]
-        elegido, ok = QInputDialog.getItem(
-            self, "Elegir gráfico", "¿Cuál gráfico quieres llevar al reporte?", opciones, 0, False
-        )
-        if not ok or not elegido:
-            return
-        idx = opciones.index(elegido)
-        panel = self.chart_panels[idx]
-        titulo = panel.nombre() or None
-
-        def regenerar(panel=panel):
-            return panel.snapshot()
-
-        rect = self._reporte_siguiente_posicion(340, 240)
-        item = ReportBoxItem("imagen", rect, self.colors, ventana_principal=self, titulo=titulo)
-        item.regenerar = regenerar
-        item.set_pixmap(regenerar())
-        self.reporte_scene.addItem(item)
-
-    def _reporte_agregar_indicador(self):
-        if not self.indicadores:
-            QMessageBox.information(
-                self, "Sin indicadores",
-                "Todavía no has creado ningún indicador. Ve a la pestaña Indicadores para crear uno."
-            )
-            return
-        nombres = [ind.nombre for ind in self.indicadores]
-        elegido, ok = QInputDialog.getItem(
-            self, "Elegir indicador", "¿Qué indicador quieres llevar al reporte?", nombres, 0, False
-        )
-        if not ok or not elegido:
-            return
-        indicador = next((ind for ind in self.indicadores if ind.nombre == elegido), None)
-        if indicador is None:
-            return
-
-        def calcular(indicador=indicador):
-            df_actual = self.filtered_df if self.filtered_df is not None else self.df
-            valor = indicador.calcular(df_actual)
-            valor_crudo = float(valor) if isinstance(valor, (int, float)) and not pd.isna(valor) else None
-            return indicador.nombre, indicador.formatear(valor), valor_crudo
-
-        rect = self._reporte_siguiente_posicion(200, 110)
-        item = ReportBoxItem("calculo", rect, self.colors, ventana_principal=self)
-        item.regenerar = calcular
-        titulo, valor_str, valor_crudo = calcular()
-        item.set_calculo_text(titulo, valor_str, valor_crudo)
-        self.reporte_scene.addItem(item)
-
-    def _reporte_agregar_narrativa(self):
-        if not hasattr(self, "narrativa_browser"):
-            return
-        if not getattr(self, "_narrativa_actualizada", False):
-            df = self.filtered_df if self.filtered_df is not None else self.df
-            if df is None or df.empty:
-                QMessageBox.information(self, "Sin datos", "Carga datos primero.")
-                return
-            self._generar_narrativa()
-
-        opciones = [
-            "Informe completo (foto)",
-            "Preguntas sugeridas (lista)",
-        ]
-        elegido, ok = QInputDialog.getItem(
-            self, "Elegir tipo", "¿Qué quieres traer de Narrativa?", opciones, 0, False
-        )
-        if not ok or not elegido:
-            return
-
-        if elegido == "Informe completo (foto)":
-            def regenerar():
-                if not getattr(self, "_narrativa_actualizada", False):
-                    self._generar_narrativa()
-                self.narrativa_browser.repaint()
-                QApplication.processEvents()
-                return self.narrativa_browser.grab()
-
-            rect = self._reporte_siguiente_posicion(360, 260)
-            item = ReportBoxItem("imagen", rect, self.colors, ventana_principal=self)
-            item.regenerar = regenerar
-            item.set_pixmap(regenerar())
-            self.reporte_scene.addItem(item)
-        else:
-            def calcular():
-                df_actual = self.filtered_df if self.filtered_df is not None else self.df
-                titulo = "Preguntas sugeridas"
-                if df_actual is None or df_actual.empty:
-                    return titulo, "-"
-                preguntas = QuestionAssistant(df_actual, self._ultimas_anomalias).suggest()
-                if not preguntas:
-                    return titulo, "Sin preguntas sugeridas por ahora."
-                cuerpo = "<br>".join(f"{i + 1}. {p}" for i, p in enumerate(preguntas))
-                return titulo, cuerpo
-
-            rect = self._reporte_siguiente_posicion(280, 220)
-            item = ReportBoxItem("lista", rect, self.colors, ventana_principal=self)
-            item.regenerar = calcular
-            titulo, cuerpo = calcular()
-            item.set_lista_text(titulo, cuerpo)
-            self.reporte_scene.addItem(item)
-
-    def _reporte_agregar_esquema(self):
-        """Trae el esquema sugerido/confirmado entre tus tablas como una
-        foto -- útil para dejar constancia visual de cómo está armada la
-        base relacional dentro del informe final."""
-        if len(self.tablas) < 2:
-            QMessageBox.information(
-                self, "Sin esquema para mostrar",
-                "Carga 2 o más tablas relacionadas (ver botón \"Ver esquema\" en "
-                "Datos) para poder agregar el esquema al reporte."
-            )
-            return
-
-        def regenerar():
-            dialogo_temp = DialogoEsquemaOntologia(self.tablas, self.colors,
-                                                    relaciones_iniciales=self.relaciones_ontologia)
-            return dialogo_temp.render_a_pixmap()
-
-        rect = self._reporte_siguiente_posicion(420, 260)
-        item = ReportBoxItem("imagen", rect, self.colors, ventana_principal=self, titulo="Esquema de tus tablas")
-        item.regenerar = regenerar
-        item.set_pixmap(regenerar())
-        self.reporte_scene.addItem(item)
-
-    def _reporte_agregar_imagen(self):
-        """Sube una imagen desde el disco (ej. una captura de pantalla que
-        tomaste tú mismo del mapa) y la deja como recuadro fijo — sin botón
-        de actualizar, porque no está ligada a ningún dato de la app."""
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Elegir imagen", "", "Imágenes (*.png *.jpg *.jpeg *.bmp *.webp)"
-        )
-        if not path:
-            return
-        pixmap = QPixmap(path)
-        if pixmap.isNull():
-            QMessageBox.warning(self, "No se pudo abrir", "Ese archivo no se pudo cargar como imagen.")
-            return
-
-        rect = self._reporte_siguiente_posicion(320, 220)
-        item = ReportBoxItem("imagen", rect, self.colors, ventana_principal=self, con_refresh=False)
-        item.set_pixmap(pixmap)
-        self.reporte_scene.addItem(item)
-
-    def _reporte_agregar_metrica(self):
-        """Trae una de las 4 estadísticas -- o el gráfico de caja y bigote --
-        de uno de los bloques de la pestaña Métricas."""
-        if not self.metricas_bloques:
-            QMessageBox.information(
-                self, "Sin métricas", "Agrega al menos un bloque de métricas primero."
-            )
-            return
-
-        columnas_disponibles = [b["columna"] for b in self.metricas_bloques]
-        columna, ok = QInputDialog.getItem(
-            self, "Elegir columna", "¿De qué columna quieres traer una métrica?",
-            columnas_disponibles, 0, False
-        )
-        if not ok or not columna:
-            return
-
-        opciones = ["Media", "Mediana", "Moda", "Desviación Std", "Gráfico de caja y bigote (foto)"]
-        elegido, ok = QInputDialog.getItem(
-            self, "Elegir métrica", "¿Qué quieres traer al reporte?", opciones, 0, False
-        )
-        if not ok or not elegido:
-            return
-
-        if elegido == "Gráfico de caja y bigote (foto)":
-            bloque = next((b for b in self.metricas_bloques if b["columna"] == columna), None)
-            if bloque is None:
-                return
-
-            def regenerar(plot=bloque["plot"]):
-                try:
-                    import pyqtgraph.exporters as pg_exporters
-                    exportador = pg_exporters.ImageExporter(plot.getPlotItem())
-                    imagen = exportador.export(toBytes=True)
-                    pixmap = QPixmap.fromImage(imagen)
-                    if not pixmap.isNull():
-                        return pixmap
-                except Exception:
-                    pass
-                return plot.grab()
-
-            rect = self._reporte_siguiente_posicion(340, 240)
-            item = ReportBoxItem(
-                "imagen", rect, self.colors, ventana_principal=self, titulo=f"Caja y bigote — {columna}"
-            )
-            item.regenerar = regenerar
-            item.set_pixmap(regenerar())
-            self.reporte_scene.addItem(item)
-            return
-
-        def calcular(elegido=elegido, columna=columna):
-            df_actual = self.filtered_df
-            if df_actual is None or df_actual.empty or columna not in df_actual.columns:
-                return f"{elegido} de {columna}", "-", None
-            serie = pd.to_numeric(df_actual[columna], errors="coerce").dropna()
-            if serie.empty:
-                return f"{elegido} de {columna}", "-", None
-            if elegido == "Media":
-                valor = serie.mean()
-            elif elegido == "Mediana":
-                valor = serie.median()
-            elif elegido == "Moda":
-                moda = serie.mode()
-                valor = moda.iloc[0] if not moda.empty else None
-            else:
-                valor = serie.std()
-            if valor is None or pd.isna(valor):
-                return f"{elegido} de {columna}", "-", None
-            return f"{elegido} de {columna}", f"{valor:,.2f}", float(valor)
-
-        rect = self._reporte_siguiente_posicion(200, 110)
-        item = ReportBoxItem("calculo", rect, self.colors, ventana_principal=self)
-        item.regenerar = calcular
-        titulo, valor_str, valor_crudo = calcular()
-        item.set_calculo_text(titulo, valor_str, valor_crudo)
-        self.reporte_scene.addItem(item)
-
-    def _reporte_agregar_frecuencias(self):
-        opciones = [
-            "Tabla de frecuencias (foto)",
-            "Gráfico de frecuencias (foto)",
-            "Top 10 más repetidos (lista)",
-        ]
-        elegido, ok = QInputDialog.getItem(
-            self, "Elegir tipo", "¿Qué quieres traer de Frecuencias?", opciones, 0, False
-        )
-        if not ok or not elegido:
-            return
-
-        if elegido == "Tabla de frecuencias (foto)":
-            def regenerar():
-                self.freq_table_view.repaint()
-                return self.freq_table_view.grab()
-
-            rect = self._reporte_siguiente_posicion(340, 240)
-            item = ReportBoxItem("imagen", rect, self.colors, ventana_principal=self)
-            item.regenerar = regenerar
-            item.set_pixmap(regenerar())
-            self.reporte_scene.addItem(item)
-
-        elif elegido == "Gráfico de frecuencias (foto)":
-            def regenerar():
-                try:
-                    import pyqtgraph.exporters as pg_exporters
-                    exportador = pg_exporters.ImageExporter(self.freq_plot.getPlotItem())
-                    imagen = exportador.export(toBytes=True)
-                    pixmap = QPixmap.fromImage(imagen)
-                    if not pixmap.isNull():
-                        return pixmap
-                except Exception:
-                    pass
-                return self.freq_plot.grab()
-
-            rect = self._reporte_siguiente_posicion(340, 240)
-            item = ReportBoxItem("imagen", rect, self.colors, ventana_principal=self)
-            item.regenerar = regenerar
-            item.set_pixmap(regenerar())
-            self.reporte_scene.addItem(item)
-
-        else:  # Top 10 más repetidos
-            if self.filtered_df is None or self.filtered_df.empty:
-                QMessageBox.information(self, "Sin datos", "Carga datos primero.")
-                return
-            columnas = list(self.filtered_df.columns)
-            columna, ok = QInputDialog.getItem(
-                self, "Elegir columna", "¿De qué columna quieres el top 10?", columnas, 0, False
-            )
-            if not ok or not columna:
-                return
-
-            def calcular(columna=columna):
-                df_actual = self.filtered_df
-                titulo = f"Top 10 más repetidos — {columna}"
-                if df_actual is None or columna not in df_actual.columns:
-                    return titulo, "-"
-                serie = df_actual[columna].dropna().astype(str)
-                if serie.empty:
-                    return titulo, "-"
-                top = serie.value_counts().head(10)
-                cuerpo = "<br>".join(f"{i + 1}. {val} ({freq})" for i, (val, freq) in enumerate(top.items()))
-                return titulo, cuerpo
-
-            rect = self._reporte_siguiente_posicion(240, 220)
-            item = ReportBoxItem("lista", rect, self.colors, ventana_principal=self)
-            item.regenerar = calcular
-            titulo, cuerpo = calcular()
-            item.set_lista_text(titulo, cuerpo)
-            self.reporte_scene.addItem(item)
-
-    def _reporte_agregar_calculo(self):
-        if self.filtered_df is None or self.filtered_df.empty:
-            QMessageBox.information(self, "Sin datos", "Carga datos primero.")
-            return
-
-        origen, ok = QInputDialog.getItem(
-            self, "Tipo de cálculo", "¿Qué quieres calcular?",
-            [
-                "Una operación nueva sobre una columna",
-                "Combinar recuadros ya creados (Métrica/Indicador/Cálculo)",
-            ], 0, False
-        )
-        if not ok or not origen:
-            return
-
-        if origen.startswith("Combinar"):
-            self._reporte_agregar_calculo_combinado()
-        else:
-            self._reporte_agregar_calculo_columna()
-
-    def _reporte_agregar_calculo_combinado(self):
-        """Combina 2 valores con una operación básica — por ejemplo,
-        Ganancia = Ingresos − Costos. Las fuentes disponibles son: cualquier
-        Indicador ya creado (pestaña Indicadores), cualquier Métrica de la
-        pestaña Métricas, o un recuadro de Cálculo que ya hayas puesto en
-        esta hoja del Reporte. No hace falta ponerlos primero en el lienzo."""
-        fuentes = []  # cada fuente: (etiqueta para elegir, nombre corto, función sin args -> valor o None)
-
-        for ind in self.indicadores:
-            fuentes.append((
-                f"Indicador: {ind.nombre}", ind.nombre,
-                lambda ind=ind: ind.calcular(self.filtered_df if self.filtered_df is not None else self.df)
-            ))
-
-        for bloque in getattr(self, "metricas_bloques", []):
-            col_metrica = bloque["columna"]
-            for nombre_metrica in ["Media", "Mediana", "Moda", "Desviación Std"]:
-                fuentes.append((
-                    f"Métrica: {nombre_metrica} de {col_metrica}",
-                    f"{nombre_metrica} de {col_metrica}",
-                    lambda nm=nombre_metrica, col=col_metrica: self._calcular_valor_metrica(nm, col)
-                ))
-
-        candidatos_lienzo = [
-            it for it in self.reporte_scene.items()
-            if isinstance(it, ReportBoxItem) and it.kind == "calculo"
-        ]
-        for it in candidatos_lienzo:
-            fuentes.append((
-                f"En el reporte: {it.titulo_calculo or 'Sin título'}",
-                it.titulo_calculo or "Sin título",
-                (lambda it=it: it.valor_crudo)
-            ))
-
-        if len(fuentes) < 2:
-            QMessageBox.information(
-                self, "Faltan datos para combinar",
-                "Necesitas al menos 2 valores disponibles para combinar: crea un indicador en la "
-                "pestaña Indicadores, elige una columna en la pestaña Métricas, o agrega un recuadro "
-                "de Cálculo en esta hoja primero."
-            )
-            return
-
-        etiquetas = [e for e, _, _ in fuentes]
-
-        etiqueta_a, ok = QInputDialog.getItem(self, "Primer valor", "Elige el primer valor:", etiquetas, 0, False)
-        if not ok or not etiqueta_a:
-            return
-        etiqueta_b, ok = QInputDialog.getItem(self, "Segundo valor", "Elige el segundo valor:", etiquetas, 0, False)
-        if not ok or not etiqueta_b:
-            return
-
-        _, nombre_a, funcion_a = fuentes[etiquetas.index(etiqueta_a)]
-        _, nombre_b, funcion_b = fuentes[etiquetas.index(etiqueta_b)]
-
-        operacion, ok = QInputDialog.getItem(
-            self, "Elegir operación", "¿Cómo quieres combinarlos?",
-            ["Suma", "Resta (primero − segundo)", "Multiplicación", "División (primero ÷ segundo)"], 0, False
-        )
-        if not ok or not operacion:
-            return
-
-        formato, ok = QInputDialog.getText(
-            self, "Formato de despliegue",
-            "Formato del número (opcional, ej: {value:,.2f} o ${value:,.0f}):",
-            QLineEdit.Normal, "{value:,.2f}"
-        )
-        formato = (formato.strip() if ok and formato and formato.strip() else "{value:,.2f}")
-
-        def calcular(funcion_a=funcion_a, funcion_b=funcion_b, nombre_a=nombre_a, nombre_b=nombre_b,
-                     operacion=operacion, formato=formato):
-            try:
-                valor_a = funcion_a()
-                valor_b = funcion_b()
-            except RuntimeError:
-                return "Combinado", "-", None
-            if (
-                valor_a is None or valor_b is None
-                or (isinstance(valor_a, float) and pd.isna(valor_a))
-                or (isinstance(valor_b, float) and pd.isna(valor_b))
-            ):
-                return f"{nombre_a} / {nombre_b}", "-", None
-            if operacion == "Suma":
-                valor, simbolo = valor_a + valor_b, "+"
-            elif operacion.startswith("Resta"):
-                valor, simbolo = valor_a - valor_b, "−"
-            elif operacion == "Multiplicación":
-                valor, simbolo = valor_a * valor_b, "×"
-            else:
-                valor = (valor_a / valor_b) if valor_b != 0 else float("nan")
-                simbolo = "÷"
-            titulo = f"{nombre_a} {simbolo} {nombre_b}"
-            if valor is None or (isinstance(valor, float) and pd.isna(valor)):
-                return titulo, "-", None
-            try:
-                valor_str = formato.format(value=valor)
-            except Exception:
-                valor_str = f"{valor:,.2f}"
-            return titulo, valor_str, float(valor)
-
-        rect = self._reporte_siguiente_posicion(220, 110)
-        item = ReportBoxItem("calculo", rect, self.colors, ventana_principal=self)
-        item.regenerar = calcular
-        titulo, valor_str, valor_crudo = calcular()
-        item.set_calculo_text(titulo, valor_str, valor_crudo)
-        self.reporte_scene.addItem(item)
-
-    def _calcular_valor_metrica(self, nombre_metrica, columna):
-        """Misma lógica que usa '+ Métrica' del Reporte, factorizada aparte
-        para poder reutilizarla también al combinar valores en '+ Cálculo'."""
-        df_actual = self.filtered_df
-        if df_actual is None or df_actual.empty or not columna or columna not in df_actual.columns:
-            return None
-        serie = pd.to_numeric(df_actual[columna], errors="coerce").dropna()
-        if serie.empty:
-            return None
-        if nombre_metrica == "Media":
-            return serie.mean()
-        if nombre_metrica == "Mediana":
-            return serie.median()
-        if nombre_metrica == "Moda":
-            moda = serie.mode()
-            return moda.iloc[0] if not moda.empty else None
-        if nombre_metrica == "Desviación Std":
-            return serie.std()
-        return None
-
-    def _reporte_agregar_calculo_columna(self):
-        if self.filtered_df is None or self.filtered_df.empty:
-            QMessageBox.information(self, "Sin datos", "Carga datos primero.")
-            return
-        columnas = list(self.filtered_df.columns)
-        columna_a, ok = QInputDialog.getItem(
-            self, "Elegir columna", "¿Sobre qué columna quieres calcular?", columnas, 0, False
-        )
-        if not ok or not columna_a:
-            return
-
-        operaciones = [
-            "Suma", "Promedio", "Mínimo", "Máximo", "Conteo (no nulos)",
-            "Resta (esta columna − otra)",
-            "Multiplicación (esta columna × otra)",
-            "División (esta columna ÷ otra)",
-        ]
-        operacion, ok = QInputDialog.getItem(
-            self, "Elegir operación", "¿Qué quieres calcular?", operaciones, 0, False
-        )
-        if not ok or not operacion:
-            return
-
-        columna_b = None
-        if operacion.startswith(("Resta", "Multiplicación", "División")):
-            columna_b, ok = QInputDialog.getItem(
-                self, "Elegir segunda columna", "¿Contra qué columna la comparas?", columnas, 0, False
-            )
-            if not ok or not columna_b:
-                return
-
-        def calcular(columna_a=columna_a, columna_b=columna_b, operacion=operacion):
-            df_actual = self.filtered_df
-            if df_actual is None or columna_a not in df_actual.columns:
-                return operacion, "-", None
-
-            if operacion == "Conteo (no nulos)":
-                conteo = int(df_actual[columna_a].notna().sum())
-                return f"{operacion} de {columna_a}", f"{conteo:,}", float(conteo)
-
-            if columna_b is not None:
-                if columna_b not in df_actual.columns:
-                    return operacion, "-", None
-                suma_a = pd.to_numeric(df_actual[columna_a], errors="coerce").sum()
-                suma_b = pd.to_numeric(df_actual[columna_b], errors="coerce").sum()
-                if operacion.startswith("Resta"):
-                    valor, titulo = suma_a - suma_b, f"{columna_a} − {columna_b}"
-                elif operacion.startswith("Multiplicación"):
-                    valor, titulo = suma_a * suma_b, f"{columna_a} × {columna_b}"
-                else:
-                    valor = (suma_a / suma_b) if suma_b != 0 else float("nan")
-                    titulo = f"{columna_a} ÷ {columna_b}"
-                if pd.isna(valor):
-                    return titulo, "-", None
-                valor_str = f"{valor:,.0f}" if float(valor).is_integer() else f"{valor:,.2f}"
-                return titulo, valor_str, float(valor)
-
-            numerica = pd.to_numeric(df_actual[columna_a], errors="coerce").dropna()
-            if numerica.empty:
-                return f"{operacion} de {columna_a}", "-", None
-            if operacion == "Suma":
-                valor = numerica.sum()
-            elif operacion == "Promedio":
-                valor = numerica.mean()
-            elif operacion == "Mínimo":
-                valor = numerica.min()
-            else:
-                valor = numerica.max()
-            valor_str = f"{valor:,.0f}" if float(valor).is_integer() else f"{valor:,.2f}"
-            return f"{operacion} de {columna_a}", valor_str, float(valor)
-
-        rect = self._reporte_siguiente_posicion(200, 110)
-        item = ReportBoxItem("calculo", rect, self.colors, ventana_principal=self)
-        item.regenerar = calcular
-        titulo, valor_str, valor_crudo = calcular()
-        item.set_calculo_text(titulo, valor_str, valor_crudo)
-        self.reporte_scene.addItem(item)
-
-    def _reporte_exportar_pdf(self):
-        path, _ = QFileDialog.getSaveFileName(
-            self, "Exportar Reporte a PDF", "reporte.pdf", "PDF (*.pdf)"
-        )
-        if not path:
-            return
-        if not path.lower().endswith(".pdf"):
-            path += ".pdf"
-
-        printer = QPrinter(QPrinter.PrinterMode.HighResolution)
-        printer.setOutputFormat(QPrinter.OutputFormat.PdfFormat)
-        printer.setOutputFileName(path)
-        printer.setPageSize(QPageSize(QPageSize.PageSizeId.Letter))
-
-        painter = QPainter(printer)
-        for i, hoja in enumerate(self.reporte_hojas):
-            if i > 0:
-                printer.newPage()
-            hoja["scene"].render(painter)
-        painter.end()
-
-        n_hojas = len(self.reporte_hojas)
-        QMessageBox.information(
-            self, "Listo",
-            f"Reporte exportado a:\n{path}\n({n_hojas} hoja{'s' if n_hojas != 1 else ''})"
-        )
+        self.panel_reporte._reporte_agregar_metricas_tiempo(titulo, html)
 
     def _actualizar_resumen_anomalias_frecuencias(self):
-        """Cards 'Anomalía Más Frecuente' y 'Columna Más Afectada' de la
-        pestaña Frecuencias. No depende de qué columna(s) esté mirando el
-        usuario en freq_col_list ni del filtro de Datos -- lee directo
-        self._ultimas_anomalias, calculado por Narrativa la última vez que
-        se generó el informe (igual que hace Indicadores con
-        columnas_con_anomalias)."""
-        if not hasattr(self, "lbl_freq_anomalia_top"):
-            return
-
-        anomalias = getattr(self, "_ultimas_anomalias", [])
-        if not anomalias:
-            self.lbl_freq_anomalia_top.setText("Genera Narrativa primero")
-            self.lbl_freq_anomalia_col.setText("Genera Narrativa primero")
-            return
-
-        # Se suma 'filas_afectadas' (no la cantidad de anomalías) para que
-        # un solo tipo con miles de filas pese más que diez anomalías de
-        # una sola fila cada una -- "más frecuente" se refiere a cuántas
-        # filas toca, no a cuántas entradas separadas hay en el informe.
-        filas_por_tipo = {}
-        filas_por_columna = {}
-        for a in anomalias:
-            n = a.get("filas_afectadas") or 0
-            tipo = a.get("tipo")
-            if tipo:
-                filas_por_tipo[tipo] = filas_por_tipo.get(tipo, 0) + n
-            for col in a.get("columnas", []):
-                filas_por_columna[col] = filas_por_columna.get(col, 0) + n
-
-        if filas_por_tipo:
-            tipo_top, n_tipo = max(filas_por_tipo.items(), key=lambda kv: kv[1])
-            etiqueta = ETIQUETAS_TIPO_ANOMALIA.get(tipo_top, tipo_top)
-            self.lbl_freq_anomalia_top.setText(f"{etiqueta} ({n_tipo:,})")
-        else:
-            self.lbl_freq_anomalia_top.setText("-")
-
-        if filas_por_columna:
-            col_top, n_col = max(filas_por_columna.items(), key=lambda kv: kv[1])
-            self.lbl_freq_anomalia_col.setText(f"{col_top} ({n_col:,})")
-        else:
-            self.lbl_freq_anomalia_col.setText("-")
+        """Cards de anomalías de la pestaña Frecuencias (ver frecuencias_ui.py)."""
+        if hasattr(self, "panel_frecuencias"):
+            self.panel_frecuencias.actualizar_resumen_anomalias()
 
     def _update_frecuencias(self):
-        if not hasattr(self, "freq_table_model"):
-            return
-
-        self._actualizar_resumen_anomalias_frecuencias()
-
-        if self.filtered_df is None or self.filtered_df.empty:
-            self.freq_table_model.set_dataframe(pd.DataFrame())
-            self.lbl_freq_moda.setText("-")
-            self.lbl_freq_menos.setText("-")
-            self.lbl_freq_unicos.setText("-")
-            self.freq_plot.clear()
-            return
-
-        selected_cols = [item.text() for item in self.freq_col_list.selectedItems()]
-        if not selected_cols:
-            self.freq_table_model.set_dataframe(pd.DataFrame())
-            self.lbl_freq_moda.setText("-")
-            self.lbl_freq_menos.setText("-")
-            self.lbl_freq_unicos.setText("-")
-            self.freq_plot.clear()
-            return
-
-        rows = []
-        first_col_counts = None
-        for col in selected_cols:
-            if col not in self.filtered_df.columns:
-                continue
-            serie_cruda = self.filtered_df[col]
-            total = len(serie_cruda)
-            if total == 0:
-                continue
-            n_vacios = int(serie_cruda.isna().sum())
-            counts = serie_cruda.dropna().astype(str).value_counts()
-            if n_vacios:
-                counts[VALOR_VACIO_FILTRO] = n_vacios
-            if first_col_counts is None:
-                first_col_counts = counts
-            for valor, freq in counts.items():
-                pct = (freq / total) * 100
-                rows.append({
-                    "Columna": col,
-                    "Valor": valor,
-                    "Frecuencia": int(freq),
-                    "% del Total": f"{pct:.2f}%",
-                })
-
-        freq_df = pd.DataFrame(rows)
-        if not freq_df.empty:
-            freq_df = freq_df.sort_values(["Columna", "Frecuencia"], ascending=[True, False]).reset_index(drop=True)
-        self.freq_table_model.set_dataframe(freq_df)
-
-        if not freq_df.empty:
-            idx_max = freq_df["Frecuencia"].idxmax()
-            idx_min = freq_df["Frecuencia"].idxmin()
-            moda_row = freq_df.loc[idx_max]
-            menos_row = freq_df.loc[idx_min]
-            self.lbl_freq_moda.setText(f"{moda_row['Valor']} ({moda_row['Frecuencia']})")
-            self.lbl_freq_menos.setText(f"{menos_row['Valor']} ({menos_row['Frecuencia']})")
-            self.lbl_freq_unicos.setText(str(freq_df["Valor"].nunique()))
-        else:
-            self.lbl_freq_moda.setText("-")
-            self.lbl_freq_menos.setText("-")
-            self.lbl_freq_unicos.setText("-")
-
-        self.freq_plot.clear()
-        self.freq_plot.setBackground(self.colors["card"])
-        self.freq_plot.getAxis("left").setPen(pg.mkPen(self.colors["muted"]))
-        self.freq_plot.getAxis("bottom").setPen(pg.mkPen(self.colors["muted"]))
-        self.freq_plot.getAxis("left").setTextPen(pg.mkPen(self.colors["text"]))
-        self.freq_plot.getAxis("bottom").setTextPen(pg.mkPen(self.colors["text"]))
-        if first_col_counts is not None and not first_col_counts.empty:
-            top_counts = first_col_counts.sort_values(ascending=False).head(20)
-            labels = top_counts.index.astype(str).tolist()
-            values = top_counts.values.tolist()
-            xvals = list(range(len(labels)))
-            bar = pg.BarGraphItem(x=xvals, height=values, width=0.6, brush=COLOR_ACCENT)
-            self.freq_plot.addItem(bar)
-            step = max(1, len(labels) // 15)
-            ticks = [(i, str(lbl)[:14]) for i, lbl in enumerate(labels) if i % step == 0]
-            self.freq_plot.getAxis("bottom").setTicks([ticks])
+        """Recalcula la pestaña Frecuencias (ver frecuencias_ui.py)."""
+        if hasattr(self, "panel_frecuencias"):
+            self.panel_frecuencias.actualizar()
 
     # ------------------------------------------------------------------
     # TAB ALARMA
@@ -5059,18 +3988,23 @@ class HadarApp(QMainWindow):
         btn_nueva = QPushButton("+ Nueva Alarma")
         btn_nueva.setObjectName("accentButton")
         btn_nueva.clicked.connect(self._abrir_dialogo_nueva_alarma)
+        btn_nueva.setCursor(Qt.PointingHandCursor)
+        btn_nueva.setStyleSheet(QSS_SUBPESTANA)
         toolbar.addWidget(btn_nueva)
         btn_config_correo = QPushButton("⚙ Configurar avisos por correo")
         btn_config_correo.clicked.connect(self._abrir_configuracion_correo)
+        btn_config_correo.setCursor(Qt.PointingHandCursor)
+        btn_config_correo.setStyleSheet(QSS_SUBPESTANA)
         toolbar.addWidget(btn_config_correo)
         toolbar.addStretch()
         layout.addLayout(toolbar)
 
         aviso = QLabel(
-            "Define un umbral sobre un Indicador, una Métrica o una Frecuencia. "
-            "Si el valor actual lo supera, se marca en rojo acá y en su pestaña de "
+            "Define un umbral sobre un Indicador, una Métrica, una Frecuencia o una "
+            "Columna. Si el valor actual lo supera, se marca en rojo acá y en su pestaña de "
             "origen (Indicadores, o Métricas/Frecuencias si esa es la columna que "
-            "tenés seleccionada ahí), y aparece la nota de aviso."
+            "tenés seleccionada ahí), y aparece la nota de aviso. Con «Columna» se revisa "
+            "fila por fila (y puedes acotarla, por ejemplo, a una máquina o producto)."
         )
         aviso.setObjectName("muted")
         aviso.setWordWrap(True)
@@ -5101,7 +4035,7 @@ class HadarApp(QMainWindow):
             return
         numericas, todas = self._columnas_para_alarma()
         dialogo = DialogoAlarma(
-            [i.nombre for i in self.indicadores], numericas, todas, parent=self
+            [i.nombre for i in self.indicadores], numericas, todas, parent=self, df=self.df
         )
         if dialogo.exec() == QDialog.DialogCode.Accepted:
             nuevo_id = self.alarma_memoria.agregar_regla(**dialogo.get_datos())
@@ -5114,7 +4048,8 @@ class HadarApp(QMainWindow):
     def _editar_alarma(self, regla):
         numericas, todas = self._columnas_para_alarma()
         dialogo = DialogoAlarma(
-            [i.nombre for i in self.indicadores], numericas, todas, regla=regla, parent=self
+            [i.nombre for i in self.indicadores], numericas, todas, regla=regla, parent=self,
+            df=self.df
         )
         if dialogo.exec() == QDialog.DialogCode.Accepted:
             self.alarma_memoria.actualizar_regla(regla["id"], **dialogo.get_datos())
@@ -5154,7 +4089,9 @@ class HadarApp(QMainWindow):
         for i, regla in enumerate(self.reglas_alarma):
             valor = calcular_valor_actual(regla, df, self.indicadores)
             en_alarma = evaluar_regla(regla, valor)
-            card = AlarmaCard(regla, valor, en_alarma, self._editar_alarma, self._eliminar_alarma)
+            resumen = evaluar_columna(regla, df) if regla["tipo"] == "Columna" else None
+            card = AlarmaCard(regla, valor, en_alarma, self._editar_alarma, self._eliminar_alarma,
+                              resumen=resumen)
             self.alarma_grid.addWidget(card, i // 3, i % 3)
             self.alarma_widgets.append(card)
 
@@ -5174,34 +4111,25 @@ class HadarApp(QMainWindow):
                             self.statusBar().showMessage(
                                 f"⚠ No se pudo mandar el correo de «{nombre_regla}»: {error}", 10000
                             )
-                    disparar_envio_correo(self, destino, regla, valor, on_resultado=_al_terminar_envio)
+                    detalle = texto_detalle_columna(regla, resumen) if resumen is not None else None
+                    disparar_envio_correo(self, destino, regla, valor, on_resultado=_al_terminar_envio,
+                                           detalle=detalle)
             self.estado_previo_alarmas[regla["id"]] = en_alarma
 
         self._marcar_alarmas_en_metricas(df)
         self._marcar_alarmas_en_frecuencias(df)
+        # El Panel muestra el estado de las alarmas: que se redibuje.
+        if hasattr(self, "panel_control"):
+            self.panel_control.notificar_cambio()
 
     def _marcar_alarmas_en_metricas(self, df):
-        if not hasattr(self, "metricas_bloques"):
-            return
-        for bloque in self.metricas_bloques:
-            columna = bloque["columna"]
-            estado = {nombre: False for nombre in bloque["cards"]}
-            for regla in self.reglas_alarma:
-                if regla["tipo"] != "Métrica" or regla["objetivo"] != columna:
-                    continue
-                valor = calcular_valor_actual(regla, df, self.indicadores)
-                if evaluar_regla(regla, valor) and regla["estadistico"] in estado:
-                    estado[regla["estadistico"]] = True
-            for nombre, card in bloque["cards"].items():
-                set_card_alarma(card, estado[nombre])
+        if hasattr(self, "panel_metricas"):
+            self.panel_metricas.marcar_alarmas(df)
 
     def _marcar_alarmas_en_frecuencias(self, df):
-        if not hasattr(self, "card_freq_moda"):
+        if not hasattr(self, "panel_frecuencias"):
             return
-        seleccionadas = (
-            [item.text() for item in self.freq_col_list.selectedItems()]
-            if hasattr(self, "freq_col_list") else []
-        )
+        seleccionadas = self.panel_frecuencias.columnas_seleccionadas()
         en_alarma = False
         if len(seleccionadas) == 1:
             columna = seleccionadas[0]
@@ -5212,4 +4140,4 @@ class HadarApp(QMainWindow):
                 if evaluar_regla(regla, valor):
                     en_alarma = True
                     break
-        set_card_alarma(self.card_freq_moda, en_alarma)
+        self.panel_frecuencias.marcar_alarma(en_alarma)

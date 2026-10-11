@@ -7,6 +7,7 @@ recorte por fechas de la Línea de Tiempo y los colores del tema activo. La
 parte de cálculo (funciones sueltas de arriba) no depende de Qt, así se
 puede probar sola.
 """
+import copy
 import html
 import re
 import unicodedata
@@ -25,13 +26,30 @@ from PySide6.QtWidgets import (
 )
 
 from .config import COLOR_ACCENT, COLOR_ACCENT_3
+from .alarmas import (
+    calcular_valor_actual, evaluar_regla, evaluar_columna, estado_en_palabras, lineas_filas,
+)
 from .indicadores import Indicador
 from .linea_tiempo import anomalias_con_fecha
+from .graficos import ChartPanel, DonutChartWidget, agrupar_por_categoria, recortar_con_otros, _FUNCIONES_AGG
+from .filtro_filas import aplicar_filtro, describir_filtro, columnas_del_filtro
 
 MAX_INDICADORES = 4
 PUNTOS_TENDENCIA = 12
 _PISTAS_FECHA = ("fecha", "date", "dia", "día", "time", "hora")
 _PISTAS_VALOR = ("total", "monto", "importe", "final", "venta", "ingreso", "valor")
+
+# Estilo de "subpestaña" (texto sin caja, con línea inferior índigo cuando está
+# activo): el mismo de Preguntas / Entrenar un modelo en Predicción. También
+# existe como QSS_SUBPESTANA en main_window.py; si se cambia uno, cambiar el otro.
+QSS_SUBPESTANA = (
+    "QPushButton{background: transparent; border: none; border-bottom: 2px solid transparent; "
+    "border-radius: 0; padding: 6px 14px; font-weight: 600; color: #a1a1aa;} "
+    "QPushButton:checked{color: #6366f1; border-bottom: 2px solid #6366f1;} "
+    "QPushButton:hover{background: transparent; color: #6366f1;} "
+    "QPushButton:pressed{background: transparent;} "
+    "QPushButton:disabled{color: rgba(127,127,127,0.6);}"
+)
 
 
 # ----------------------------------------------------------------------------
@@ -284,9 +302,21 @@ def _partes_de_tendencia(df, fechas, n=PUNTOS_TENDENCIA):
     return [df.iloc[idx] for idx in np.array_split(np.arange(len(df)), n)]
 
 
+def _sin_ventana(ind):
+    """Copia del indicador sin la ventana 'últimos N días'. Para dibujar la
+    evolución hay que mirar todo el período: con la ventana puesta, cada tramo
+    se recortaría por su cuenta y la línea no diría nada."""
+    if not getattr(ind, "ventana", None):
+        return ind
+    copia = copy.copy(ind)
+    copia.ventana = None
+    return copia
+
+
 def tendencia_indicador(ind, df, fechas):
     """Valor del indicador en cada tramo, para la mini línea. [] si no hay
     suficientes datos para dibujar algo con sentido."""
+    ind = _sin_ventana(ind)
     valores = []
     for parte in _partes_de_tendencia(df, fechas):
         v = ind.calcular(parte) if len(parte) else None
@@ -302,6 +332,7 @@ def tendencia_indicador(ind, df, fechas):
 def variacion_indicador(ind, df, fechas):
     """Cambio porcentual de la 2ª mitad del período contra la 1ª. Solo tiene
     sentido con fechas; sin ellas devuelve None."""
+    ind = _sin_ventana(ind)
     if fechas is None or df is None or df.empty:
         return None
     ok = fechas.notna()
@@ -394,14 +425,83 @@ def indicadores_por_defecto(df, propias=None):
     col = elegir_columna_valor(df, propias)
     resultado = []
     if col:
-        resultado.append(Indicador(f"Total {col}", "suma", col, formato="{value:,.0f}"))
-        resultado.append(Indicador(f"Promedio {col}", "promedio", col, formato="{value:,.2f}"))
+        resultado.append(Indicador(f"Total {col}", "suma", col, formato_tipo="entero"))
+        resultado.append(Indicador(f"Promedio {col}", "promedio", col, formato_tipo="decimales"))
     primera = (propias or list(df.columns))[0]
-    resultado.append(Indicador("Registros", "conteo", primera, formato="{value:,.0f}"))
+    resultado.append(Indicador("Registros", "conteo", primera, formato_tipo="entero"))
     otras = [c for c in columnas_numericas_utiles(df, propias) if c != col]
     if otras:
-        resultado.append(Indicador(f"Total {otras[0]}", "suma", otras[0], formato="{value:,.0f}"))
+        resultado.append(Indicador(f"Total {otras[0]}", "suma", otras[0], formato_tipo="entero"))
     return resultado[:MAX_INDICADORES]
+
+
+# --- Gráficos propios (los que el usuario crea en la pestaña Gráficos) ------
+MAX_GRAFICOS_PROPIOS = 4
+GRAFICOS_SOPORTADOS = ("Barras", "Líneas", "Histograma", "Dona / Torta")
+CLAVE_AUTO = "__auto__"   # el gráfico automático de Hadar, dentro de la lista de Personalizar
+
+
+def clave_grafico(cfg):
+    """Nombre con el que se identifica un gráfico propio: el que le puso el
+    usuario o, si no tiene, 'Tipo — X / Y'."""
+    if cfg.get("nombre"):
+        return cfg["nombre"]
+    clave = f"{cfg.get('tipo')} — {cfg.get('x')} / {cfg.get('y')}"
+    solo = describir_filtro(cfg.get("filtro"))
+    return f"{clave} (solo donde {solo})" if solo else clave
+
+
+def datos_grafico_propio(cfg, df):
+    """Prepara los datos de un gráfico propio (sin Qt, para poder probarlo).
+    Devuelve un dict con 'modo' (fecha / categorias / histograma / dona) y
+    los datos a dibujar, o {'error': texto} si no se puede dibujar."""
+    tipo, x = cfg.get("tipo"), cfg.get("x")
+    y = cfg.get("y") or "Conteo"
+    if tipo not in GRAFICOS_SOPORTADOS:
+        return {"error": f"El tipo '{tipo}' todavía no se puede mostrar en el Panel."}
+    pedidas = [x, None if y == "Conteo" else y, *sorted(columnas_del_filtro(cfg.get("filtro")))]
+    faltan = [c for c in pedidas if c and c not in df.columns]
+    if faltan:
+        return {"error": "Este gráfico usa columnas que no están en lo que ves ahora: "
+                         + ", ".join(map(str, faltan))}
+    df = aplicar_filtro(df, cfg.get("filtro"))
+    if df.empty:
+        return {"error": "No hay filas que cumplan el filtro de este gráfico."}
+    funcion = _FUNCIONES_AGG.get(cfg.get("calcular"), "sum")
+    top = int(cfg.get("top") or 0)
+
+    if tipo == "Histograma":
+        datos = pd.to_numeric(df[x], errors="coerce").dropna()
+        if datos.empty:
+            return {"error": "No hay datos numéricos para dibujar este gráfico."}
+        cuentas, bordes = np.histogram(datos, bins=20)
+        return {"modo": "histograma", "x": ((bordes[:-1] + bordes[1:]) / 2).tolist(),
+                "y": cuentas.tolist(), "ancho": float(bordes[1] - bordes[0]) * 0.9}
+
+    if tipo in ("Barras", "Líneas") and ChartPanel._es_columna_fecha(df, x):
+        contar = (y == "Conteo")
+        fechas = ChartPanel._parsear_fechas(df[x])
+        serie, periodo = serie_por_periodo(df[x] if contar else df[y], fechas,
+                                           contar=contar, funcion=funcion)
+        if len(serie) >= 2:
+            xs = serie.index.values.astype("datetime64[s]").astype("int64").astype(float)
+            return {"modo": "fecha", "tipo": tipo, "x": xs.tolist(),
+                    "y": serie.fillna(0).astype(float).tolist(), "detalle": f"por {periodo}"}
+
+    orden = "valor" if tipo in ("Barras", "Dona / Torta") else "clave"
+    etiquetas, valores = agrupar_por_categoria(df, x, y, funcion, orden)
+    if not etiquetas:
+        return {"error": "No hay datos para dibujar este gráfico."}
+    if tipo == "Dona / Torta":
+        e, v, _ = recortar_con_otros(etiquetas, valores, 8, funcion, incluir_otros=True)
+        return {"modo": "dona", "etiquetas": e, "valores": v}
+    if tipo == "Barras":
+        n = top if 0 < top <= 15 else 15   # más de 15 barras no se leen en una tarjeta
+        e, v, nota = recortar_con_otros(etiquetas, valores, n, funcion)
+        return {"modo": "categorias", "tipo": tipo, "etiquetas": e, "valores": v,
+                "detalle": f"top {n} de {nota['total']}" if nota else ""}
+    return {"modo": "categorias", "tipo": tipo, "etiquetas": etiquetas[:60],
+            "valores": valores[:60], "detalle": ""}
 
 
 # ----------------------------------------------------------------------------
@@ -515,6 +615,115 @@ class TarjetaIndicador(QFrame):
         lay.addWidget(self.tendencia)
 
 
+def trazar_area(plot, x, y, colors):
+    """Línea con relleno suave y base en cero (con área, la base tiene que
+    ser cero para no exagerar las diferencias). Si un punto se despega
+    claramente del resto, se marca como 'pico'. Es el estilo de los gráficos
+    del Panel: lo usan el gráfico automático y los gráficos propios."""
+    y = np.asarray(y, dtype=float)
+    acento = QColor(COLOR_ACCENT)
+    suave = QColor(acento)
+    suave.setAlpha(45)
+    plot.plot(x, y, pen=pg.mkPen(acento, width=2.5), fillLevel=0, brush=suave)
+    techo = float(np.nanmax(y)) if len(y) else 1.0
+    piso = min(0.0, float(np.nanmin(y))) if len(y) else 0.0
+    plot.setYRange(piso, techo * 1.15 if techo > 0 else 1.0, padding=0)
+    if len(y) >= 5:
+        mediana = float(np.nanmedian(y))
+        i = int(np.nanargmax(y))
+        if mediana > 0 and y[i] > 1.6 * mediana:
+            est = colores_estado(colors)
+            punto = pg.ScatterPlotItem([x[i]], [y[i]], size=10, brush=pg.mkBrush(est["baja"]), pen=pg.mkPen(None))
+            plot.addItem(punto)
+            txt = pg.TextItem("pico", color=est["baja"], anchor=(0.5, 1.6))
+            txt.setPos(x[i], y[i])
+            plot.addItem(txt)
+
+
+def _rango_barras(plot, valores):
+    techo = max(valores) if len(valores) else 1.0
+    piso = min(0.0, min(valores)) if len(valores) else 0.0
+    plot.setYRange(piso, techo * 1.15 if techo > 0 else 1.0, padding=0)
+
+
+def _etiquetas_eje(plot, etiquetas, maximo=8):
+    """Pocas etiquetas y cortas en el eje X, para que no se pisen."""
+    paso = max(1, -(-len(etiquetas) // maximo))
+    ticks = [(i, e if len(e) <= 14 else e[:13] + "…")
+             for i, e in enumerate(etiquetas) if i % paso == 0]
+    plot.getAxis("bottom").setTicks([ticks])
+
+
+class TarjetaGrafico(QFrame):
+    """Un gráfico que el usuario creó en la pestaña Gráficos, dibujado con la
+    misma tarjeta del Panel (colores, borde, tipografía y estilo de línea)."""
+
+    def __init__(self, cfg, datos, colors, parent=None):
+        super().__init__(parent)
+        self.setObjectName("panelTarjeta")
+        self.setStyleSheet(estilo_tarjeta(colors))
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(16, 14, 16, 12)
+        lay.setSpacing(6)
+
+        texto = clave_grafico(cfg)
+        if cfg.get("nombre") and cfg.get("filtro"):
+            texto += f" · solo donde {describir_filtro(cfg['filtro'])}"
+        if datos.get("detalle"):
+            texto += f" · {datos['detalle']}"
+        titulo = QLabel(texto)
+        titulo.setWordWrap(True)
+        titulo.setStyleSheet(f"color: {colors['text']}; font-size: 13px;")
+        lay.addWidget(titulo)
+
+        if "error" in datos:
+            aviso = QLabel(datos["error"])
+            aviso.setWordWrap(True)
+            aviso.setStyleSheet(f"color: {colors['muted']}; font-size: 12px;")
+            lay.addWidget(aviso)
+            return
+
+        if datos["modo"] == "dona":
+            dona = DonutChartWidget()
+            dona.setMinimumHeight(190)
+            dona.set_data(datos["etiquetas"], datos["valores"], colors["text"])
+            lay.addWidget(dona)
+            return
+
+        con_fechas = datos["modo"] == "fecha"
+        eje = pg.DateAxisItem(orientation="bottom") if con_fechas else pg.AxisItem(orientation="bottom")
+        pw = pg.PlotWidget(axisItems={"bottom": eje})
+        pw.setMinimumHeight(190)
+        pw.setFrameShape(QFrame.NoFrame)
+        pw.setMenuEnabled(False)
+        pw.showGrid(x=False, y=True, alpha=0.12)
+        pw.setBackground(colors["card"])
+        for nombre_eje in ("left", "bottom"):
+            pw.getAxis(nombre_eje).setPen(pg.mkPen(colors["border"]))
+            pw.getAxis(nombre_eje).setTextPen(pg.mkPen(colors["muted"]))
+        lay.addWidget(pw)
+
+        if datos["modo"] == "histograma":
+            pw.addItem(pg.BarGraphItem(x=datos["x"], height=datos["y"], width=datos["ancho"], brush=COLOR_ACCENT))
+            _rango_barras(pw, datos["y"])
+        elif con_fechas and datos["tipo"] == "Líneas":
+            trazar_area(pw, datos["x"], datos["y"], colors)
+        elif con_fechas:
+            xs = datos["x"]
+            ancho = (float(np.min(np.diff(xs))) if len(xs) > 1 else 86400.0) * 0.8
+            pw.addItem(pg.BarGraphItem(x=xs, height=datos["y"], width=ancho, brush=COLOR_ACCENT))
+            _rango_barras(pw, datos["y"])
+        else:
+            n = len(datos["valores"])
+            xs = list(range(n))
+            if datos["tipo"] == "Barras":
+                pw.addItem(pg.BarGraphItem(x=xs, height=datos["valores"], width=0.7, brush=COLOR_ACCENT))
+                _rango_barras(pw, datos["valores"])
+            else:
+                trazar_area(pw, xs, datos["valores"], colors)
+            _etiquetas_eje(pw, datos["etiquetas"])
+
+
 def _lista_con_casillas(items, marcados, alto=120):
     """items: [(texto, clave)]; marcados: set de claves."""
     lista = QListWidget()
@@ -540,7 +749,9 @@ class DialogoPersonalizarPanel(QDialog):
 
     def __init__(self, candidatos, seleccionados, columnas_valor, col_valor,
                  mostrar_hallazgos, mostrar_tiempo, cols_hallazgos, ocultas,
-                 combinables, combinar_sel, parent=None):
+                 combinables, combinar_sel, parent=None, mostrar_alarmas=True,
+                 nombres_propios=None, graficos_opciones=None, graficos_marcados=None,
+                 auto_marcado=True):
         super().__init__(parent)
         self.setWindowTitle("Personalizar panel")
         self.setMinimumWidth(420)
@@ -552,7 +763,10 @@ class DialogoPersonalizarPanel(QDialog):
         p1 = QWidget()
         l1 = QVBoxLayout(p1)
         l1.addWidget(QLabel(f"Indicadores a mostrar (hasta {MAX_INDICADORES}):"))
-        self.lista = _lista_con_casillas([(i.nombre, i.nombre) for i in candidatos], set(seleccionados), 130)
+        propios = set(nombres_propios or [])
+        self.lista = _lista_con_casillas(
+            [(i.nombre + ("  · tuyo" if i.nombre in propios else "  · automático"), i.nombre)
+             for i in candidatos], set(seleccionados), 130)
         l1.addWidget(self.lista)
         l1.addWidget(QLabel("Columna del gráfico principal:"))
         self.combo = QComboBox()
@@ -561,6 +775,9 @@ class DialogoPersonalizarPanel(QDialog):
             self.combo.setCurrentText(str(col_valor))
         l1.addWidget(self.combo)
         l1.addWidget(QLabel("Secciones:"))
+        self.chk_alarmas = QCheckBox("Alarmas")
+        self.chk_alarmas.setChecked(mostrar_alarmas)
+        l1.addWidget(self.chk_alarmas)
         self.chk_hallazgos = QCheckBox("Lo que Hadar notó (hallazgos)")
         self.chk_hallazgos.setChecked(mostrar_hallazgos)
         l1.addWidget(self.chk_hallazgos)
@@ -569,6 +786,21 @@ class DialogoPersonalizarPanel(QDialog):
         l1.addWidget(self.chk_tiempo)
         l1.addStretch(1)
         pestanas.addTab(p1, "Qué se ve")
+
+        # -- 1b. Gráficos (el automático de Hadar + los que creaste en Gráficos)
+        p1b = QWidget()
+        l1b = QVBoxLayout(p1b)
+        l1b.addWidget(QLabel("Gráficos a mostrar en el panel:"))
+        items_g = [("Gráfico automático de Hadar", CLAVE_AUTO)]
+        items_g += [(k + "  · tuyo", k) for k in (graficos_opciones or [])]
+        marcados_g = set(graficos_marcados or []) | ({CLAVE_AUTO} if auto_marcado else set())
+        self.lista_graficos = _lista_con_casillas(items_g, marcados_g, 170)
+        l1b.addWidget(self.lista_graficos)
+        l1b.addWidget(QLabel(
+            f"Los «tuyos» son los de la pestaña Gráficos (hasta {MAX_GRAFICOS_PROPIOS}).\n"
+            "Se pueden mostrar: Barras, Líneas, Histograma y Dona / Torta."))
+        l1b.addStretch(1)
+        pestanas.addTab(p1b, "Gráficos")
 
         # -- 2. Hallazgos
         p2 = QWidget()
@@ -612,10 +844,22 @@ class DialogoPersonalizarPanel(QDialog):
                 f"Elige {MAX_INDICADORES} o menos para que el panel se lea de un vistazo.",
             )
             return
+        if len(self.graficos_elegidos()) > MAX_GRAFICOS_PROPIOS:
+            QMessageBox.information(
+                self, "Demasiados gráficos",
+                f"Elige {MAX_GRAFICOS_PROPIOS} gráficos tuyos o menos para que el panel se lea de un vistazo.",
+            )
+            return
         self.accept()
 
     def nombres_elegidos(self):
         return _claves_marcadas(self.lista)
+
+    def graficos_elegidos(self):
+        return [k for k in _claves_marcadas(self.lista_graficos) if k != CLAVE_AUTO]
+
+    def auto_elegido(self):
+        return CLAVE_AUTO in _claves_marcadas(self.lista_graficos)
 
     def columna_elegida(self):
         return self.combo.currentText() or None
@@ -669,6 +913,8 @@ class PanelControl(QWidget):
         self.combo_base.setVisible(False)
         self.btn_personalizar = QPushButton("Personalizar")
         self.btn_personalizar.clicked.connect(self._personalizar)
+        self.btn_personalizar.setCursor(Qt.PointingHandCursor)
+        self.btn_personalizar.setStyleSheet(QSS_SUBPESTANA)
         cab.addWidget(self.btn_personalizar)
         raiz.addLayout(cab)
 
@@ -681,6 +927,30 @@ class PanelControl(QWidget):
         self.fila_tarjetas.setSpacing(12)
         raiz.addLayout(self.fila_tarjetas)
         self._tarjetas = []
+
+        self.card_alarmas = QFrame()
+        self.card_alarmas.setObjectName("panelTarjeta")
+        la = QVBoxLayout(self.card_alarmas)
+        la.setContentsMargins(16, 12, 16, 12)
+        la.setSpacing(8)
+        cab_al = QHBoxLayout()
+        self.lbl_alarmas = QLabel("Alarmas")
+        cab_al.addWidget(self.lbl_alarmas)
+        self.lbl_alarmas_estado = QLabel("")
+        cab_al.addWidget(self.lbl_alarmas_estado)
+        cab_al.addStretch()
+        self.btn_alarmas = QPushButton("Ver alarmas →")
+        self.btn_alarmas.setFlat(True)
+        self.btn_alarmas.setCursor(Qt.PointingHandCursor)
+        self.btn_alarmas.clicked.connect(self._ir_a_alarmas)
+        cab_al.addWidget(self.btn_alarmas)
+        la.addLayout(cab_al)
+        self.grid_alarmas = QGridLayout()
+        self.grid_alarmas.setSpacing(10)
+        la.addLayout(self.grid_alarmas)
+        self._chips_alarmas = []
+        self.card_alarmas.setVisible(False)
+        raiz.addWidget(self.card_alarmas)
 
         self.card_grafico = QFrame()
         self.card_grafico.setObjectName("panelTarjeta")
@@ -700,6 +970,10 @@ class PanelControl(QWidget):
         fila.addWidget(self.card_grafico, 2)
         fila.addWidget(self._crear_card_hallazgos(), 1)
         raiz.addLayout(fila, 1)
+        self.grid_propios = QGridLayout()
+        self.grid_propios.setSpacing(12)
+        raiz.addLayout(self.grid_propios)
+        self._tarjetas_graficos = []
         raiz.addWidget(self._crear_card_tiempo())
 
         self._estilo_plot()
@@ -773,6 +1047,15 @@ class PanelControl(QWidget):
                 tv.setCurrentIndex(i)
                 return
 
+    def _ir_a_alarmas(self):
+        tv = getattr(self.host, "tabview", None)
+        if tv is None:
+            return
+        for i in range(tv.count()):
+            if tv.tabText(i).strip().lower().startswith("alarma"):
+                tv.setCurrentIndex(i)
+                return
+
     def _estilo_plot(self):
         c = self.colors
         self.plot.setBackground(c["card"])
@@ -794,6 +1077,13 @@ class PanelControl(QWidget):
         self.card_grafico.setStyleSheet(estilo_tarjeta(c))
         self.card_hallazgos.setStyleSheet(estilo_tarjeta(c))
         self.card_tiempo.setStyleSheet(estilo_tarjeta(c))
+        self.card_alarmas.setStyleSheet(estilo_tarjeta(c))
+        self.lbl_alarmas.setStyleSheet(f"color: {c['text']}; font-size: 13px;")
+        self.btn_alarmas.setStyleSheet(
+            f"QPushButton {{ background: transparent; border: none; color: {COLOR_ACCENT};"
+            " padding: 2px 0; }"
+            f"QPushButton:hover {{ color: {c['text']}; }}"
+        )
         self.lbl_hallazgos.setStyleSheet(f"color: {c['text']}; font-size: 13px;")
         self.lbl_tiempo.setStyleSheet(f"color: {c['text']}; font-size: 13px;")
         self.btn_informe.setStyleSheet(
@@ -879,7 +1169,7 @@ class PanelControl(QWidget):
         validos = []
         for ind in list(getattr(self.host, "indicadores", []) or []):
             try:
-                deps = set(ind.columnas_de_las_que_depende())
+                deps = set(ind.columnas_necesarias())
             except Exception:
                 deps = set()
             if deps <= set(df.columns):
@@ -933,12 +1223,14 @@ class PanelControl(QWidget):
             t.setParent(None)
             t.deleteLater()
         self._tarjetas.clear()
+        self._limpiar_graficos_propios()
 
         if df is None or df.empty:
             self.lbl_vacio.setVisible(True)
             self.card_grafico.setVisible(False)
             self.card_hallazgos.setVisible(False)
             self.card_tiempo.setVisible(False)
+            self.card_alarmas.setVisible(False)
             self.lbl_sub.setText("")
             return
         self.lbl_vacio.setVisible(False)
@@ -963,11 +1255,168 @@ class PanelControl(QWidget):
             self.fila_tarjetas.setColumnStretch(i, 1)
             self._tarjetas.append(tarjeta)
 
+        self._dibujar_alarmas(cfg.get("mostrar_alarmas", True))
         self._dibujar_grafico(df, col_fecha, fechas)
+        self._dibujar_graficos_propios(df)
         self._dibujar_hallazgos(cfg.get("mostrar_hallazgos", True))
         self._dibujar_tiempo(df, col_fecha, fechas, cfg.get("mostrar_tiempo", True))
 
+    def _dibujar_alarmas(self, mostrar, maximo=6, columnas=3):
+        """Recuadro con el estado de las alarmas configuradas (las que
+        suenan primero). Se evalúan igual que en la pestaña Alarma: sobre
+        los datos de la tabla activa con los filtros puestos, sin el cruce
+        con otras tablas que usa el resto del Panel."""
+        for chip in self._chips_alarmas:
+            chip.setParent(None)
+            chip.deleteLater()
+        self._chips_alarmas.clear()
+        reglas = list(getattr(self.host, "reglas_alarma", []) or [])
+        if not mostrar or not reglas:
+            self.card_alarmas.setVisible(False)
+            return
+        self.card_alarmas.setVisible(True)
+
+        h = self.host
+        df_alarmas = h.filtered_df if getattr(h, "filtered_df", None) is not None else h.df
+        estados = []
+        for regla in reglas:
+            valor = calcular_valor_actual(regla, df_alarmas, h.indicadores)
+            resumen = evaluar_columna(regla, df_alarmas) if regla["tipo"] == "Columna" else None
+            estados.append((regla, evaluar_regla(regla, valor), estado_en_palabras(regla, valor, resumen),
+                            valor is None, resumen))
+        activas = sum(1 for _, en, _, _, _ in estados if en)
+        c = self.colors
+        est = colores_estado(c)
+        if activas:
+            self.lbl_alarmas_estado.setText(f"  {activas} activa" if activas == 1 else f"  {activas} activas")
+            self.lbl_alarmas_estado.setStyleSheet(f"color: {est['baja']}; font-size: 12px; font-weight: 600;")
+        else:
+            self.lbl_alarmas_estado.setText("  todo en orden")
+            self.lbl_alarmas_estado.setStyleSheet(f"color: {est['sube']}; font-size: 12px;")
+
+        # Las que suenan primero; el resto en el orden en que se crearon.
+        estados.sort(key=lambda e: 0 if e[1] else 1)
+        visibles = estados[:maximo]
+        for i, (regla, en_alarma, frase, sin_datos, resumen) in enumerate(visibles):
+            color = est["baja"] if en_alarma else (est["igual"] if sin_datos else est["sube"])
+            borde = est["baja"] if en_alarma else c["border"]
+            chip = QFrame()
+            chip.setObjectName("panelChip")
+            chip.setStyleSheet(
+                f"QFrame#panelChip {{ background: transparent; border: 1px solid {borde}; border-radius: 8px; }}"
+                "QFrame#panelChip QLabel { background: transparent; border: none; }"
+            )
+            lay = QVBoxLayout(chip)
+            lay.setContentsMargins(12, 8, 12, 8)
+            lay.setSpacing(2)
+            titulo = QLabel(f"<span style='color:{color}'>●</span>&nbsp; " + html.escape(regla["nombre"]))
+            titulo.setTextFormat(Qt.RichText)
+            titulo.setWordWrap(True)
+            titulo.setStyleSheet(f"color: {c['text']}; font-size: 12px; font-weight: 600;")
+            lay.addWidget(titulo)
+            detalle = QLabel(frase)
+            detalle.setWordWrap(True)
+            detalle.setStyleSheet(f"color: {c['muted']}; font-size: 12px;")
+            lay.addWidget(detalle)
+            if en_alarma and regla.get("mensaje"):
+                aviso = QLabel(regla["mensaje"])
+                aviso.setWordWrap(True)
+                aviso.setStyleSheet(f"color: {est['baja']}; font-size: 12px;")
+                lay.addWidget(aviso)
+            filas = lineas_filas(regla, resumen) if en_alarma else []
+            if filas:
+                chip.setToolTip("Filas que la activaron:\n" + "\n".join(filas))
+            self.grid_alarmas.addWidget(chip, i // columnas, i % columnas)
+            self._chips_alarmas.append(chip)
+        for col in range(columnas):
+            self.grid_alarmas.setColumnStretch(col, 1)
+        resto = len(estados) - len(visibles)
+        self.btn_alarmas.setText(f"Ver alarmas (+{resto} más) →" if resto > 0 else "Ver alarmas →")
+
+    def _limpiar_graficos_propios(self):
+        for t in self._tarjetas_graficos:
+            t.setParent(None)
+            t.deleteLater()
+        self._tarjetas_graficos.clear()
+
+    def _dibujar_graficos_propios(self, df):
+        """Los gráficos que el usuario eligió desde la pestaña Gráficos, en
+        tarjetas del mismo estilo, de a dos por fila bajo el gráfico principal."""
+        lista = (self.host.panel_config.get("graficos") or [])[:MAX_GRAFICOS_PROPIOS]
+        for i, g in enumerate(lista):
+            tarjeta = TarjetaGrafico(g, datos_grafico_propio(g, df), self.colors)
+            self.grid_propios.addWidget(tarjeta, i // 2, i % 2)
+            self.grid_propios.setColumnStretch(i % 2, 1)
+            self._tarjetas_graficos.append(tarjeta)
+
+    def _opciones_graficos(self):
+        """{nombre: config} de los gráficos propios que se pueden elegir: los
+        ya enviados al Panel y los que hay ahora en la pestaña Gráficos (si
+        hay uno con el mismo nombre, manda el de la pestaña Gráficos)."""
+        opciones = {}
+        for g in self.host.panel_config.get("graficos") or []:
+            opciones[clave_grafico(g)] = g
+        for p in getattr(self.host, "chart_panels", None) or []:
+            try:
+                g = p.config_a_dict()
+            except Exception:
+                continue
+            if g.get("tipo") in GRAFICOS_SOPORTADOS and g.get("x"):
+                opciones[clave_grafico(g)] = g
+        return opciones
+
+    # -- "Al Panel": lo que llega desde las pestañas Indicadores y Gráficos --
+    def nombres_en_panel(self):
+        """Nombres de los indicadores que el Panel muestra ahora mismo."""
+        try:
+            df = self._df()
+            if df is None or df.empty:
+                return set()
+            return {i.nombre for i in self._indicadores_visibles(df)}
+        except Exception:
+            return set()
+
+    def enviar_indicador(self, nombre):
+        """'ok', 'ya' (estaba), 'lleno' (ya hay 4) o 'invalido' (usa columnas
+        que esta vista no tiene)."""
+        df = self._df()
+        if df is None or df.empty or nombre not in {i.nombre for i in self._candidatos(df)}:
+            return "invalido"
+        actuales = [i.nombre for i in self._indicadores_visibles(df)]
+        if nombre in actuales:
+            return "ya"
+        if len(actuales) >= MAX_INDICADORES:
+            return "lleno"
+        self.host.panel_config["indicadores"] = actuales + [nombre]
+        self.notificar_cambio()
+        return "ok"
+
+    def enviar_grafico(self, cfg_grafico):
+        """'ok', 'actualizado' (ya estaba: se reemplaza con los cambios),
+        'tipo' (no se puede mostrar en el Panel) o 'lleno'."""
+        if cfg_grafico.get("tipo") not in GRAFICOS_SOPORTADOS:
+            return "tipo"
+        cfg = self.host.panel_config
+        lista = list(cfg.get("graficos") or [])
+        clave = clave_grafico(cfg_grafico)
+        for i, g in enumerate(lista):
+            if clave_grafico(g) == clave:
+                lista[i] = cfg_grafico
+                cfg["graficos"] = lista
+                self.notificar_cambio()
+                return "actualizado"
+        if len(lista) >= MAX_GRAFICOS_PROPIOS:
+            return "lleno"
+        cfg["graficos"] = lista + [cfg_grafico]
+        self.notificar_cambio()
+        return "ok"
+
     def _dibujar_grafico(self, df, col_fecha, fechas):
+        cfg_g = self.host.panel_config
+        if not cfg_g.get("grafico_auto", True) and cfg_g.get("graficos"):
+            self.plot.clear()   # el usuario eligió ver solo sus gráficos
+            self.card_grafico.setVisible(False)
+            return
         col = self.host.panel_config.get("col_valor")
         if col not in df.columns or col not in self._propias:
             col = elegir_columna_valor(df, self._propias)
@@ -1075,24 +1524,7 @@ class PanelControl(QWidget):
         """Línea con relleno suave y base en cero (con área, la base tiene
         que ser cero para no exagerar las diferencias). Si un punto se
         despega claramente del resto, se marca como 'pico'."""
-        y = np.asarray(y, dtype=float)
-        acento = QColor(COLOR_ACCENT)
-        suave = QColor(acento)
-        suave.setAlpha(45)
-        self.plot.plot(x, y, pen=pg.mkPen(acento, width=2.5), fillLevel=0, brush=suave)
-        techo = float(np.nanmax(y)) if len(y) else 1.0
-        piso = min(0.0, float(np.nanmin(y))) if len(y) else 0.0
-        self.plot.setYRange(piso, techo * 1.15 if techo > 0 else 1.0, padding=0)
-        if len(y) >= 5:
-            mediana = float(np.nanmedian(y))
-            i = int(np.nanargmax(y))
-            if mediana > 0 and y[i] > 1.6 * mediana:
-                est = colores_estado(self.colors)
-                punto = pg.ScatterPlotItem([x[i]], [y[i]], size=10, brush=pg.mkBrush(est["baja"]), pen=pg.mkPen(None))
-                self.plot.addItem(punto)
-                txt = pg.TextItem("pico", color=est["baja"], anchor=(0.5, 1.6))
-                txt.setPos(x[i], y[i])
-                self.plot.addItem(txt)
+        trazar_area(self.plot, x, y, self.colors)
 
     def _usar_eje(self, con_fechas):
         """Cambia el eje X entre fechas y números solo cuando hace falta."""
@@ -1117,15 +1549,25 @@ class PanelControl(QWidget):
         if ocultas is None:
             ocultas = columnas_ocultas_por_defecto(todas)
         combinables = alcanzables(self._base, self._padres()) if self._base else []
+        opciones = self._opciones_graficos()
         dlg = DialogoPersonalizarPanel(
             self._candidatos(df), visibles, columnas_numericas_utiles(df, self._propias),
             cfg.get("col_valor") or elegir_columna_valor(df, self._propias),
             cfg.get("mostrar_hallazgos", True), cfg.get("mostrar_tiempo", True),
             dict(cols_hallazgos), ocultas, combinables, cfg.get("tablas_combinar"), parent=self,
+            mostrar_alarmas=cfg.get("mostrar_alarmas", True),
+            nombres_propios={i.nombre for i in self._propios_validos(df)},
+            graficos_opciones=list(opciones),
+            graficos_marcados=[clave_grafico(g) for g in cfg.get("graficos") or []],
+            auto_marcado=cfg.get("grafico_auto", True),
         )
         if dlg.exec() == QDialog.Accepted:
+            elegidos_g = [opciones[k] for k in dlg.graficos_elegidos() if k in opciones]
+            cfg["graficos"] = elegidos_g
+            cfg["grafico_auto"] = dlg.auto_elegido() or not elegidos_g   # nunca dejar el panel sin gráfico
             cfg["indicadores"] = dlg.nombres_elegidos()
             cfg["col_valor"] = dlg.columna_elegida()
+            cfg["mostrar_alarmas"] = dlg.chk_alarmas.isChecked()
             cfg["mostrar_hallazgos"] = dlg.chk_hallazgos.isChecked()
             cfg["mostrar_tiempo"] = dlg.chk_tiempo.isChecked()
             nuevas = dlg.columnas_ocultas()

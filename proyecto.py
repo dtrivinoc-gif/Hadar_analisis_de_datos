@@ -73,9 +73,13 @@ def ruta_carpeta_proyectos():
 def guardar_proyecto(ruta, *, tablas, nombre_tabla_activa, relaciones_ontologia,
                       filtro_columna, filtro_valores, notas_manuales, indicadores,
                       ml_activado=False, linea_base_ml=None, fuentes_datos=None,
-                      ml_multivariado_activado=False, procedencia=None, prediccion=None):
+                      ml_multivariado_activado=False, procedencia=None, prediccion=None,
+                      panel=None):
     """
     ... (ver parámetros existentes arriba)
+    panel: dict con lo que el usuario eligió en Personalizar del Panel (qué
+        indicadores, qué gráficos propios, etc.). Solo textos, números y
+        listas, así que se guarda tal cual.
     prediccion: dict con la configuración de la pestaña Predicción (qué tabla,
         qué columna predecir, qué columnas usar o ignorar). El modelo entrenado
         NO se guarda: un .hadarproy es un .zip común y los modelos de Python
@@ -116,6 +120,8 @@ def guardar_proyecto(ruta, *, tablas, nombre_tabla_activa, relaciones_ontologia,
         "ml_multivariado_activado": bool(ml_multivariado_activado),
         "procedencia": procedencia or [],
         "prediccion": prediccion or {},
+        # default=str por si algún valor raro se coló en la configuración.
+        "panel": json.loads(json.dumps(panel or {}, default=str)),
     }
 
     carpeta = os.path.dirname(ruta)
@@ -137,7 +143,9 @@ class ProyectoCargado:
     def __init__(self, tablas, nombre_tabla_activa, relaciones_ontologia,
                  filtro_columna, filtro_valores, notas_manuales, indicadores_dict,
                  ml_activado=False, linea_base_ml=None, fuentes_datos=None,
-                 ml_multivariado_activado=False, procedencia=None, prediccion=None):
+                 ml_multivariado_activado=False, procedencia=None, prediccion=None,
+                 panel=None):
+        self.panel = panel or {}               # config del Panel (dict); {} en proyectos antiguos
         self.tablas = tablas
         self.nombre_tabla_activa = nombre_tabla_activa
         self.relaciones_ontologia = relaciones_ontologia
@@ -188,6 +196,7 @@ def abrir_proyecto(ruta):
             ml_multivariado_activado=metadata.get("ml_multivariado_activado", False),
             procedencia=metadata.get("procedencia", []),
             prediccion=metadata.get("prediccion", {}),
+            panel=metadata.get("panel", {}),
         )
 
 
