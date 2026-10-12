@@ -1508,4 +1508,8 @@ class PanelPrediccion(QWidget):
             QMessageBox.critical(self, "Error al guardar", str(e))
             return
         self.lbl_pred.setText(f"Guardado: {ruta} ({len(salida):,} filas)")
-        QMessageBox.information(self, "Predicciones guardadas", f"{len(salida):,} filas guardadas en:\n{ruta}")
+        avisos = list(getattr(salida, "attrs", {}).get("avisos", []))
+        texto = f"{len(salida):,} filas guardadas en:\n{ruta}"
+        if avisos:
+            texto += "\n\nOjo:\n" + "\n".join("• " + a for a in avisos)
+        QMessageBox.information(self, "Predicciones guardadas", texto)

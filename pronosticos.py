@@ -20,13 +20,15 @@ import numpy as np
 import pandas as pd
 
 try:
-    from .prediccion import _tokens, es_columna_id, tipo_columna
-    from .pronostico_base import ResultadoPronostico
+    from . import pistas as _pistas
+    from .prediccion import es_columna_id, tipo_columna
+    from .pronostico_base import ResultadoPronostico, TEXTO_TIPO_SALIDA, aviso_datos_antiguos, leer_fecha_corte
     from . import eventos as _ev
     from . import series_tiempo as _st
 except ImportError:
-    from prediccion import _tokens, es_columna_id, tipo_columna
-    from pronostico_base import ResultadoPronostico
+    import pistas as _pistas
+    from prediccion import es_columna_id, tipo_columna
+    from pronostico_base import ResultadoPronostico, TEXTO_TIPO_SALIDA, aviso_datos_antiguos, leer_fecha_corte
     import eventos as _ev
     import series_tiempo as _st
 
@@ -63,6 +65,9 @@ class ConfigPronostico:
     unidad_duracion: str = "dias"
     ventana_dias: float | None = None        # ventana de la pregunta (alerta, probabilidad en N días…)
     fecha_corte: str | None = None
+    fin_observacion: str = "auto"            # auto | global | ultimo_registro (hasta cuándo se observa a cada elemento)
+    ceros_mismo_dia: str = "medio_dia"       # medio_dia | descartar (casos de 0 días con fechas sin hora)
+    dias_aviso_datos_antiguos: int = 45      # avisar si el último dato está a más de estos días de hoy
     # --- escenario ---
     columna_driver: str | None = None
     agregacion_driver: str = "promedio"
@@ -74,7 +79,7 @@ class ConfigPronostico:
     top: int = 20
     columna_objetivo: str | None = None
     columnas_explicativas: list = field(default_factory=list)
-    validacion: str = "aleatoria"
+    validacion: str = "auto"                 # auto (por fecha si hay) | aleatoria | temporal
     semilla: int = 0
 
     def to_dict(self) -> dict:
@@ -107,6 +112,9 @@ _AGREGACION = _c("agregacion", "Cómo juntar los datos", "opcion", False,
 _FREC = _c("frecuencia", "Período", "opcion", False, "Auto lo detecta según tus fechas.", ["auto", "H", "D", "W", "M"], "auto")
 _HORIZ = _c("horizonte", "Cuánto mirar hacia adelante", "entero", False,
             "En períodos (días, semanas…). 0 = automático.", None, 0)
+_FECHA_CORTE = _c("fecha_corte", "Fecha de corte (opcional)", "texto", False,
+                  "Escríbela así: 2024-05-31. Vacío = se usa el último dato de la tabla. Sirve para ver cómo estaban "
+                  "las cosas en esa fecha: se ignora lo posterior.")
 _EVENTO_COLS = [
     _c("columna_entidad", "Elemento", "columna", True, "Qué identifica a cada máquina, cliente, equipo…"),
     _c("columna_evento", "Columna que marca el evento", "columna", False,
@@ -117,6 +125,7 @@ _EVENTO_COLS = [
        ["repetido", "unico"], "repetido"),
     _c("columna_inicio", "Fecha de inicio del elemento (opcional)", "fecha", False, "Instalación, alta del cliente… Mejora la estimación."),
     _c("columna_grupo", "Agrupar por tipo (opcional)", "columna", False, "Modelo, categoría… cada grupo con suficientes eventos se estima aparte."),
+    _FECHA_CORTE,
 ]
 
 PALABRAS_CLAVE = {
@@ -124,18 +133,18 @@ PALABRAS_CLAVE = {
         "nombre": "Proyección", "mecanismo": "serie",
         "pregunta": "¿Qué valor tendrá más adelante?",
         "ejemplos": "ventas del próximo mes · temperatura de mañana · consumo de la semana",
-        "campos": [_FECHA, _VALOR, _ENT, _ENT_UNO, _AGREGACION, _FREC, _HORIZ]},
+        "campos": [_FECHA, _VALOR, _ENT, _ENT_UNO, _AGREGACION, _FREC, _HORIZ, _FECHA_CORTE]},
     "tendencia": {
         "nombre": "Tendencia", "mecanismo": "serie",
         "pregunta": "¿Sube, baja o se mantiene? ¿A qué ritmo?",
         "ejemplos": "ganancias · tasa de fallas · rotación de personal",
         "campos": [_FECHA, _VALOR, _ENT, _ENT_UNO, _AGREGACION, _FREC,
-                   _c("ventana", "Mirar solo los últimos N períodos", "entero", False, "0 = todo el historial.", None, 0)]},
+                   _c("ventana", "Mirar solo los últimos N períodos", "entero", False, "0 = todo el historial.", None, 0), _FECHA_CORTE]},
     "estacionalidad": {
         "nombre": "Estacionalidad", "mecanismo": "serie",
         "pregunta": "¿Cuándo se repiten los picos y los valles?",
         "ejemplos": "días de más demanda · horas punta · meses flojos",
-        "campos": [_FECHA, _VALOR, _ENT, _ENT_UNO, _AGREGACION, _FREC]},
+        "campos": [_FECHA, _VALOR, _ENT, _ENT_UNO, _AGREGACION, _FREC, _FECHA_CORTE]},
     "escenario": {
         "nombre": "Escenario", "mecanismo": "serie",
         "pregunta": "¿Qué pasa si cambio una variable?",
@@ -144,7 +153,7 @@ PALABRAS_CLAVE = {
                    _c("cambio_pct", "Cambio (%)", "numero", True, "Positivo sube, negativo baja.", None, 10.0),
                    _c("rezago", "El efecto tarda (períodos)", "entero", False, "0 = efecto inmediato.", None, 0),
                    _c("agregacion_driver", "Cómo juntar la variable", "opcion", False, "", ["promedio", "suma", "ultimo", "max", "min"], "promedio"),
-                   _ENT, _ENT_UNO, _AGREGACION, _FREC]},
+                   _ENT, _ENT_UNO, _AGREGACION, _FREC, _FECHA_CORTE]},
     "agotamiento": {
         "nombre": "Agotamiento", "mecanismo": "serie",
         "pregunta": "¿Cuándo se acaba un recurso?",
@@ -155,20 +164,20 @@ PALABRAS_CLAVE = {
                    _c("stock_actual", "Stock actual (si no hay columna)", "numero", False, "Un número, para un solo recurso."),
                    _ENT, _FREC,
                    _c("ventana_dias", "Avisar si se acaba en menos de (días)", "numero", False, "", None, 14),
-                   _c("ventana", "Mirar el consumo de los últimos N períodos", "entero", False, "0 = automático.", None, 0)]},
+                   _c("ventana", "Mirar el consumo de los últimos N períodos", "entero", False, "0 = automático.", None, 0), _FECHA_CORTE]},
     "umbral": {
         "nombre": "Umbral", "mecanismo": "serie",
         "pregunta": "¿Cuándo una métrica cruzará un límite?",
         "ejemplos": "temperatura sobre 80° · deuda sobre un tope · uso de CPU sobre 90%",
         "campos": [_FECHA, _VALOR, _c("umbral", "Límite", "numero", True, "El valor que quieres vigilar."),
                    _c("direccion", "Qué vigilar", "opcion", False, "auto: según si hoy estás sobre o bajo el límite.", ["auto", "sube", "baja"], "auto"),
-                   _ENT, _ENT_UNO, _AGREGACION, _FREC, _HORIZ]},
+                   _ENT, _ENT_UNO, _AGREGACION, _FREC, _HORIZ, _FECHA_CORTE]},
     "saturacion": {
         "nombre": "Saturación", "mecanismo": "serie",
         "pregunta": "¿Con qué probabilidad se superará la capacidad?",
         "ejemplos": "ancho de banda · aforo · cola de atención · carga de una planta",
         "campos": [_FECHA, _VALOR, _c("capacidad", "Capacidad máxima", "numero", True, "El valor desde el cual se satura."),
-                   _ENT, _ENT_UNO, _AGREGACION, _FREC, _HORIZ]},
+                   _ENT, _ENT_UNO, _AGREGACION, _FREC, _HORIZ, _FECHA_CORTE]},
     "vida_util": {
         "nombre": "Vida útil", "mecanismo": "evento",
         "pregunta": "¿Cuánto falta para que ocurra un evento?",
@@ -194,13 +203,16 @@ PALABRAS_CLAVE = {
                    _c("unidad_duracion", "Unidad de esa columna", "opcion", False, "", ["dias", "horas", "minutos", "semanas"], "dias"),
                    _c("columna_grupo", "Agrupar por tipo (opcional)", "columna", False, "Tipo de trámite, proveedor…"),
                    _c("columna_entidad", "Identificador del caso (opcional)", "columna", False, ""),
-                   _c("ventana_dias", "Probabilidad de terminar en (días)", "numero", False, "", None, 7)]},
+                   _c("ventana_dias", "Probabilidad de terminar en (días)", "numero", False, "", None, 7), _FECHA_CORTE]},
     "clasificacion": {
         "nombre": "Clasificación", "mecanismo": "tabla",
         "pregunta": "¿A qué categoría pertenece?",
         "ejemplos": "aprobado o rechazado · tipo de defecto · cliente que compra o no",
         "campos": [_c("columna_objetivo", "Categoría a predecir", "columna", True, ""),
-                   _c("columnas_explicativas", "Columnas que explican (vacío = automático)", "multi_columna", False, "")]},
+                   _c("columnas_explicativas", "Columnas que explican (vacío = automático)", "multi_columna", False, ""),
+                   _c("columna_fecha", "Fecha (opcional)", "fecha", False,
+                      "Si la tabla tiene fechas, Hadar prueba con los casos más nuevos (como pasará en la vida real). "
+                      "Vacío = busca sola una columna de fecha.")]},
     "prioridad": {
         "nombre": "Prioridad", "mecanismo": "tabla",
         "pregunta": "¿Qué casos debo mirar primero?",
@@ -242,6 +254,12 @@ def campos_faltantes(cfg: ConfigPronostico) -> list:
     return faltan
 
 
+# Qué es el número de cada palabra clave. «falla» (con modelo) y «clasificacion» lo deciden según la calibración medida.
+_TIPO_SALIDA = {"proyeccion": "valor", "tendencia": "valor", "estacionalidad": "valor", "escenario": "valor",
+                "agotamiento": "valor", "umbral": "valor", "saturacion": "valor", "vida_util": "valor",
+                "duracion": "valor", "prioridad": "ranking"}
+
+
 def ejecutar(cfg: ConfigPronostico, tablas: dict) -> ResultadoPronostico:
     """Corre la palabra clave sobre la tabla elegida. Lanza ValueError con un mensaje en español
     claro cuando falta algo o los datos no alcanzan."""
@@ -255,17 +273,24 @@ def ejecutar(cfg: ConfigPronostico, tablas: dict) -> ResultadoPronostico:
     df = tablas[cfg.tabla]
     if len(df) < 5:
         raise ValueError("La tabla tiene muy pocas filas para predecir algo.")
+    if PALABRAS_CLAVE[cfg.palabra]["mecanismo"] != "tabla":
+        leer_fecha_corte(cfg.fecha_corte)            # error claro si la fecha de corte no se entiende
     res = _FUNCIONES[cfg.palabra](df, cfg)
+    if not res.tipo_salida:
+        res.tipo_salida = _TIPO_SALIDA.get(cfg.palabra) or ("probabilidad" if cfg.palabra == "falla" else "")
+        if res.tipo_salida and TEXTO_TIPO_SALIDA[res.tipo_salida] not in res.detalle:
+            res.detalle.append(TEXTO_TIPO_SALIDA[res.tipo_salida])
+    if PALABRAS_CLAVE[cfg.palabra]["mecanismo"] != "tabla":
+        aviso = aviso_datos_antiguos(df, [cfg.columna_fecha, cfg.columna_fin, cfg.columna_inicio], cfg.fecha_corte,
+                                     umbral_dias=cfg.dias_aviso_datos_antiguos)
+        if aviso:
+            res.advertencias.insert(0, aviso)
     return res
 
 
 # ----------------------------------------------------------------------
 # Sugerir columnas
 # ----------------------------------------------------------------------
-_PISTAS_VALOR = {"venta", "ventas", "monto", "total", "cantidad", "consumo", "ingreso", "ingresos", "ganancia",
-                 "ganancias", "costo", "precio", "valor", "temperatura", "uso", "carga", "stock", "unidades"}
-_PISTAS_EVENTO = {"falla", "fallo", "evento", "error", "incidente", "averia", "avería", "tipo", "estado", "status",
-                  "alarma", "alerta"}
 
 
 def sugerir_configuracion(df: pd.DataFrame, palabra: str = "proyeccion") -> dict:
@@ -276,7 +301,7 @@ def sugerir_configuracion(df: pd.DataFrame, palabra: str = "proyeccion") -> dict
     if fechas:
         sug["columna_fecha"] = fechas[0]
     nums = [c for c, t in tipos.items() if t == "numerica" and not es_columna_id(c)]
-    puntaje = lambda c: len(set(_tokens(c)) & _PISTAS_VALOR)
+    puntaje = lambda c: len(set(_pistas.tokens(c)) & _pistas.VALOR)
     if nums:
         sug["columna_valor"] = sorted(nums, key=lambda c: (-puntaje(c), list(df.columns).index(c)))[0]
     n = len(df)
@@ -289,12 +314,12 @@ def sugerir_configuracion(df: pd.DataFrame, palabra: str = "proyeccion") -> dict
     if ents:
         sug["columna_entidad"] = sorted(ents)[0][1]
     for c, t in tipos.items():
-        if t in ("categorica", "booleana") and set(_tokens(c)) & _PISTAS_EVENTO and c != sug.get("columna_entidad"):
+        if t in ("categorica", "booleana") and set(_pistas.tokens(c)) & _pistas.EVENTO and c != sug.get("columna_entidad"):
             sug["columna_evento"] = c
             break
     if palabra in ("duracion",):
-        ini = [c for c in fechas if set(_tokens(c)) & {"inicio", "apertura", "creacion", "creación", "ingreso", "solicitud"}]
-        fin = [c for c in fechas if set(_tokens(c)) & {"fin", "cierre", "termino", "término", "entrega", "resolucion", "resolución"}]
+        ini = [c for c in fechas if set(_pistas.tokens(c)) & _pistas.INICIO]
+        fin = [c for c in fechas if set(_pistas.tokens(c)) & _pistas.FIN]
         if ini:
             sug["columna_inicio"] = ini[0]
         if fin:

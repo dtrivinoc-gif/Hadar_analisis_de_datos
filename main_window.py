@@ -75,6 +75,7 @@ from .alarmas import (
 from .notificaciones import DialogoConfiguracionCorreo, disparar_envio_correo, cargar_configuracion
 from .linea_tiempo_ui import LineaTiempoPanel
 from .panel import PanelControl, tendencia_indicador, variacion_indicador
+from .ajustes_ui import PanelAjustes
 from .prediccion_ui import PanelPrediccion
 from .pronosticos_ui import PanelPalabras
 from .frecuencias_ui import PanelFrecuencias
@@ -1251,6 +1252,8 @@ class HadarApp(QMainWindow):
             self._actualizar_indicadores()
         if hasattr(self, "panel_prediccion"):
             self.panel_prediccion.aplicar_tema(self.colors)
+        if hasattr(self, "panel_ajustes"):
+            self.panel_ajustes.aplicar_tema(self.colors)
         if hasattr(self, "panel_palabras"):
             self.panel_palabras.aplicar_tema(self.colors)
         if hasattr(self, "panel_frecuencias"):
@@ -1810,11 +1813,13 @@ class HadarApp(QMainWindow):
         fila.setSpacing(8)
         self.btn_pred_preguntas = QPushButton("Preguntas")
         self.btn_pred_modelo = QPushButton("Entrenar un modelo")
+        self.btn_pred_ajustes = QPushButton("Ajustes")
         self.btn_pred_preguntas.setToolTip("Cuándo, cuánto o qué pasaría: ventas futuras, stock que se acaba, fallas…")
         self.btn_pred_modelo.setToolTip("Adivinar el valor de una columna fila por fila, aprendiendo de las demás.")
+        self.btn_pred_ajustes.setToolTip("Formato de los números y otras decisiones que valen para todo el proyecto.")
         self.pred_grupo = QButtonGroup(self)
         self.pred_grupo.setExclusive(True)
-        for i, b in enumerate((self.btn_pred_preguntas, self.btn_pred_modelo)):
+        for i, b in enumerate((self.btn_pred_preguntas, self.btn_pred_modelo, self.btn_pred_ajustes)):
             b.setCheckable(True)
             b.setCursor(Qt.PointingHandCursor)
             b.setStyleSheet(QSS_SUBPESTANA)
@@ -1826,8 +1831,10 @@ class HadarApp(QMainWindow):
         self.pred_pila = QStackedWidget()
         self.panel_palabras = PanelPalabras(host=self)
         self.panel_prediccion = PanelPrediccion(host=self)
+        self.panel_ajustes = PanelAjustes(host=self)
         self.pred_pila.addWidget(self.panel_palabras)
         self.pred_pila.addWidget(self.panel_prediccion)
+        self.pred_pila.addWidget(self.panel_ajustes)
         layout.addWidget(self.pred_pila)
         self.pred_grupo.idClicked.connect(self.pred_pila.setCurrentIndex)
         self.btn_pred_preguntas.setChecked(True)
@@ -1845,6 +1852,10 @@ class HadarApp(QMainWindow):
             base["palabras"] = self.panel_palabras.config_a_dict()
         elif "palabras" in (self.prediccion_config or {}):
             base["palabras"] = self.prediccion_config["palabras"]
+        if hasattr(self, "panel_ajustes"):
+            base["ajustes"] = self.panel_ajustes.config_a_dict()
+        elif "ajustes" in (self.prediccion_config or {}):
+            base["ajustes"] = self.prediccion_config["ajustes"]
         return base
 
     # ------------------------------------------------------------------
@@ -2747,6 +2758,8 @@ class HadarApp(QMainWindow):
             self.panel_prediccion.cargar_config(self.prediccion_config)
         if hasattr(self, "panel_palabras"):
             self.panel_palabras.cargar_config((self.prediccion_config or {}).get("palabras"))
+        if hasattr(self, "panel_ajustes"):
+            self.panel_ajustes.cargar_config((self.prediccion_config or {}).get("ajustes"))
 
         nombre_proyecto = os.path.splitext(os.path.basename(path))[0]
         sufijo_multi_tabla = (

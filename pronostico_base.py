@@ -34,6 +34,23 @@ UNIDADES = {
 }
 
 
+# Formato de los números en los textos: «chileno» (1.234,5) o «estandar» (1,234.5). Es un solo lugar para todo Hadar:
+# la pantalla lo fija al cargar el proyecto (ver ajustes.py) y todas las frases lo respetan.
+FORMATO_NUMERICO = "chileno"
+
+
+def set_formato_numerico(formato: str) -> None:
+    global FORMATO_NUMERICO
+    FORMATO_NUMERICO = "estandar" if formato == "estandar" else "chileno"
+
+
+def _loc(s: str) -> str:
+    """Pasa un número escrito en formato estándar (1,234.5) al formato elegido."""
+    if FORMATO_NUMERICO != "chileno":
+        return s
+    return s.replace(",", "\x00").replace(".", ",").replace("\x00", ".")
+
+
 def fecha_txt(t, con_hora: bool = False) -> str:
     if t is None or (not isinstance(t, pd.Timestamp) and pd.isna(t)):
         return "—"
@@ -47,7 +64,11 @@ def fecha_txt(t, con_hora: bool = False) -> str:
 
 
 def num_txt(x, decimales: int | None = None) -> str:
-    """Número legible: miles con coma, pocos decimales si es grande."""
+    """Número legible: separador de miles y pocos decimales si es grande (según el formato elegido)."""
+    return _loc(_num_estandar(x, decimales))
+
+
+def _num_estandar(x, decimales: int | None = None) -> str:
     if x is None:
         return "—"
     try:
@@ -76,7 +97,7 @@ def pct_txt(x, decimales: int = 0, signo: bool = False) -> str:
     if round(v, decimales) == 0:
         v = 0.0                       # evita «-0%»
     s = f"{v:+.{decimales}f}%" if (signo and v != 0) else f"{v:.{decimales}f}%"
-    return s
+    return _loc(s)
 
 
 def pct_auto(x, signo: bool = False) -> str:
@@ -97,7 +118,7 @@ def duracion_txt(n, freq: str = "D") -> str:
     if abs(n - round(n)) < 0.05 or n >= 10:
         v = int(round(n))
         return f"{v} {uno if v == 1 else varios}"
-    return f"{n:.1f} {varios}"
+    return _loc(f"{n:.1f} {varios}")
 
 
 def dias_txt(d) -> str:
@@ -117,7 +138,16 @@ def dias_txt(d) -> str:
     if d < 730:
         v = int(round(d / 30.4))
         return f"{v} meses"
-    return f"{d / 365.25:.1f} años"
+    return _loc(f"{d / 365.25:.1f} años")
+
+
+# Qué significa el número que entrega cada palabra clave (texto automático, en palabras simples)
+TEXTO_TIPO_SALIDA = {
+    "valor": "Qué es el número: un valor pronosticado (una estimación con su rango), no una cifra exacta.",
+    "probabilidad": "Qué es el número: una probabilidad calculada con los casos observados (de cada 100 casos como este, "
+                    "ocurre en aproximadamente ese número).",
+    "ranking": "Qué es el número: un puntaje para ORDENAR de más a menos urgente; no es un porcentaje ni un monto real.",
+}
 
 
 @dataclass
@@ -136,6 +166,7 @@ class ResultadoPronostico:
     tabla_titulo: str = ""
     grafico: dict | None = field(default=None, repr=False)   # ver series_tiempo.grafico_serie
     metricas: dict = field(default_factory=dict)
+    tipo_salida: str = ""            # qué es el número que se entrega: valor | probabilidad | ranking (ver TEXTO_TIPO_SALIDA)
 
     def lineas_resumen(self) -> list:
         lineas = [self.titular]
@@ -172,3 +203,62 @@ def leer_fechas(serie: pd.Series, nombre: str, exigir_validas: bool = True) -> p
     if exigir_validas and len(dt) and float(dt.notna().mean()) < 0.5:
         raise ValueError(f"No pude leer fechas en «{nombre}» (solo se entendió el {dt.notna().mean() * 100:.0f}%).")
     return dt
+
+
+# ----------------------------------------------------------------------
+# Fecha de corte («como estaba el mundo en esa fecha») y aviso de datos antiguos
+# ----------------------------------------------------------------------
+UMBRAL_DATOS_ANTIGUOS_DIAS = 45
+
+
+def leer_fecha_corte(txt):
+    """Texto -> Timestamp (o None si está vacío). Error claro, en español, si no se entiende."""
+    if txt is None or (isinstance(txt, str) and not txt.strip()):
+        return None
+    try:
+        t = pd.Timestamp(txt)
+    except (ValueError, TypeError):
+        raise ValueError(f"No entendí la fecha de corte «{txt}». Escríbela así: 2024-05-31.")
+    if pd.isna(t):
+        raise ValueError(f"No entendí la fecha de corte «{txt}». Escríbela así: 2024-05-31.")
+    return t.tz_localize(None) if t.tzinfo is not None else t
+
+
+def aplicar_fecha_corte(df: pd.DataFrame, col_fecha, fecha_corte) -> pd.DataFrame:
+    """Deja solo las filas con fecha hasta el corte (el día completo si el corte no trae hora)."""
+    corte = leer_fecha_corte(fecha_corte)
+    if corte is None or not col_fecha or col_fecha not in df.columns:
+        return df
+    lim = corte + pd.Timedelta(days=1) - pd.Timedelta(nanoseconds=1) if corte == corte.normalize() else corte
+    dt = leer_fechas(df[col_fecha], col_fecha, exigir_validas=False)
+    sub = df[(dt <= lim).to_numpy()]
+    if len(sub) == 0:
+        raise ValueError(f"No hay datos hasta la fecha de corte ({fecha_txt(corte)}). Elige una fecha de corte más reciente.")
+    return sub
+
+
+def aviso_datos_antiguos(df: pd.DataFrame, columnas, fecha_corte=None, hoy=None, umbral_dias=None):
+    """Frase de aviso si el último dato está lejos de hoy (las fechas se cuentan desde el último dato, no desde hoy).
+    Devuelve None si no hace falta."""
+    hoy = pd.Timestamp(hoy) if hoy is not None else pd.Timestamp.now().normalize()
+    corte = leer_fecha_corte(fecha_corte)
+    ult = None
+    if corte is None:
+        for c in columnas:
+            if c and c in df.columns:
+                try:
+                    m = leer_fechas(df[c], c, exigir_validas=False).max()
+                except ValueError:
+                    continue
+                if pd.notna(m) and (ult is None or m > ult):
+                    ult = m
+    else:
+        ult = corte
+    if ult is None:
+        return None
+    dias = (hoy - ult.normalize()).days
+    if dias <= (UMBRAL_DATOS_ANTIGUOS_DIAS if umbral_dias is None else umbral_dias):
+        return None
+    origen = "La fecha de corte es" if corte is not None else "El último dato de la tabla es del"
+    return (f"{origen} {fecha_txt(ult)} (hace {dias} días): las fechas y plazos se cuentan desde ahí, no desde hoy. "
+            f"Si ya pasó tiempo, lo que dice sobre «los próximos días» puede estar en el pasado.")

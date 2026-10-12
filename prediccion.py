@@ -52,6 +52,7 @@ UMBRAL_FUGA = 0.999
 FRACCION_VALIDACION = 0.2
 MINIMO_FILAS = 30
 MAX_FRECUENCIAS = 50_000
+UMBRAL_DUPLICADAS = 0.02    # avisar si al menos el 2% de las filas están repetidas
 REVISION_MAX = 50              # filas que se guardan para la lista de revisión
 PUNTOS_GRAFICO = 1500           # puntos del gráfico «predicho vs real»
 PLIEGUES_POR_DEFECTO = 5        # cuántas pruebas distintas se hacen (validación cruzada)
@@ -267,6 +268,20 @@ def inferir_tipo_problema(serie: pd.Series, manual: str = "auto") -> str:
     return "regresion"
 
 
+def columnas_fecha(df: pd.DataFrame, excluir=()) -> list:
+    """Columnas de la tabla que parecen fechas (mira solo una muestra, así es barato)."""
+    salida = []
+    for c in df.columns:
+        if c in excluir or es_columna_id(c):
+            continue
+        try:
+            if tipo_columna(df[c].head(2000)) in ("fecha", "fecha_texto"):
+                salida.append(str(c))
+        except Exception:
+            continue
+    return salida
+
+
 def sugerir_columnas(df: pd.DataFrame, objetivo: str | None = None,
                      df_prueba: pd.DataFrame | None = None) -> list:
     """Propone qué columnas usar. Es solo una sugerencia: el usuario puede
@@ -412,6 +427,7 @@ class Preprocesador:
                 self.mascara_categ.append(p["tipo"] == "cat")
 
     def transformar(self, df: pd.DataFrame) -> np.ndarray:
+        self.desconocidas = {}          # columna -> (filas con un valor que no se vio al entrenar, un ejemplo)
         columnas = []
         for col in self.columnas:
             p = self.plan[col]
@@ -435,7 +451,10 @@ class Preprocesador:
                 faltante = s.isna().to_numpy()
                 texto = np.where(faltante, None, s.astype(object).astype(str).to_numpy())
                 if p["tipo"] == "cat":
-                    codigos = pd.Categorical(texto, categories=p["categorias"]).codes.astype("float32")
+                    # Categorías que no se vieron al entrenar pasan a «vacío» (NaN). Se hace con get_indexer: construir
+                    # un Categorical con valores fuera de las categorías está deprecado y fallará en pandas 4.
+                    codigos = pd.Index(p["categorias"]).get_indexer(texto).astype("float32")
+                    nuevas = (codigos < 0) & ~faltante
                     codigos[codigos < 0] = np.nan
                     columnas.append(codigos)
                 else:
@@ -443,6 +462,9 @@ class Preprocesador:
                     columnas.append(np.array(
                         [frec.get(t, 0.0) if t is not None else np.nan for t in texto],
                         dtype="float32"))
+                    nuevas = np.array([t is not None and t not in frec for t in texto], dtype=bool)
+                if nuevas.any():
+                    self.desconocidas[col] = (int(nuevas.sum()), str(texto[np.argmax(nuevas)]))
         if not columnas:
             return np.empty((len(df), 0), dtype="float32")
         return np.column_stack(columnas).astype("float32", copy=False)
@@ -499,6 +521,9 @@ class ResultadoEntrenamiento:
     modo_validacion: str = "aleatoria"
     balanceado: bool = False       # se dio más peso a la clase poco frecuente
     clase_minoritaria: object = None   # solo en problemas de dos clases
+    tipo_salida: str = ""              # valor | probabilidad | ranking (qué significa el número que se entrega)
+    calibracion: dict | None = field(default=None, repr=False)   # medición de calibración (dos clases)
+    calibrador: object = field(default=None, repr=False)         # corrección en memoria, o None
 
     # ---- lectura simple del resultado (para la pantalla) --------------
     def mejora(self) -> float:
@@ -560,6 +585,23 @@ class ResultadoEntrenamiento:
             return ""
         sd = self.metricas_sd.get(clave, 0.0) * escala
         return f" (± {sd:.{decimales}f})" if sd >= 0.5 * 10 ** -decimales else ""
+
+    def texto_salida(self) -> str:
+        """Qué significa el número que entrega el modelo, en palabras simples."""
+        if self.tipo_salida == "valor":
+            return f"El número es un valor pronosticado de «{self.objetivo}» (una estimación, no una probabilidad)."
+        c = self.calibracion or {}
+        if self.tipo_salida == "probabilidad":
+            base = ("Es una probabilidad: en datos que no vio, de los casos con un X% estimado ocurrió aproximadamente "
+                    "ese X% de las veces")
+            if c.get("calibrada") and c.get("metodo"):
+                base += (f" (Hadar corrigió el número con lo observado: método {'isotónico' if c['metodo'] == 'isotonica' else 'sigmoide'})")
+            return base + "."
+        if self.tipo_salida == "ranking":
+            razon = c.get("motivo") or ("se dio más peso a la clase poco frecuente, lo que distorsiona el número"
+                                        if self.balanceado else "no se pudo comprobar que coincida con lo que ocurre")
+            return ("El número es un puntaje para ORDENAR (de más a menos probable), no un porcentaje real: " + razon + ".")
+        return ""
 
     def tarjetas(self) -> list:
         """Tres cifras clave, cada una con su explicación en palabras: [(valor, titulo, explicacion)]."""
@@ -643,7 +685,106 @@ class ResultadoEntrenamiento:
         if extra:
             lineas.append(extra)
         lineas.append(self.texto_validacion())
+        ts = self.texto_salida()
+        if ts:
+            lineas.append(ts)
+        if self.importancias:
+            lineas.append("Las columnas «que más pesan» resumen el modelo en general, no explican un caso puntual; y si "
+                          "dos columnas dicen casi lo mismo, el peso se reparte entre ellas.")
         return lineas
+
+
+# ----------------------------------------------------------------------
+# Calibración: ¿el «30%» que dice el modelo ocurre de verdad ~30% de las veces?
+# ----------------------------------------------------------------------
+MIN_CASOS_CALIBRACION = 200       # menos casos que esto: no se puede comprobar
+MIN_CLASE_CALIBRACION = 20        # y al menos 20 de cada clase
+MIN_CASOS_ISOTONICA = 1000        # con menos casos se usa un ajuste suave (Platt) en vez de la isotónica
+
+
+class Calibrador:
+    """Corrige las probabilidades del modelo con lo que pasó de verdad en datos que no vio. Vive solo en memoria
+    (no se guarda: igual que el modelo, se reentrena con un clic)."""
+
+    def __init__(self, metodo: str):
+        self.metodo = metodo
+        self._m = None
+
+    @staticmethod
+    def _logit(p):
+        p = np.clip(np.asarray(p, dtype="float64"), 1e-6, 1 - 1e-6)
+        return np.log(p / (1 - p)).reshape(-1, 1)
+
+    def ajustar(self, p, y) -> "Calibrador":
+        if self.metodo == "isotonica":
+            from sklearn.isotonic import IsotonicRegression
+            self._m = IsotonicRegression(out_of_bounds="clip", y_min=0.0, y_max=1.0).fit(np.asarray(p, dtype="float64"), y)
+        else:
+            from sklearn.linear_model import LogisticRegression
+            self._m = LogisticRegression(C=1e6, max_iter=1000).fit(self._logit(p), y)
+        return self
+
+    def transformar(self, p) -> np.ndarray:
+        if self.metodo == "isotonica":
+            return np.asarray(self._m.predict(np.asarray(p, dtype="float64")), dtype="float64")
+        return self._m.predict_proba(self._logit(p))[:, 1]
+
+
+def _ece_y_tabla(p, y):
+    """Error de calibración (promedio ponderado de |lo que dijo − lo que pasó|) y la tabla por tramos de igual tamaño."""
+    n = len(y)
+    k = int(max(2, min(10, n // 50)))
+    orden = np.argsort(p, kind="stable")
+    tabla, ece = [], 0.0
+    for grupo in np.array_split(orden, k):
+        if len(grupo) == 0:
+            continue
+        pm, fr = float(np.mean(p[grupo])), float(np.mean(y[grupo]))
+        ece += len(grupo) / n * abs(pm - fr)
+        tabla.append({"desde": float(p[grupo].min()), "hasta": float(p[grupo].max()), "estimada": pm, "real": fr,
+                      "casos": int(len(grupo))})
+    return float(ece), tabla
+
+
+def evaluar_calibracion(p, y, semilla: int = 0) -> dict:
+    """Mide la calibración con predicciones FUERA DE MUESTRA (p = probabilidad estimada de la clase 1, y = 0/1).
+    Calibra solo si hay casos suficientes y la calibración MEJORA en datos separados (validación cruzada de 2 partes)."""
+    p = np.clip(np.asarray(p, dtype="float64"), 1e-6, 1 - 1e-6)
+    y = np.asarray(y).astype(int)
+    n, pos = len(y), int(y.sum())
+    base = float(y.mean()) if n else 0.0
+    out = {"n": n, "positivos": pos, "brier": float(np.mean((p - y) ** 2)) if n else None,
+           "brier_base": float(np.mean((base - y) ** 2)) if n else None,
+           "verificable": False, "calibrada": False, "metodo": None, "calibrador": None,
+           "ece": None, "ece_calibrado": None, "tabla": [], "motivo": ""}
+    if n < MIN_CASOS_CALIBRACION or pos < MIN_CLASE_CALIBRACION or (n - pos) < MIN_CLASE_CALIBRACION:
+        out["motivo"] = (f"hay pocos casos para comprobarlo ({n} casos, {pos} de la clase que se predice; "
+                         f"se necesitan al menos {MIN_CASOS_CALIBRACION} y {MIN_CLASE_CALIBRACION} de cada clase)")
+        return out
+    ece, tabla = _ece_y_tabla(p, y)
+    tol = 0.05 + 0.5 / np.sqrt(n)               # tolerancia: con pocos casos el azar mueve la tabla
+    out.update(verificable=True, ece=ece, tabla=tabla, tolerancia=float(tol))
+    if ece <= tol:
+        out["calibrada"] = True                  # ya decía la verdad: no hace falta corregir
+        return out
+    metodo = "isotonica" if (n >= MIN_CASOS_ISOTONICA and pos >= 50 and n - pos >= 50) else "platt"
+    idx = np.random.default_rng(semilla).permutation(n)
+    mitades = (idx[: n // 2], idx[n // 2:])
+    antes, despues = [], []
+    try:
+        for a, b in ((0, 1), (1, 0)):
+            cal = Calibrador(metodo).ajustar(p[mitades[a]], y[mitades[a]])
+            despues.append(_ece_y_tabla(cal.transformar(p[mitades[b]]), y[mitades[b]])[0])
+            antes.append(_ece_y_tabla(p[mitades[b]], y[mitades[b]])[0])
+        ece_cal, ece_antes = float(np.mean(despues)), float(np.mean(antes))
+        if ece_cal <= tol and ece_cal < 0.8 * ece_antes:
+            out["calibrador"] = Calibrador(metodo).ajustar(p, y)
+            out.update(calibrada=True, metodo=metodo, ece_calibrado=ece_cal)
+        else:
+            out["motivo"] = "corregirlas con lo observado no las dejó confiables al probar con datos separados"
+    except Exception as e:                       # no se oculta: se anota el motivo
+        out["motivo"] = f"no se pudo calibrar ({type(e).__name__})"
+    return out
 
 
 # ----------------------------------------------------------------------
@@ -674,6 +815,15 @@ def diagnosticar_variables(df: pd.DataFrame, objetivo: str, columnas: list, tipo
                 ok = xn.notna() & yn.notna()
                 if ok.sum() >= MINIMO_FILAS and xn[ok].nunique() > 1 and yn[ok].nunique() > 1:
                     r = abs(float(np.corrcoef(xn[ok].to_numpy(float), yn[ok].to_numpy(float))[0, 1]))
+                    if np.isfinite(r) and r >= UMBRAL_FUGA:
+                        salida.append((str(c), f"es casi una copia de «{objetivo}» (correlación {r:.3f})"))
+            elif tipo == "clasificacion" and t in ("numerica", "numerica_texto") and y_txt.nunique() == 2:
+                # número que casi copia una respuesta de dos clases (por ejemplo 0/1)
+                xn = pd.to_numeric(s, errors="coerce")
+                cod = pd.Series(pd.factorize(y_txt)[0], index=y_txt.index).astype(float)
+                ok = xn.notna()
+                if ok.sum() >= MINIMO_FILAS and xn[ok].nunique() > 1:
+                    r = abs(float(np.corrcoef(xn[ok].to_numpy(float), cod[ok].to_numpy(float))[0, 1]))
                     if np.isfinite(r) and r >= UMBRAL_FUGA:
                         salida.append((str(c), f"es casi una copia de «{objetivo}» (correlación {r:.3f})"))
             elif tipo == "clasificacion" and t in ("categorica", "booleana"):
@@ -853,12 +1003,30 @@ def entrenar(df: pd.DataFrame, config: ConfigPrediccion, columnas: list,
     if modo == "grupos" and config.columna_grupo not in df.columns:
         raise ValueError("Para probar «por grupos» elige la columna que identifica el grupo "
                          "(por ejemplo, la persona o cosa que se repite en varias filas).")
+    if modo == "aleatoria":
+        con_fecha = columnas_fecha(df, excluir=[obj])
+        if con_fecha:
+            advertencias.append(
+                f"La tabla tiene una columna de fecha («{con_fecha[0]}»), pero la prueba mezcló las filas al azar. "
+                "Si lo que predices cambia con el tiempo, la nota sale más optimista que la realidad: "
+                "para saber cómo le iría con casos nuevos, prueba «por fecha».")
     cols_necesarias = list(dict.fromkeys(
         columnas + [obj]
         + ([config.columna_fecha] if modo == "temporal" else [])
         + ([config.columna_grupo] if modo == "grupos" else [])))
     datos = df[cols_necesarias].iloc[pos].reset_index(drop=True)
     y_raw = datos[obj]
+    # Filas idénticas: con prueba aleatoria una copia puede caer en el entrenamiento y otra en la prueba, y la nota sale
+    # inflada. Solo se AVISA (nunca se borra nada). Si todas las columnas tienen pocos valores distintos, repetirse es
+    # normal y no se avisa.
+    cols_dup = [c for c in dict.fromkeys(columnas + [obj])]
+    n_dup = int(datos[cols_dup].duplicated().sum())
+    if n_dup and n_dup / len(datos) >= UMBRAL_DUPLICADAS and any(
+            datos[c].nunique(dropna=True) >= 50 for c in columnas if c in datos.columns):
+        advertencias.append(
+            f"{n_dup:,} filas ({n_dup / len(datos) * 100:.0f}%) son idénticas a otra en las columnas que usa el modelo. "
+            "Si una copia cae en el entrenamiento y otra en la prueba, la nota sale más alta que la real. "
+            "Hadar no las borró: revisa si son repeticiones por error" + (" o prueba «por fecha»." if modo == "aleatoria" else "."))
 
     tipo = inferir_tipo_problema(y_raw, config.tipo)
     clases = None
@@ -932,8 +1100,9 @@ def entrenar(df: pd.DataFrame, config: ConfigPrediccion, columnas: list,
 
     por_pliegue, base_pliegue, mejoras = [], [], []
     importancia_total = {}
+    fallos_importancia = []
     n_iters, tam_tr, tam_val = [], [], []
-    oof = {"pos": [], "real": [], "pred": [], "conf": []}
+    oof = {"pos": [], "real": [], "pred": [], "conf": [], "pbin": [], "ybin": []}
     pos_todas = []
     for i, (idx_tr, idx_val) in enumerate(partes):
         prog(f"Probando el modelo ({i + 1} de {len(partes)})…" if len(partes) > 1
@@ -1010,6 +1179,9 @@ def entrenar(df: pd.DataFrame, config: ConfigPrediccion, columnas: list,
                 oof["real"].append(real)
                 oof["pred"].append(pred)
                 oof["conf"].append(proba.max(axis=1))
+                if len(clases) == 2 and 1 in list(modelo.classes_):
+                    oof["pbin"].append(proba[:, list(modelo.classes_).index(1)])
+                    oof["ybin"].append((real == 1).astype(int))
         por_pliegue.append(met)
         base_pliegue.append(bas)
         mejoras.append(_mejora_de(tipo, met, bas))
@@ -1020,7 +1192,7 @@ def entrenar(df: pd.DataFrame, config: ConfigPrediccion, columnas: list,
             k = min(2000, len(idx_val))
             sub = np.random.default_rng(config.semilla + i).choice(len(idx_val), size=k, replace=False)
             pi = permutation_importance(
-                modelo, X_val[sub], yt[idx_val][sub], n_repeats=2, random_state=config.semilla, n_jobs=1,
+                modelo, X_val[sub], yt[idx_val][sub], n_repeats=5, random_state=config.semilla, n_jobs=1,
                 scoring="balanced_accuracy" if tipo == "clasificacion" else None)
             por_col = {}
             for fuente, valor in zip(pre.fuente, pi.importances_mean):
@@ -1029,8 +1201,12 @@ def entrenar(df: pd.DataFrame, config: ConfigPrediccion, columnas: list,
             if tot > 0:
                 for c, v in por_col.items():
                     importancia_total[c] = importancia_total.get(c, 0.0) + v / tot
-        except Exception:
-            pass
+        except Exception as e:      # no se oculta: el usuario debe saber que falta esta sección
+            fallos_importancia.append(f"{type(e).__name__}: {str(e)[:80]}")
+
+    if fallos_importancia:
+        advertencias.append("No se pudo calcular qué columnas pesan más en el modelo (" + fallos_importancia[0]
+                            + "). El resto de los resultados no se ve afectado.")
 
     metricas, metricas_sd = _promediar(por_pliegue)
     baseline, _ = _promediar(base_pliegue)
@@ -1107,6 +1283,29 @@ def entrenar(df: pd.DataFrame, config: ConfigPrediccion, columnas: list,
     modelo_final = _crear_modelo(tipo, config, pre_final.mascara_categ, n, n_iter=n_iter, parar_antes=False)
     modelo_final.fit(X_all, yt, sample_weight=_pesos(yt) if usar_pesos else None)
 
+    # --- ¿qué significa el número que se entrega? ---------------------------------------------------
+    tipo_salida, calibracion, calibrador = "", None, None
+    if tipo == "regresion":
+        tipo_salida = "valor"
+    elif config.salida == "probabilidad":
+        if len(clases) == 2 and oof["pbin"]:
+            calibracion = evaluar_calibracion(np.concatenate(oof["pbin"]), np.concatenate(oof["ybin"]), config.semilla)
+            calibrador = calibracion.pop("calibrador", None)
+            if calibracion["verificable"] and calibracion["calibrada"] and not (usar_pesos and calibrador is None):
+                tipo_salida = "probabilidad"
+            else:
+                tipo_salida = "ranking"
+                if usar_pesos and calibracion["verificable"] and calibracion["calibrada"]:
+                    calibracion["motivo"] = "se dio más peso a la clase poco frecuente, lo que distorsiona el número"
+            if tipo_salida == "ranking" and not calibracion["motivo"]:
+                calibracion["motivo"] = "no se pudo comprobar que coincida con lo que ocurre"
+        else:
+            tipo_salida = "ranking"
+            calibracion = {"motivo": "con más de dos categorías Hadar no comprueba la calibración", "verificable": False,
+                           "calibrada": False}
+    if calibracion is not None and calibracion.get("verificable") and tipo_salida == "ranking" and not calibracion.get("calibrada"):
+        advertencias.append("Las probabilidades que da el modelo no coinciden con lo que ocurre en datos que no vio "
+                            "(dice, por ejemplo, 30% y ocurre otra proporción): úsalas para ordenar, no como porcentajes.")
     return ResultadoEntrenamiento(
         tipo=tipo, objetivo=obj, columnas=columnas, clases=clases,
         metricas=metricas, baseline=baseline, importancias=importancias,
@@ -1116,6 +1315,7 @@ def entrenar(df: pd.DataFrame, config: ConfigPrediccion, columnas: list,
         validacion=validacion, revision=revision,
         metricas_sd=metricas_sd, mejoras_pliegue=mejoras, n_pliegues=len(partes),
         modo_validacion=modo, balanceado=usar_pesos, clase_minoritaria=clase_min,
+        tipo_salida=tipo_salida, calibracion=calibracion, calibrador=calibrador,
     )
 
 
@@ -1132,6 +1332,11 @@ def predecir(resultado: ResultadoEntrenamiento, df: pd.DataFrame,
     salida = salida or resultado.salida
     X = resultado.preprocesador.transformar(df[resultado.columnas])
     modelo = resultado.modelo
+    avisos = []
+    for col, (n_nuevas, ejemplo) in getattr(resultado.preprocesador, "desconocidas", {}).items():
+        avisos.append(f"{n_nuevas:,} filas ({n_nuevas / max(len(df), 1) * 100:.1f}%) traen en «{col}» valores que el modelo "
+                      f"nunca vio (por ejemplo «{ejemplo}»): para esas filas el modelo no tiene cómo usar esa columna "
+                      f"y la predicción es menos confiable.")
 
     id_col = elegir_columna_id(df, columna_id)
     salida_df = pd.DataFrame({id_col: df[id_col].to_numpy()}) if id_col else \
@@ -1142,6 +1347,8 @@ def predecir(resultado: ResultadoEntrenamiento, df: pd.DataFrame,
         if resultado.log_objetivo:
             pred = np.clip(np.expm1(pred), 0, None)
         salida_df[resultado.objetivo] = pred
+        salida_df.attrs["avisos"] = avisos
+        salida_df.attrs["tipo_salida"] = "valor"
         return salida_df
 
     clases = np.array(resultado.clases, dtype=object)
@@ -1149,12 +1356,17 @@ def predecir(resultado: ResultadoEntrenamiento, df: pd.DataFrame,
     if salida == "probabilidad":
         proba = modelo.predict_proba(X)
         if len(presentes) == 2 and len(resultado.clases) == 2:
-            salida_df[resultado.objetivo] = proba[:, 1]
+            p1 = proba[:, 1]
+            if getattr(resultado, "calibrador", None) is not None:
+                p1 = resultado.calibrador.transformar(p1)
+            salida_df[resultado.objetivo] = p1
         else:
             for j, etiqueta in enumerate(presentes):
                 salida_df[str(etiqueta)] = proba[:, j]
     else:
         salida_df[resultado.objetivo] = presentes[np.searchsorted(modelo.classes_, modelo.predict(X))]
+    salida_df.attrs["avisos"] = avisos
+    salida_df.attrs["tipo_salida"] = resultado.tipo_salida if salida == "probabilidad" else ""
     return salida_df
 
 

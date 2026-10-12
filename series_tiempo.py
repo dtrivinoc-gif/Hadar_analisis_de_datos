@@ -16,7 +16,7 @@ Cómo se proyecta (sin librerías nuevas, solo numpy/pandas):
   2. Se comparan «a ciegas»: se simula que estamos en el pasado, se predice y
      se compara contra lo que de verdad pasó (varios puntos del historial).
   3. Gana el más simple entre los que rinden parecido. Se mide cuánto mejora
-     frente a «repetir lo último que pasó» (la respuesta tonta de siempre).
+     frente a la respuesta más simple («repetir lo último que pasó» o «el promedio de siempre»).
   4. El rango sale de cuánto se equivocó ese método en las pruebas pasadas,
      no de una fórmula teórica. Se informa qué fracción de los casos pasados
      cayó dentro del rango (si es baja, se avisa).
@@ -31,13 +31,17 @@ import numpy as np
 import pandas as pd
 
 try:
+    from . import pistas as _pistas
     from .prediccion import _a_datetime, _tokens, es_columna_id, normalizar_clave, tipo_columna
     from .pronostico_base import (DIAS_SEMANA, MESES, UNIDADES, ResultadoPronostico, confianza_por_datos,
-                                  dias_txt, duracion_txt, fecha_txt, leer_fechas, num_txt, pct_auto, pct_txt)
+                                  dias_txt, duracion_txt, fecha_txt, leer_fechas, num_txt, pct_auto, pct_txt,
+                                  aplicar_fecha_corte)
 except ImportError:  # pruebas sueltas fuera del paquete
+    import pistas as _pistas
     from prediccion import _a_datetime, _tokens, es_columna_id, normalizar_clave, tipo_columna
     from pronostico_base import (DIAS_SEMANA, MESES, UNIDADES, ResultadoPronostico, confianza_por_datos,
-                                 dias_txt, duracion_txt, fecha_txt, leer_fechas, num_txt, pct_auto, pct_txt)
+                                 dias_txt, duracion_txt, fecha_txt, leer_fechas, num_txt, pct_auto, pct_txt,
+                                 aplicar_fecha_corte)
 
 MIN_PERIODOS = 12
 MAX_PERIODOS = {"H": 2000, "D": 3000, "W": 1000, "M": 600}
@@ -52,12 +56,11 @@ HORIZONTE_AGOTAMIENTO = {"H": 24 * 60, "D": 365, "W": 104, "M": 36}
 VENTANA_CONSUMO = {"H": 168, "D": 56, "W": 13, "M": 12}
 MAX_ENTIDADES = 3000
 N_SIMULACIONES = 600
+EXPONENTE_MIN_EXTRAPOLACION = 0.5   # el error de «seguir el último dato» crece al menos como √horizonte
+_BASES_SIN_REGRESO = ("ultimo", "holt")
 
-_PISTAS_NIVEL = {"stock", "nivel", "saldo", "temperatura", "temp", "precio", "promedio", "tasa", "porcentaje",
-                 "humedad", "presion", "presión", "voltaje", "latencia", "ocupacion", "ocupación", "saturacion"}
-_PISTAS_PICO = {"uso", "carga", "ocupacion", "ocupación", "trafico", "tráfico", "conexiones", "usuarios",
-                "latencia", "cpu", "memoria", "ancho", "banda", "aforo", "cola"}
 
+BASE_PROMEDIO = ("promedio_historico", None)   # respuesta fácil: el promedio de TODO lo visto hasta cada punto
 CANDIDATOS = [
     ("ultimo", None), ("promedio", None), ("tendencia", None), ("tendencia_larga", None), ("holt", None),
     ("estacional", None),
@@ -189,14 +192,7 @@ def _rellenar(s: pd.Series, freq: str, agg: str, con_filas=None):
 
 
 def agregacion_auto(col_valor, defecto: str = "suma") -> str:
-    if col_valor is None:
-        return "cuenta"
-    toks = set(_tokens(col_valor))
-    if toks & _PISTAS_NIVEL:
-        return "promedio"
-    if toks & _PISTAS_PICO:
-        return "max"
-    return defecto
+    return _pistas.agregacion_sugerida(col_valor, defecto)[0]
 
 
 def periodo_estacional(freq: str, n: int):
@@ -237,7 +233,14 @@ def preparar_serie(df: pd.DataFrame, col_fecha, col_valor=None, agregacion: str 
     if col_valor is not None:
         v = pd.to_numeric(df[col_valor], errors="coerce").to_numpy(dtype="float64")[ok]
         vals = v
-    agg = agregacion_auto(col_valor, agregacion_defecto) if agregacion in (None, "auto") else agregacion
+    if agregacion in (None, "auto"):
+        agg, reconocida = _pistas.agregacion_sugerida(col_valor, agregacion_defecto)
+        if not reconocida:
+            verbo = {"suma": "sumaron", "max": "tomó el máximo de", "promedio": "promediaron"}.get(agg, "juntaron")
+            avisos_ini.append(f"No reconocí qué mide «{col_valor}»: por defecto se {verbo} sus valores en cada período. "
+                              f"Si es un nivel (temperatura, saldo) o un pico (uso, carga), elígelo en «Cómo juntar los datos».")
+    else:
+        agg = agregacion
     if col_valor is None:
         agg = "cuenta"
     if vals is not None:
@@ -257,13 +260,31 @@ def preparar_serie(df: pd.DataFrame, col_fecha, col_valor=None, agregacion: str 
         if dt.max().normalize() < fin - pd.Timedelta(days=3):
             s = s.iloc[:-1]
             avisos.append("Se dejó fuera el último período porque está incompleto (sumarlo daría un valor engañosamente bajo).")
+    # último día/hora que parece a medio llenar (solo importa si se suma o se cuenta): solo se AVISA, no se descarta,
+    # porque con fechas y horas no se puede saber con certeza si ya terminó
+    if agg in ("suma", "cuenta") and freq in ("D", "H") and len(s) >= 9:
+        cuentas = _bucket(dt, freq).value_counts().sort_index()
+        if len(cuentas) >= 9:
+            habitual = float(np.median(cuentas.iloc[-8:-1]))
+            if habitual >= 3 and float(cuentas.iloc[-1]) < 0.5 * habitual:
+                avisos.append(f"El último {UNIDADES[freq][0]} tiene {int(cuentas.iloc[-1])} registros, bastante menos que lo "
+                              f"habitual ({habitual:.0f}): si todavía no termina, su valor está subestimado y arrastra la "
+                              f"proyección hacia abajo.")
     s = s.iloc[-MAX_PERIODOS[freq]:]
+    faltantes = _indice(s.index.min(), s.index.max(), freq).difference(s.index) if len(s) else s.index[:0]
     s, relleno = _rellenar(s, freq, agg, con_filas)
     if len(s) < MIN_PERIODOS:
         uno, varios = UNIDADES[freq]
         raise ValueError(f"Hay solo {len(s)} {varios} de historial; se necesitan al menos {MIN_PERIODOS} "
                          f"para poder decir algo con sentido.")
-    if relleno > 0.2:
+    solo_finde = freq == "D" and len(faltantes) > 0 and bool(np.all(faltantes.dayofweek >= 5))
+    if solo_finde:
+        como = ("con 0 (no hubo ventas ni actividad registrada esos días)" if agg in ("suma", "cuenta")
+                else "con valores intermedios entre el viernes y el lunes")
+        avisos.append(f"Los días sin datos son siempre sábado y domingo ({relleno * 100:.0f}% del período): parece que no se "
+                      f"registra actividad en fin de semana. Se completaron {como}; el patrón semanal que se vea es "
+                      f"consecuencia de eso, no un fallo de los datos.")
+    elif relleno > 0.2:
         avisos.append(f"El {relleno * 100:.0f}% de los períodos no tenía datos y se rellenó: "
                       f"los resultados pueden ser poco fiables.")
     y = s.to_numpy(dtype="float64")
@@ -276,6 +297,7 @@ def preparar_serie(df: pd.DataFrame, col_fecha, col_valor=None, agregacion: str 
 
 
 def serie_desde_cfg(df, cfg, agregacion_defecto: str = "suma") -> SerieTiempo:
+    df = aplicar_fecha_corte(df, _g(cfg, "columna_fecha"), _g(cfg, "fecha_corte"))
     return preparar_serie(df, _g(cfg, "columna_fecha"), _g(cfg, "columna_valor"), _g(cfg, "agregacion", "auto"),
                           _g(cfg, "frecuencia", "auto"), _g(cfg, "columna_entidad"), _g(cfg, "entidad"),
                           agregacion_defecto=agregacion_defecto)
@@ -426,8 +448,8 @@ class Proyeccion:
     modelo: tuple
     modelo_nombre: str
     scores: dict
-    mae_modelo: float
-    mae_base: float
+    rmse_modelo: float
+    rmse_base: float
     mejora: float
     cobertura: float
     n_origenes: int
@@ -436,6 +458,7 @@ class Proyeccion:
     nivel: float
     z: float
     no_negativa: bool
+    cobertura_honesta: bool = False   # True si la cobertura se midió con pruebas que NO fijaron el ancho del rango
 
 
 def _backtest(y: np.ndarray, h: int, m):
@@ -469,6 +492,10 @@ def _backtest(y: np.ndarray, h: int, m):
             errores[c] = E
     if not errores:
         return None
+    E = np.full((len(origenes), h_eval), np.nan)
+    for i, o in enumerate(origenes):
+        E[i] = y[o:o + h_eval] - float(np.mean(y[:o]))
+    errores[BASE_PROMEDIO] = E        # solo sirve de comparación: no es un candidato (ver `orden` en proyectar)
     return errores, origenes, h_eval, usa_est
 
 
@@ -483,6 +510,27 @@ def _ajuste_potencia(valores: np.ndarray, b_min: float, b_max: float):
     b = float(np.clip(np.polyfit(X, Y, 1)[0], b_min, b_max))
     a = float(np.mean(Y - b * X))
     return lambda k: np.exp(a + b * np.log(np.asarray(k, dtype=float)))
+
+
+def _sigma_hasta(E: np.ndarray, h_eval: int) -> np.ndarray:
+    """Ancho típico del error (sigma) para los primeros h_eval períodos, a partir de una tabla de errores
+    [orígenes × horizonte]. Es el mismo cálculo que fija el rango, para poder medirlo con otras pruebas."""
+    sig_h = np.maximum.accumulate(np.maximum(np.sqrt(np.mean(E ** 2, axis=0)), 1e-12))
+    f_sig = _ajuste_potencia(sig_h, 0.0, 0.6) if h_eval >= 5 else None
+    if f_sig is None:
+        return sig_h
+    return np.maximum.accumulate(f_sig(np.arange(1, h_eval + 1)))
+
+
+def _cobertura_honesta(E: np.ndarray, h_eval: int, z: float):
+    """Cobertura medida en pruebas distintas de las que fijan el ancho: el ancho se calcula con la primera mitad
+    (más antigua) de los orígenes y se comprueba con la segunda. Devuelve (cobertura, es_honesta)."""
+    K = E.shape[0]
+    if K < 6:
+        return float("nan"), False
+    a, b = E[:K // 2], E[K // 2:]
+    sig = _sigma_hasta(a, h_eval)
+    return float(np.mean(np.abs(b) <= z * sig[None, :])), True
 
 
 def _factor_t(nivel: float, nu: float) -> float:
@@ -528,10 +576,10 @@ def proyectar(serie: SerieTiempo, h: int, nivel: float = 0.8) -> Proyeccion:
     elegibles = [c for c in orden if scores[c] <= mejor * 1.03 + 1e-12]
     elegido = elegibles[0]                          # el más simple (orden de CANDIDATOS)
     E = errores[elegido][ev]
-    mae_modelo = float(np.sqrt(np.mean(E ** 2)))
-    base_c = [c for c in (("ultimo", None), ("estacional", None)) if c in errores]
-    mae_base = min(float(np.sqrt(np.mean(errores[c][ev] ** 2))) for c in base_c)
-    mejora = float(np.clip(1 - mae_modelo / mae_base, 0, 1)) if mae_base > 0 else 0.0
+    rmse_modelo = float(np.sqrt(np.mean(E ** 2)))
+    base_c = [c for c in (("ultimo", None), ("estacional", None), BASE_PROMEDIO) if c in errores]
+    rmse_base = min(float(np.sqrt(np.mean(errores[c][ev] ** 2))) for c in base_c)
+    mejora = float(np.clip(1 - rmse_modelo / rmse_base, 0, 1)) if rmse_base > 0 else 0.0
     sig_h = np.sqrt(np.mean(E ** 2, axis=0))
     sig_h = np.maximum.accumulate(np.maximum(sig_h, 1e-12))
     ac = np.sqrt(np.mean(np.cumsum(E, axis=1) ** 2, axis=0))
@@ -546,12 +594,21 @@ def proyectar(serie: SerieTiempo, h: int, nivel: float = 0.8) -> Proyeccion:
         sigma = np.maximum.accumulate(f_sig(ks))
     else:
         sigma = np.where(ks <= h_eval, sig_h[np.minimum(ks, h_eval) - 1], sig_h[-1] * np.sqrt(ks / h_eval))
+    if h > h_eval:
+        # Más allá de lo que se pudo probar, el error de los métodos que siguen al último dato (o a una tendencia)
+        # crece al menos como una caminata al azar (raíz del horizonte); el ajuste con pocas pruebas tiende a
+        # subestimarlo. Los métodos que vuelven a un promedio no necesitan este piso.
+        b_loc = float(np.log(f_sig(h_eval) / f_sig(1)) / np.log(h_eval)) if (f_sig is not None and h_eval > 1) else 0.5
+        b_ext = max(b_loc, EXPONENTE_MIN_EXTRAPOLACION) if elegido[0] in _BASES_SIN_REGRESO else max(b_loc, 0.0)
+        ref = float(sigma[h_eval - 1])
+        sigma = np.where(ks <= h_eval, sigma, ref * (ks / h_eval) ** b_ext)
+        sigma = np.maximum.accumulate(sigma)
     if f_ac is not None:
         sigma_ac = np.maximum.accumulate(f_ac(ks))
     else:
         sigma_ac = np.where(ks <= h_eval, ac[np.minimum(ks, h_eval) - 1], ac[-1] * (ks / h_eval) ** 0.75)
     sigma_ac = sigma_ac * _factor_t(nivel, k_eff) * 1.1   # el total acumulado se equivoca más de lo que muestran pocas pruebas
-    cobertura = float(np.mean(np.abs(E) <= z * sigma[np.minimum(np.arange(h_eval), h - 1)][None, :]))
+    cobertura, cob_honesta = _cobertura_honesta(E, h_eval, z) if honesta else (float("nan"), False)
     f = _pronosticar(y, h, serie.m if usa_est else None, elegido[0], elegido[1])
     if f is None or not np.all(np.isfinite(f)):
         elegido = ("ultimo", None)
@@ -561,31 +618,35 @@ def proyectar(serie: SerieTiempo, h: int, nivel: float = 0.8) -> Proyeccion:
         f, lo, hi = np.maximum(f, 0), np.maximum(lo, 0), np.maximum(hi, 0)
     nombres = {nombre_modelo(*c): s for c, s in scores.items()}
     return Proyeccion(serie.freq, _futuras(serie.fechas[-1], h, serie.freq), f, lo, hi, sigma, sigma_ac, elegido,
-                      nombre_modelo(*elegido), nombres, mae_modelo, mae_base, mejora, cobertura, K, h_eval,
-                      honesta, nivel, z, no_neg)
+                      nombre_modelo(*elegido), nombres, rmse_modelo, rmse_base, mejora, cobertura, K, h_eval,
+                      honesta, nivel, z, no_neg, cob_honesta)
 
 
 def _confianza_proy(p: Proyeccion, n: int):
     if p.n_origenes < 4 or n < 24:
         return "baja", "hay pocos datos para comprobar el método contra lo que ya pasó."
-    if p.mejora >= 0.25 and p.cobertura >= 0.65 and n >= 60:
-        return "alta", (f"el método reduce el error en {p.mejora * 100:.0f}% frente a repetir lo último, y el rango "
-                        f"acertó en {p.cobertura * 100:.0f}% de las pruebas pasadas.")
+    cob_ok = p.cobertura_honesta and not np.isnan(p.cobertura)
+    cob_txt = (f"el rango acertó en {p.cobertura * 100:.0f}% de pruebas que no usó para fijar su ancho"
+               if cob_ok else "no hubo pruebas suficientes para comprobar si el rango acierta")
+    if p.mejora >= 0.25 and cob_ok and p.cobertura >= 0.65 and n >= 60:
+        return "alta", (f"el método reduce el error en {p.mejora * 100:.0f}% frente a la respuesta más simple (repetir lo último o el promedio), y {cob_txt}.")
     if p.mejora >= 0.08:
-        return "media", (f"el método mejora {p.mejora * 100:.0f}% a repetir lo último; el rango acertó en "
-                         f"{p.cobertura * 100:.0f}% de las pruebas pasadas.")
-    return "baja", ("el método casi no mejora a repetir lo último que pasó: la serie se comporta como ruido "
-                    "y el rango es ancho.")
+        return "media", (f"el método mejora {p.mejora * 100:.0f}% a la respuesta más simple (repetir lo último o el promedio); {cob_txt}.")
+    return "baja", ("el método casi no mejora a la respuesta más simple (repetir lo último o el promedio): no se encontró un "
+                    "patrón que aprovechar. El rango sigue siendo válido, pero es amplio.")
 
 
 def _avisos_proyeccion(serie: SerieTiempo, p: Proyeccion, h: int) -> list:
     av = list(serie.advertencias)
-    if not np.isnan(p.cobertura) and p.cobertura < 0.65:
-        av.append(f"El rango acertó solo en {p.cobertura * 100:.0f}% de las pruebas pasadas (debería ser cerca de "
-                  f"{p.nivel * 100:.0f}%): tómalo como orientativo.")
+    if p.cobertura_honesta and not np.isnan(p.cobertura) and p.cobertura < 0.65:
+        av.append(f"El rango acertó solo en {p.cobertura * 100:.0f}% de pruebas que no usó para fijar su ancho (debería ser "
+                  f"cerca de {p.nivel * 100:.0f}%): tómalo como orientativo.")
     if not p.honesta and p.n_origenes:
         av.append("Hay pocas pruebas pasadas, así que el método se eligió y evaluó con los mismos casos: "
                   "las cifras de calidad pueden ser algo optimistas.")
+    if p.h_eval and h > p.h_eval:
+        av.append(f"Solo se pudo comprobar el método hasta {p.h_eval} períodos hacia adelante; más allá, el rango es una "
+                  f"extrapolación (menos comprobada).")
     if h > len(serie.y) / 2:
         av.append("Estás mirando más lejos que la mitad del historial disponible: a mayor distancia, menos fiable.")
     return av
@@ -650,7 +711,7 @@ def analizar_proyeccion(df: pd.DataFrame, cfg) -> ResultadoPronostico:
         tarj = [(num_txt(fin), "Valor esperado", f"dentro de {ht}, rango {num_txt(lo)} a {num_txt(hi)}"),
                 (pct_txt(cambio, 0, True), "Frente a hoy", f"el último valor real fue {num_txt(ref)}")]
     conf, motivo = _confianza_proy(p, len(y))
-    tarj.append((pct_txt(p.mejora), "Mejora sobre repetir lo último",
+    tarj.append((pct_txt(p.mejora), "Mejora sobre lo más simple",
                  "cuánto error evita el método frente a la respuesta más simple"))
     det = [serie.explicacion + f" Se usó el método «{p.modelo_nombre}».",
            f"Rango de {rango_pct}: según cuánto se equivocó el método en {p.n_origenes} pruebas hechas sobre el pasado."]
@@ -658,8 +719,8 @@ def analizar_proyeccion(df: pd.DataFrame, cfg) -> ResultadoPronostico:
         "proyeccion", "Proyección", titular, "info", conf, motivo, tarj, det,
         ["El comportamiento reciente se mantiene; no se conocen promociones, cierres, cambios de precio ni otros eventos futuros."],
         _avisos_proyeccion(serie, p, h), _tabla_proyeccion(p), "Proyección período a período",
-        grafico_serie(serie, p), {"modelo": p.modelo_nombre, "mejora": p.mejora, "cobertura": p.cobertura,
-                                  "error": p.mae_modelo, "error_base": p.mae_base, "periodos": len(y)})
+        grafico_serie(serie, p), {"modelo": p.modelo_nombre, "mejora": p.mejora, "cobertura": p.cobertura, "cobertura_honesta": p.cobertura_honesta,
+                                  "error": p.rmse_modelo, "error_base": p.rmse_base, "periodos": len(y)})
 
 
 # ----------------------------------------------------------------------
@@ -1028,6 +1089,15 @@ def _simular_agotamiento(y: np.ndarray, stock: float, hmax: int, pos_hist, pos_f
     return T
 
 
+def _rango_dur_txt(pronto, tarde, freq: str) -> str:
+    """'entre 10 y 18 días' · 'unos 20 días' (si el rango no se distingue) · '30 días o más' (si el lado lento no termina)."""
+    a = duracion_txt(pronto, freq)
+    if not np.isfinite(tarde):
+        return f"{a} o más"
+    b = duracion_txt(tarde, freq)
+    return f"unos {a}" if a == b else f"entre {a} y {b}"
+
+
 def _cuantil(T: np.ndarray, q: float) -> float:
     Ts = np.sort(T)
     return float(Ts[min(int(np.ceil(q * len(Ts))) - 1, len(Ts) - 1) if q > 0 else 0])
@@ -1045,6 +1115,7 @@ def analizar_agotamiento(df: pd.DataFrame, cfg) -> ResultadoPronostico:
         raise ValueError("Elige la columna de consumo (lo que se gasta por período) o la columna de stock.")
     if col_stock is None and stock_num is None:
         raise ValueError("Indica el stock actual (un número) o elige la columna de stock.")
+    df = aplicar_fecha_corte(df, col_fecha, _g(cfg, "fecha_corte"))
     dt = leer_fechas(df[col_fecha], col_fecha)
     ok = dt.notna().to_numpy()
     base = pd.DataFrame({"dt": dt[ok].to_numpy()})
@@ -1080,6 +1151,7 @@ def analizar_agotamiento(df: pd.DataFrame, cfg) -> ResultadoPronostico:
     k_v = int(_g(cfg, "ventana", 0)) or VENTANA_CONSUMO[freq]
     ini = fin - (k_v - 1) * _paso(freq) if freq != "M" else fin - pd.DateOffset(months=k_v - 1)
     idx_v = _indice(max(ini, base["per"].min()), fin, freq)
+    ent_antes = [e for e in pd.unique(base["ent"])]
     base = base[base["per"] >= idx_v[0]]
     piv = base.groupby(["ent", "per"])["consumo"].sum().unstack(fill_value=0.0).reindex(columns=idx_v, fill_value=0.0)
     # stock actual por entidad
@@ -1089,8 +1161,20 @@ def analizar_agotamiento(df: pd.DataFrame, cfg) -> ResultadoPronostico:
         stocks = ult.to_dict()
     if stock_num is not None and (not col_ent or col_ent not in df.columns):
         stocks = {"total": float(stock_num)}
+    if not stocks and stock_num is not None:
+        if len(piv) == 1:
+            stocks = {piv.index[0]: float(stock_num)}
+        else:
+            raise ValueError(f"Hay {len(piv)} elementos y un solo número de stock: no sé a cuál corresponde. "
+                             "Elige la columna de stock (un valor por elemento), indica un solo elemento, "
+                             "o quita la columna de elemento para analizar el total.")
     if not stocks:
         raise ValueError("No encontré el stock actual: revisa la columna de stock.")
+    fuera_ventana = [e for e in ent_antes if e not in set(piv.index)]
+    if fuera_ventana:
+        avisos.append(f"{len(fuera_ventana)} elemento(s) no tienen registros en los últimos {k_v} {UNIDADES[freq][1]} "
+                      f"y no se analizaron: " + ", ".join(str(e) for e in fuera_ventana[:5])
+                      + (" y otros." if len(fuera_ventana) > 5 else "."))
     if len(piv) > MAX_ENTIDADES:
         piv = piv.loc[piv.sum(axis=1).sort_values(ascending=False).index[:MAX_ENTIDADES]]
         avisos.append(f"Había más de {MAX_ENTIDADES} elementos; se analizaron los {MAX_ENTIDADES} con más consumo.")
@@ -1103,9 +1187,11 @@ def analizar_agotamiento(df: pd.DataFrame, cfg) -> ResultadoPronostico:
     ultima_fecha = _siguiente(pd.Timestamp(fin), freq)   # el stock actual es el de al final del último período
     n_sim = N_SIMULACIONES if len(piv) <= 300 else 300
     filas = []
+    sin_stock = []
     for ent, fila in piv.iterrows():
         stock = stocks.get(ent)
         if stock is None or not np.isfinite(stock):
+            sin_stock.append(ent)
             continue
         p0 = primer.get(ent, idx_v[0])
         sel = np.asarray(idx_v >= p0)
@@ -1145,6 +1231,9 @@ def analizar_agotamiento(df: pd.DataFrame, cfg) -> ResultadoPronostico:
             reg.update({"Pronto": _cuantil(T, 0.10), "Central": _cuantil(T, 0.50), "Tarde": _cuantil(T, 0.90),
                         "Cobertura": ""})
         filas.append(reg)
+    if sin_stock:
+        avisos.append(f"{len(sin_stock)} elemento(s) no tienen stock conocido y no se analizaron: "
+                      + ", ".join(str(e) for e in sin_stock[:5]) + (" y otros." if len(sin_stock) > 5 else "."))
     if not filas:
         raise ValueError("No se pudo calcular el agotamiento: faltan datos de stock o de consumo.")
     res = pd.DataFrame(filas).sort_values("Central", kind="stable").reset_index(drop=True)
@@ -1174,22 +1263,31 @@ def analizar_agotamiento(df: pd.DataFrame, cfg) -> ResultadoPronostico:
         if r["Cobertura"] == "ya agotado":
             titular = "El stock ya está agotado."
             nivel = "alerta"
+        elif r["Cobertura"] == "sin consumo reciente":
+            titular = ("No hubo consumo en el período reciente: con estos datos no se puede estimar cuánto durará el stock "
+                       "(mientras no se use no baja, pero eso no dice nada de cuando se vuelva a usar).")
+            nivel = "info"
         elif r["Cobertura"]:
-            titular = f"Con el consumo reciente, el stock {r['Cobertura']} (alcanza para varios períodos): no se agota en el horizonte analizado."
+            titular = f"Con el consumo reciente, el stock dura {r['Cobertura']}: no se agota en el horizonte analizado."
             nivel = "info"
         else:
-            titular = (f"Al ritmo reciente, el stock dura entre {duracion_txt(r['Pronto'], freq)} y {duracion_txt(r['Tarde'], freq)} "
-                       f"(lo más probable: {duracion_txt(r['Central'], freq)}); se acabaría entre {fecha_txt(r['Fecha pronto'])} y "
-                       f"{fecha_txt(r['Fecha tarde'])}.")
+            if pd.notna(r["Fecha tarde"]):
+                cuando = f"se acabaría entre {fecha_txt(r['Fecha pronto'])} y {fecha_txt(r['Fecha tarde'])}"
+            else:
+                cuando = f"se acabaría desde {fecha_txt(r['Fecha pronto'])}"
+            titular = (f"Al ritmo reciente, el stock dura {_rango_dur_txt(r['Pronto'], r['Tarde'], freq)} "
+                       f"(lo más probable: {duracion_txt(r['Central'], freq)}); {cuando}.")
             nivel = "alerta" if r["Pronto"] <= w_per else "atencion" if r["Central"] <= 2 * w_per else "info"
         tarj = [(duracion_txt(r["Central"], freq) if np.isfinite(r["Central"]) else "—", "Duración probable", "lo más probable según el consumo reciente"),
-                (f"{duracion_txt(r['Pronto'], freq)} – {duracion_txt(r['Tarde'], freq)}" if np.isfinite(r["Pronto"]) and np.isfinite(r["Tarde"]) else "—", "Rango", "del caso más rápido al más lento razonable (80%)"),
+                (_rango_dur_txt(r["Pronto"], r["Tarde"], freq) if np.isfinite(r["Pronto"]) else "—", "Rango", "del caso más rápido al más lento razonable (80%)"),
                 (num_txt(r["Consumo medio por " + uno]), f"Consumo por {uno}", f"con {num_txt(r['Stock actual'])} de stock actual")]
     else:
         if np.isfinite(primero["Central"]):
-            titular = (f"Primero se agota «{primero['Elemento']}»: entre {duracion_txt(primero['Pronto'], freq)} y "
-                       f"{duracion_txt(primero['Tarde'], freq)}. {urgentes} de {len(res)} podrían agotarse en los próximos "
-                       f"{num_txt(alerta_w)} días.")
+            titular = (f"Primero se agota «{primero['Elemento']}»: {_rango_dur_txt(primero['Pronto'], primero['Tarde'], freq)}. "
+                       f"{urgentes} de {len(res)} podrían agotarse en los próximos {num_txt(alerta_w)} días.")
+        elif (res["Cobertura"] == "sin consumo reciente").all():
+            titular = (f"Ninguno de los {len(res)} elementos tuvo consumo reciente: con estos datos no se puede estimar "
+                       "cuánto durará su stock.")
         else:
             titular = f"Ninguno de los {len(res)} elementos se agota dentro del horizonte analizado."
         nivel = "alerta" if urgentes else "info"

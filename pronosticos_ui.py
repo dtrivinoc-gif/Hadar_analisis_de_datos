@@ -31,6 +31,8 @@ from PySide6.QtWidgets import (
 
 from .panel import estilo_tarjeta
 from .prediccion import tipo_columna
+from .ajustes import aplicar_ajustes
+from .historial import limpiar as limpiar_historial, registrar_y_comparar
 from .pronostico_base import fecha_txt, num_txt
 from .pronosticos import (
     ConfigPronostico, ORDEN_PALABRAS, PALABRAS_CLAVE, ejecutar, sugerir_configuracion,
@@ -126,6 +128,7 @@ class PanelPalabras(QWidget):
         self._cargando = False
         self._firma_tablas = None
         self._hilo = None
+        self._historial = []          # resumen de cada ejecución (se guarda en el proyecto; ver historial.py)
         self._resultado = None
         self._contexto_pdf = None        # foto de lo calculado (para el PDF)
         self._contexto_pendiente = None
@@ -278,10 +281,13 @@ class PanelPalabras(QWidget):
         # la configuración que el proyecto trae guardada.
         if self._firma_tablas is not None:
             self._leer_formulario()
-        return self._cfg.to_dict()
+        d = self._cfg.to_dict()
+        d["historial"] = list(self._historial)
+        return d
 
     def cargar_config(self, datos):
         self._cfg = ConfigPronostico.from_dict(datos)
+        self._historial = limpiar_historial((datos or {}).get("historial") if isinstance(datos, dict) else None)
         if self._cfg.palabra not in PALABRAS_CLAVE:
             self._cfg.palabra = "proyeccion"
         self._resultado = None
@@ -579,6 +585,9 @@ class PanelPalabras(QWidget):
             self.lbl_estado.setText(" ".join(self._errores_form))
             return
         cfg = ConfigPronostico.from_dict(self._cfg.to_dict())      # copia: el formulario puede cambiar mientras calcula
+        panel_aj = getattr(self.host, "panel_ajustes", None)       # decisiones del proyecto (subpestaña «Ajustes»)
+        if panel_aj is not None:
+            aplicar_ajustes(cfg, panel_aj.ajustes)
         df = self._tablas().get(cfg.tabla)
         if df is None:
             self.lbl_estado.setText("Elige la tabla con los datos.")
@@ -605,8 +614,14 @@ class PanelPalabras(QWidget):
         self.lbl_estado.setText(mensaje)
 
     def _fin_calculo(self, r):
+        ctx = self._contexto_pendiente
+        try:    # compara con la última vez que se hizo este mismo análisis y guarda el resumen en el proyecto
+            avisos = registrar_y_comparar(self._historial, ctx.config, r, getattr(ctx, "n_filas", None))
+            r.advertencias = list(avisos) + list(r.advertencias)
+        except Exception:
+            pass                # el historial nunca debe impedir mostrar el resultado
         self._resultado = r
-        self._contexto_pdf = self._contexto_pendiente
+        self._contexto_pdf = ctx
         self.lbl_estado.setText("")
         self._mostrar_resultado(r)
 

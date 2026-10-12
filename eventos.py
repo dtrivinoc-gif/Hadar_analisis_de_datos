@@ -27,11 +27,13 @@ import numpy as np
 import pandas as pd
 
 try:
-    from .prediccion import (ConfigPrediccion, _a_datetime, columnas_a_usar, entrenar, es_columna_id,
+    from . import pistas as _pistas
+    from .prediccion import (ConfigPrediccion, _a_datetime, columnas_a_usar, columnas_fecha, entrenar, es_columna_id,
                              normalizar_clave, predecir, sugerir_columnas, tipo_columna)
     from .pronostico_base import (ResultadoPronostico, confianza_por_datos, dias_txt, fecha_txt, leer_fechas, num_txt, pct_txt)
 except ImportError:
-    from prediccion import (ConfigPrediccion, _a_datetime, columnas_a_usar, entrenar, es_columna_id,
+    import pistas as _pistas
+    from prediccion import (ConfigPrediccion, _a_datetime, columnas_a_usar, columnas_fecha, entrenar, es_columna_id,
                             normalizar_clave, predecir, sugerir_columnas, tipo_columna)
     from pronostico_base import (ResultadoPronostico, confianza_por_datos, dias_txt, fecha_txt, leer_fechas, num_txt, pct_txt)
 
@@ -40,6 +42,11 @@ MIN_EVENTOS_GRUPO = 10
 N_REMUESTREOS = 200
 DIA = np.timedelta64(1, "D")
 _NEGATIVOS = {"", "0", "no", "false", "falso", "none", "nan", "null", "ok", "-", "n/a", "na"}
+
+
+def _con_tipo(tipo_salida: str, resultado):
+    resultado.tipo_salida = tipo_salida or ""
+    return resultado
 
 
 def _g(cfg, nombre, defecto=None):
@@ -207,7 +214,8 @@ def _dias(a, b) -> float:
 
 
 def construir_tramos(df: pd.DataFrame, col_entidad, col_fecha, col_evento=None, valor_evento=None,
-                     modo: str = "repetido", col_inicio=None, col_grupo=None, fecha_corte=None) -> Tramos:
+                     modo: str = "repetido", col_inicio=None, col_grupo=None, fecha_corte=None,
+                     fin_observacion: str = "auto") -> Tramos:
     if not col_entidad or col_entidad not in df.columns:
         raise ValueError("Elige la columna que identifica a cada elemento (máquina, cliente, equipo…).")
     if not col_fecha or col_fecha not in df.columns:
@@ -230,6 +238,13 @@ def construir_tramos(df: pd.DataFrame, col_entidad, col_fecha, col_evento=None, 
         if modo == "repetido":
             avisos.append("No hay fecha de inicio de cada elemento: el tiempo hasta el PRIMER evento no se usó "
                           "(no se sabe cuánto llevaba funcionando antes de empezar el registro).")
+    # Fin de la observación de cada elemento. «global»: todos se observan hasta la fecha de corte (si un elemento se dio
+    # de baja, cuenta como «sigue sin fallar» e infla la vida útil). «ultimo_registro»: cada uno hasta su último
+    # registro. «auto» usa el segundo solo si la tabla trae filas que NO son eventos (lecturas, estados): ahí el
+    # último registro sí indica hasta cuándo se le siguió.
+    ultimo_reg = t.groupby("ent")["t"].max()
+    hay_no_eventos = bool((~t["ev"]).any())
+    usar_ultimo = fin_observacion == "ultimo_registro" or (fin_observacion == "auto" and hay_no_eventos)
     evs = {k: np.sort(np.unique(g["t"].to_numpy())) for k, g in t[t["ev"]].groupby("ent")}
     grupos = None
     if col_grupo and col_grupo in df.columns:
@@ -246,6 +261,7 @@ def construir_tramos(df: pd.DataFrame, col_entidad, col_fecha, col_evento=None, 
     ceros = 0
     for i, e in enumerate(entidades):
         s0 = ini[e]
+        corte_e = min(corte, pd.Timestamp(ultimo_reg[e])) if usar_ultimo and e in ultimo_reg.index else corte
         v = evs.get(e, np.array([], dtype="datetime64[ns]"))
         v = v[v <= np.datetime64(corte)]
         n_ev[i] = len(v)
@@ -260,7 +276,7 @@ def construir_tramos(df: pd.DataFrame, col_entidad, col_fecha, col_evento=None, 
                 vivos[i] = False
                 edades[i] = max(d, 0.0)
             else:
-                d = _dias(np.datetime64(s0), np.datetime64(corte))
+                d = _dias(np.datetime64(s0), np.datetime64(corte_e))
                 if d > 0:
                     tiempos.append(d), eventos.append(False), idx.append(i)
                 edades[i] = max(d, 0.0)
@@ -276,10 +292,26 @@ def construir_tramos(df: pd.DataFrame, col_entidad, col_fecha, col_evento=None, 
                 else:
                     ceros += 1
             ref = v[-1] if len(v) else np.datetime64(s0)
-            d = _dias(ref, np.datetime64(corte))
+            d = _dias(ref, np.datetime64(corte_e))
             if d > 0:
                 tiempos.append(d), eventos.append(False), idx.append(i)
             edades[i] = max(d, 0.0)
+    if col_inicio and col_inicio in df.columns:
+        sin_inicio = [e for e in pd.unique(t["ent"]) if e not in ini.index]
+        if sin_inicio:
+            avisos.append(f"{len(sin_inicio)} elemento(s) no tienen una fecha de inicio válida y no se analizaron: "
+                          + ", ".join(str(x) for x in sin_inicio[:5]) + (" y otros." if len(sin_inicio) > 5 else "."))
+    if usar_ultimo:
+        avisos.append("Cada elemento se observó hasta su último registro (no hasta la fecha más reciente de la tabla): "
+                      "así los que se dieron de baja no cuentan como «siguen sin fallar».")
+    else:
+        ev_t = np.array(tiempos)[np.array(eventos, dtype=bool)] if len(tiempos) else np.array([])
+        if len(ev_t) >= 5 and len(entidades):
+            inactivos = int((edades[vivos] > 2 * float(np.median(ev_t))).sum()) if vivos.any() else 0
+            if inactivos:
+                avisos.append(f"{inactivos} elemento(s) llevan más del doble del tiempo típico sin ningún registro. La tabla "
+                              "solo trae eventos, así que no se sabe si siguen activos o se dieron de baja: si algunos se "
+                              "dieron de baja, la vida útil estimada sale más larga de lo real.")
     if ceros:
         avisos.append(f"{ceros} eventos ocurrieron el mismo día/instante que el anterior y no se contaron como intervalos.")
     if gmap is not None:
@@ -369,7 +401,7 @@ def _supuestos_eventos(modo: str, con_grupo: bool):
 def _analisis_supervivencia(df, cfg, w_defecto=30.0):
     tr = construir_tramos(df, _g(cfg, "columna_entidad"), _g(cfg, "columna_fecha"), _g(cfg, "columna_evento"),
                           _g(cfg, "valor_evento"), _g(cfg, "modo_evento", "repetido"), _g(cfg, "columna_inicio"),
-                          _g(cfg, "columna_grupo"), _g(cfg, "fecha_corte"))
+                          _g(cfg, "columna_grupo"), _g(cfg, "fecha_corte"), _g(cfg, "fin_observacion", "auto"))
     modelos = _modelos(tr, int(_g(cfg, "semilla", 0)))
     w = float(_g(cfg, "ventana_dias", w_defecto))
     tabla = _tabla_elementos(tr, modelos, w)
@@ -539,11 +571,12 @@ def analizar_falla_modelo(df: pd.DataFrame, cfg) -> ResultadoPronostico:
     ultimo = d.sort_values(col_fecha, kind="stable").groupby(col_ent, sort=False).tail(1).drop(columns="__observable__")
     pred = predecir(res, ultimo, columna_id=col_ent)
     pred = pred.sort_values(pred.columns[1], ascending=False, kind="stable").reset_index(drop=True)
-    pred.columns = ["Elemento", "Riesgo (0 a 1)" if res.balanceado else f"Probabilidad en {num_txt(w)} días"] + list(pred.columns[2:])
+    es_prob = res.tipo_salida == "probabilidad"
+    pred.columns = ["Elemento", f"Probabilidad en {num_txt(w)} días" if es_prob else "Puntaje de riesgo (0 a 1)"] + list(pred.columns[2:])
     cp = pred.columns[1]
     nivel_v, titulo_v, frase_v = res.veredicto()
     top = pred.iloc[0] if len(pred) else None
-    if res.balanceado:
+    if not es_prob:
         titular = (f"El modelo ordena los {len(pred)} elementos por riesgo de que ocurra en {num_txt(w)} días; "
                    f"el primero es «{top['Elemento']}». El número sirve para ORDENAR, no es un porcentaje real.")
     else:
@@ -553,13 +586,13 @@ def analizar_falla_modelo(df: pd.DataFrame, cfg) -> ResultadoPronostico:
     avisos = list(res.advertencias)
     if nivel_v == "sospechoso":
         avisos.insert(0, frase_v)
-    return ResultadoPronostico(
-        "falla", "Falla / evento (con modelo)", titular, "atencion" if len(pred) and float(top[cp]) >= 0.5 else "info",
+    return _con_tipo(res.tipo_salida, ResultadoPronostico(
+        "falla", "Falla / evento (con modelo)", titular, "atencion" if es_prob and len(pred) and float(top[cp]) >= 0.5 else "info",
         conf, f"{titulo_v}. {frase_v} (probado entrenando con lo antiguo y evaluando con lo más reciente).",
         res.tarjetas(), res.lineas_resumen(),
         ["Las condiciones recientes de cada elemento seguirán pareciéndose a las que tenían antes de fallar los demás."],
         avisos, pred, "Riesgo actual de cada elemento", None,
-        {"metricas": dict(res.metricas)})
+        {"metricas": dict(res.metricas), "mejora": float(res.mejora())}))
 
 
 # ----------------------------------------------------------------------
@@ -583,14 +616,33 @@ def analizar_duracion(df: pd.DataFrame, cfg) -> ResultadoPronostico:
         invalido = ~np.isfinite(dur) | (dur < 0) | ~buenos
         if invalido.any():
             avisos.append(f"{int(invalido.sum())} filas con fechas faltantes o con el fin antes del inicio no se usaron.")
+        solo_fecha = bool((ini[buenos] == ini[buenos].dt.normalize()).all()
+                          and (fin.dropna() == fin.dropna().dt.normalize()).all())
+        medio = 0.5 if solo_fecha else None      # «0 días» con fechas sin hora = menos de un día
     elif col_val:
         f = _FACTOR_UNIDAD.get(str(_g(cfg, "unidad_duracion", "dias")), 1.0)
         dur = pd.to_numeric(df[col_val], errors="coerce").to_numpy(dtype="float64") * f
         abierto = np.zeros(len(df), dtype=bool)
         invalido = ~np.isfinite(dur) | (dur < 0)
         corte = pd.Timestamp.now().normalize()
+        medio = 0.5 * f                           # «0» en la unidad de la columna = menos de una unidad
     else:
         raise ValueError("Elige las columnas de inicio y fin, o una columna con la duración.")
+    cero_cerrado = ~invalido & ~abierto & (dur == 0)
+    if cero_cerrado.any():
+        n0 = int(cero_cerrado.sum())
+        if medio is not None and _g(cfg, "ceros_mismo_dia", "medio_dia") != "descartar":
+            dur = np.where(cero_cerrado, medio, dur)
+            avisos.append(f"{n0} casos ({n0 / max(int((~invalido).sum()), 1) * 100:.0f}%) terminaron el mismo día (0 días): "
+                          f"se contaron como medio día porque no hay hora. Descartarlos habría alargado el tiempo típico.")
+        elif medio is not None:
+            avisos.append(f"{n0} casos terminaron el mismo día (0 días) y no se usaron, como pediste en Ajustes: el tiempo "
+                          f"típico que se ve corresponde solo a los casos que tardaron más de un día.")
+        else:
+            avisos.append(f"{n0} casos con duración exactamente 0 no se usaron (con hora, 0 no es una duración medible).")
+    n_abiertos_hoy = int((~invalido & abierto & (dur <= 0)).sum())
+    if n_abiertos_hoy:
+        avisos.append(f"{n_abiertos_hoy} casos abiertos se iniciaron en la fecha de corte; todavía no aportan información y no se usaron.")
     ok = ~invalido & (dur > 0)
     if ok.sum() < 10:
         raise ValueError(f"Solo hay {int(ok.sum())} casos con duración válida; se necesitan al menos 10.")
@@ -673,6 +725,9 @@ def analizar_prioridad(df: pd.DataFrame, cfg) -> ResultadoPronostico:
     if ok.sum() == 0:
         raise ValueError("No hay filas con números válidos para priorizar.")
     r = riesgo[ok]
+    # ¿el «riesgo» es una probabilidad o un puntaje? Si es un puntaje (mayor que 1, o con nombre de puntaje/orden), riesgo × impacto
+    # NO es una pérdida esperada: sirve para ordenar, nada más.
+    es_puntaje = bool(np.nanmax(r) > 1.0) or bool(set(_pistas.tokens(col_r)) & _pistas.RANKING)
     puntaje = r * imp[ok] if col_i else r
     ids = (df[col_id].astype(str).to_numpy()[ok] if col_id and col_id in df.columns
            else np.array([f"fila {i + 1}" for i in np.flatnonzero(ok)], dtype=object))
@@ -681,14 +736,14 @@ def analizar_prioridad(df: pd.DataFrame, cfg) -> ResultadoPronostico:
     tab = pd.DataFrame({"Prioridad": np.arange(1, len(orden) + 1), "Elemento": ids[orden], "Riesgo": r[orden]})
     if col_i:
         tab["Impacto"] = imp[ok][orden]
-        tab["Pérdida esperada" ] = puntaje[orden]
+        tab["Puntaje (riesgo × impacto)" if es_puntaje else "Pérdida esperada"] = puntaje[orden]
     total = float(puntaje.sum())
     acum = np.cumsum(puntaje[orden]) / total if total > 0 else np.zeros(len(orden))
     tab["% acumulado del total"] = acum
     k = min(top, len(tab))
     conc = float(acum[k - 1]) if total > 0 else float("nan")
     primero = tab.iloc[0]
-    etiqueta = "pérdida esperada (riesgo × impacto)" if col_i else "riesgo"
+    etiqueta = ("puntaje (riesgo × impacto)" if es_puntaje else "pérdida esperada (riesgo × impacto)") if col_i else "riesgo"
     titular = (f"Empieza por «{primero['Elemento']}». Los primeros {k} de {len(tab)} concentran el {pct_txt(conc)} del total de {etiqueta}.")
     n80 = int(np.argmax(acum >= 0.8) + 1) if total > 0 and (acum >= 0.8).any() else len(tab)
     tarj = [(str(k), "Para revisar primero", f"concentran {pct_txt(conc)} del {etiqueta}"),
@@ -697,13 +752,17 @@ def analizar_prioridad(df: pd.DataFrame, cfg) -> ResultadoPronostico:
     avisos = []
     if col_i is None:
         avisos.append("Sin columna de impacto se ordena solo por riesgo: un riesgo alto sobre algo poco importante pasa por delante de uno medio sobre algo crítico.")
-    if np.nanmax(r) > 1.0 and not col_i:
-        avisos.append("El riesgo tiene valores mayores que 1: se interpretó como un puntaje, no como una probabilidad.")
+    if es_puntaje:
+        avisos.append(f"«{col_r}» parece un puntaje u orden, no una probabilidad: sirve para ORDENAR, pero "
+                      + ("«riesgo × impacto» no es una pérdida esperada real ni el % acumulado es un % real del total."
+                         if col_i else "sus valores no son porcentajes reales."))
     return ResultadoPronostico(
         "prioridad", "Prioridad", titular, "info", "media",
         "el orden es tan bueno como el riesgo y el impacto que le entregues.", tarj,
         [f"El puntaje de cada elemento es " + ("riesgo × impacto." if col_i else "su riesgo.")],
-        ["El riesgo y el impacto de la tabla son confiables y comparables entre elementos."], avisos,
+        ["El riesgo y el impacto de la tabla son confiables y comparables entre elementos.",
+         "El riesgo se toma tal como viene: si es una probabilidad calibrada, riesgo × impacto es una pérdida esperada; "
+         "si es un puntaje (por ejemplo, de un modelo sin calibrar), solo sirve para ordenar."], avisos,
         tab.head(max(top, 50)), "Orden de revisión", None, {"concentracion": conc})
 
 
@@ -714,8 +773,28 @@ def analizar_clasificacion(df: pd.DataFrame, cfg) -> ResultadoPronostico:
     obj = _g(cfg, "columna_objetivo")
     if not obj or obj not in df.columns:
         raise ValueError("Elige la columna que quieres clasificar (la categoría a predecir).")
-    cfgp = ConfigPrediccion(objetivo=obj, validacion=_g(cfg, "validacion", "aleatoria"),
-                            columna_fecha=_g(cfg, "columna_fecha") or None, salida="probabilidad")
+    # Validación: por fecha cuando la tabla tiene fechas (la prueba se parece a lo que pasará de verdad); al azar solo
+    # si no hay fechas o si así se pidió en Ajustes. «auto» = por fecha si hay UNA columna de fecha clara.
+    pref = _g(cfg, "validacion", "auto")
+    fecha = _g(cfg, "columna_fecha") or None
+    if fecha and fecha not in df.columns:
+        raise ValueError(f"La columna de fecha «{fecha}» no está en la tabla.")
+    notas_val = []
+    if pref == "temporal" and not fecha:
+        raise ValueError("Para probar «por fecha» elige la columna de fecha.")
+    if pref in ("auto", "temporal") and not fecha:
+        cand = columnas_fecha(df, excluir=[obj])
+        if len(cand) == 1:
+            fecha = cand[0]
+            notas_val.append(f"Se probó con los casos más nuevos usando la fecha «{fecha}».")
+        elif len(cand) > 1:
+            notas_val.append("Hay varias columnas de fecha (" + ", ".join(f"«{c}»" for c in cand[:4])
+                             + "): elige una en «Fecha» para probar con los casos más nuevos.")
+    modo = "temporal" if (fecha and pref != "aleatoria") else "aleatoria"
+    if fecha and pref != "aleatoria" and not notas_val:
+        notas_val.append(f"Se probó con los casos más nuevos usando la fecha «{fecha}».")
+    cfgp = ConfigPrediccion(objetivo=obj, validacion=modo, columna_fecha=fecha if modo == "temporal" else None,
+                            salida="probabilidad")
     extra = list(_g(cfg, "columnas_explicativas", []) or [])
     if extra:
         cols = [c for c in extra if c in df.columns and c != obj]
@@ -731,8 +810,9 @@ def analizar_clasificacion(df: pd.DataFrame, cfg) -> ResultadoPronostico:
     avisos = list(res.advertencias)
     if nivel_v == "sospechoso":
         avisos.insert(0, frase_v)
-    return ResultadoPronostico(
+    return _con_tipo(res.tipo_salida, ResultadoPronostico(
         "clasificacion", "Clasificación", f"{titulo_v}. {frase_v}",
         "info", conf, "calidad medida sobre filas que el modelo no vio al entrenar.", res.tarjetas(),
-        res.lineas_resumen(), ["Los casos futuros se parecen a los del historial."], avisos, tabla,
-        "Qué variables pesan más", None, {"metricas": dict(res.metricas)})
+        res.lineas_resumen(), ["Los casos futuros se parecen a los del historial."] + [n for n in notas_val if n.startswith("Se probó")],
+        avisos + [n for n in notas_val if not n.startswith("Se probó")], tabla,
+        "Qué variables pesan más", None, {"metricas": dict(res.metricas), "mejora": float(res.mejora())}))
