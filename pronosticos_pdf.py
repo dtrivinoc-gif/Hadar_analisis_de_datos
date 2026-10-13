@@ -18,6 +18,13 @@ from datetime import datetime
 
 import numpy as np
 import pandas as pd
+
+try:
+    from .avisos import ETIQUETA as ETIQUETA_AVISO
+    from .formato import dec
+except ImportError:  # pruebas sueltas fuera del paquete
+    from avisos import ETIQUETA as ETIQUETA_AVISO
+    from formato import dec
 from PySide6.QtCore import QPointF, QRectF, Qt
 from PySide6.QtGui import QColor, QFont, QImage, QPainterPath, QPen, QPolygonF, QTextDocument
 
@@ -54,6 +61,7 @@ class ContextoPregunta:
     n_filas: int = 0
     n_columnas: int = 0
     calculado_en: str = ""
+    con_tecnico: bool = False        # incluir la sección «Detalles técnicos» (modo experto)
 
 
 # ----------------------------------------------------------------------
@@ -342,7 +350,7 @@ def _html_cabecera(r, spec, ctx, modo, ahora) -> str:
               f'<p style="margin-top:0; margin-bottom:{_pp._p(2)}px; font-size:10.5pt; color:{GRIS};">'
               f'{_pp._esc(sub)} · Hadar · {_pp._esc(ahora)}</p>']
     if modo == "resultados":
-        linea = [f"Tabla: {ctx.config.get('tabla') or '—'}", f"{ctx.n_filas:,} filas"]
+        linea = [f"Tabla: {ctx.config.get('tabla') or '—'}", f"{dec(ctx.n_filas, 0, True)} filas"]
         partes.append(f'<p style="margin-top:0; font-size:9pt; color:{GRIS};">{_pp._esc(" · ".join(linea))}</p>')
     return "".join(partes)
 
@@ -353,7 +361,7 @@ def _html_configuracion(r, spec, ctx) -> str:
     out.append(_pp._subtitulo("Qué se preguntó"))
     filas = [("Pregunta", f"{spec.get('nombre', r.titulo)}: {spec.get('pregunta', '')}"),
              ("Tabla", cfg.get("tabla") or "—"),
-             ("Tamaño de la tabla", f"{ctx.n_filas:,} filas · {ctx.n_columnas} columnas")]
+             ("Tamaño de la tabla", f"{dec(ctx.n_filas, 0, True)} filas · {ctx.n_columnas} columnas")]
     if ctx.calculado_en:
         filas.append(("Calculado el", ctx.calculado_en))
     out.append(_pp._tabla_clave_valor(filas))
@@ -364,11 +372,31 @@ def _html_configuracion(r, spec, ctx) -> str:
         nombre = campo["campo"]
         filas.append((campo["etiqueta"], _valor_campo(nombre, campo["tipo"], cfg.get(nombre), campo.get("ayuda", ""))))
     if spec.get("mecanismo") == "serie" and cfg.get("nivel_intervalo"):
-        filas.append(("Amplitud del rango", f"{float(cfg['nivel_intervalo']) * 100:.0f}% de probabilidad"))
+        filas.append(("Amplitud del rango", f"{dec(float(cfg['nivel_intervalo']) * 100, 0)}% de probabilidad"))
     if filas:
         out.append(_pp._tabla_clave_valor(filas))
     else:
         out.append(_pp._parrafo("Esta pregunta no tiene opciones adicionales."))
+    return "".join(out)
+
+
+def _html_tecnico(x: dict) -> str:
+    """Sección opcional «Detalles técnicos» (modo experto): lo mismo que la pantalla, sin el gráfico."""
+    out = [_pp._subtitulo(x.get("titulo", "Detalles técnicos"), 120)]
+    for e, v in x.get("filas", []):          # párrafos (no tabla): los valores largos se parten en líneas en vez de salirse de la hoja
+        out.append(f'<p style="margin-top:{_pp._p(1)}px; margin-bottom:{_pp._p(1)}px; font-size:9.5pt;">'
+                   f'<span style="color:{GRIS};">{_pp._esc(e)}:</span> {_pp._esc(str(v))}</p>')
+    if x.get("metodos"):
+        out.append(_pp._subtitulo(x.get("metodos_titulo", "Métodos probados"), 100))
+        out.append(_tabla_pdf(["Método", "Error"], [[n, dec(v, 3)] for n, v in x["metodos"]], "lr", 9.0))
+    res = x.get("residuos")
+    if res:
+        a = np.asarray(res, dtype=float)
+        q10, q25, q75, q90 = np.percentile(a, [10, 25, 75, 90])
+        out.append(_pp._subtitulo(x.get("residuos_titulo") or "Errores en las pruebas pasadas", 100))
+        out.append(_pp._nota(f"La mitad de los errores cae entre {dec(q25, 2)} y {dec(q75, 2)}; el 80% entre {dec(q10, 2)} y "
+                             f"{dec(q90, 2)}; el error más grande fue de {dec(float(np.max(np.abs(a))), 2)} "
+                             f"({dec(len(a), 0)} casos)."))
     return "".join(out)
 
 
@@ -435,15 +463,19 @@ def _html_respuesta(r, ctx, modo, b: "_pp._Constructor") -> str:
         alinear = ["right" if (len(df) and _es_numero(df.iloc[0, j])) else "left" for j in range(df.shape[1])]
         out.append(_tabla_pdf(encabezados, filas, alinear, pt=8.5 if ancha else 10.0))
         if len(r.tabla) > MAX_FILAS_TABLA:
-            out.append(_pp._nota(f"Se muestran las primeras {MAX_FILAS_TABLA} filas de {len(r.tabla):,}."))
+            out.append(_pp._nota(f"Se muestran las primeras {MAX_FILAS_TABLA} filas de {dec(len(r.tabla), 0, True)}."))
 
     # supuestos y avisos
     if r.supuestos:
         out.append(_pp._subtitulo("Qué asume Hadar", 100))
         out.append(_pp._nota(" ".join(r.supuestos)))
-    for aviso in r.advertencias:
+    color_aviso = {"critico": _pp.ROJO, "importante": AMBAR}
+    for aviso in r.avisos_ordenados():              # el PDF respeta el orden: críticos, importantes, notas
         out.append(f'<p style="margin-top:{_pp._p(2)}px; margin-bottom:{_pp._p(4)}px; font-size:9.5pt;">'
-                   f'<span style="color:{AMBAR}; font-weight:600;">Ojo:</span> {_pp._esc(aviso)}</p>')
+                   f'<span style="color:{color_aviso.get(aviso.nivel, _pp.GRIS)}; font-weight:600;">'
+                   f'{ETIQUETA_AVISO[aviso.nivel]}:</span> {_pp._esc(aviso)}</p>')
+    if getattr(ctx, "con_tecnico", False) and getattr(r, "experto", None):
+        out.append(_html_tecnico(r.experto))
     return "".join(out)
 
 

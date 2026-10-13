@@ -26,6 +26,8 @@ from PySide6.QtWidgets import (
     QPushButton, QScrollArea, QSpinBox, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
+from .avisos import CRITICO, ETIQUETA as ETIQUETA_AVISO, IMPORTANTE, ordenar_avisos
+from .formato import dec
 from .panel import estilo_tarjeta
 
 try:
@@ -1196,11 +1198,30 @@ class PanelPrediccion(QWidget):
         veredicto.setWordWrap(True)
         veredicto.setStyleSheet(f"font-size: 17px; font-family: {FUENTE_SERIF};")
         lay.addWidget(veredicto)
-        for aviso in r.advertencias:
-            a = QLabel("Nota: " + aviso)
+        # Avisos: los críticos primero (una fuga siempre arriba y visible); se ven 3 y el resto con «ver más»
+        color_aviso = {CRITICO: ROJO, IMPORTANTE: AMBAR}
+        ocultos = []
+        for i, aviso in enumerate(ordenar_avisos(r.advertencias)):
+            a = QLabel(f"{ETIQUETA_AVISO[aviso.nivel]}: " + aviso)
             a.setWordWrap(True)
-            a.setStyleSheet(f"color: {AMBAR};")
+            a.setStyleSheet(f"color: {color_aviso.get(aviso.nivel, GRIS)};")
             lay.addWidget(a)
+            if i >= 3 and aviso.nivel != CRITICO:
+                a.setVisible(False)
+                ocultos.append(a)
+        if ocultos:
+            btn_mas = QPushButton(f"Ver {len(ocultos)} aviso(s) más")
+            btn_mas.setCursor(Qt.PointingHandCursor)
+            btn_mas.setStyleSheet(f"QPushButton{{background: transparent; color: {ACENTO}; border: none; "
+                                  f"text-align: left; padding: 2px 0;}} QPushButton:hover{{text-decoration: underline;}}")
+
+            def _alternar(_=None, b=btn_mas, ls=tuple(ocultos)):
+                mostrar = not ls[0].isVisible()
+                for x in ls:
+                    x.setVisible(mostrar)
+                b.setText("Ver menos avisos" if mostrar else f"Ver {len(ls)} aviso(s) más")
+            btn_mas.clicked.connect(_alternar)
+            lay.addWidget(btn_mas, 0, Qt.AlignLeft)
 
         # 2) tres cifras: tipografía y nada más
         cifras = QWidget()
@@ -1228,7 +1249,7 @@ class PanelPrediccion(QWidget):
             self._seccion("El modelo frente a adivinar el promedio", "Más a la izquierda = menos error.")
             rb = max(base.get("rmse", 0.0), 1e-12)
             mej = r.mejora()
-            brecha = f"{(1 - m['rmse'] / rb) * 100:.0f}% menos error" if m["rmse"] < rb else "sin mejora"
+            brecha = f"{dec((1 - m['rmse'] / rb) * 100, 0)}% menos error" if m["rmse"] < rb else "sin mejora"
             lay.addWidget(_Mancuerna(m["rmse"], rb, max(m["rmse"], rb),
                                      f"con el modelo  {_formatear(m['rmse'])}",
                                      f"respondiendo el promedio  {_formatear(rb)}", brecha))
@@ -1238,14 +1259,14 @@ class PanelPrediccion(QWidget):
                           "en cada clase por igual. Más a la derecha = mejor.")
             bal, fb = m["bal_acc"] * 100, base["bal_acc"] * 100
             lay.addWidget(_Mancuerna(bal, fb, 100,
-                                     f"modelo  {bal:.0f}%", f"siempre la clase más frecuente  {fb:.0f}%",
-                                     f"+{bal - fb:.0f} puntos" if bal > fb else "sin mejora"))
+                                     f"modelo  {dec(bal, 0)}%", f"siempre la clase más frecuente  {dec(fb, 0)}%",
+                                     f"+{dec(bal - fb, 0)} puntos" if bal > fb else "sin mejora"))
         else:
             self._seccion("El modelo frente a la respuesta fácil", "Más a la derecha = más aciertos.")
             acc, fac = m["accuracy"] * 100, base["accuracy"] * 100
             lay.addWidget(_Mancuerna(acc, fac, 100,
-                                     f"modelo  {acc:.0f}%", f"siempre la clase más frecuente  {fac:.0f}%",
-                                     f"+{acc - fac:.0f} puntos" if acc > fac else "sin mejora"))
+                                     f"modelo  {dec(acc, 0)}%", f"siempre la clase más frecuente  {dec(fac, 0)}%",
+                                     f"+{dec(acc - fac, 0)} puntos" if acc > fac else "sin mejora"))
         ref = r.texto_lineal()
         if ref:
             t = QLabel(ref)
@@ -1256,7 +1277,7 @@ class PanelPrediccion(QWidget):
         # 4) en qué columnas se fijó: gráfico de puntos ordenado
         if r.importancias:
             self._seccion("En qué columnas se fijó más", "Cuánto ayudó cada columna a adivinar. Todas suman 100%.")
-            self._grilla_puntos([(str(c), pct, ACENTO, "<1%" if pct < 1 else f"{pct:.0f}%")
+            self._grilla_puntos([(str(c), pct, ACENTO, "<1%" if pct < 1 else f"{dec(pct, 0)}%")
                                  for c, pct in r.importancias[:8]])
 
         # 5) lo predicho frente a lo real
@@ -1378,7 +1399,7 @@ class PanelPrediccion(QWidget):
                 tabla.setItem(i, 3, it)
                 tabla.setCellWidget(i, 4, self._celda_punto(_PuntoDivergente(d / escala, color)))
             else:
-                tabla.setItem(i, 3, QTableWidgetItem(f"{extra[i] * 100:.0f}%"))
+                tabla.setItem(i, 3, QTableWidgetItem(f"{dec(extra[i] * 100, 0)}%"))
                 tabla.setCellWidget(i, 4, self._celda_punto(_PuntoLinea(extra[i] * 100, AMBAR)))
         tabla.setFixedHeight(26 * n + 32)
         self.resultado_lay.addWidget(tabla)
@@ -1507,9 +1528,9 @@ class PanelPrediccion(QWidget):
         except Exception as e:
             QMessageBox.critical(self, "Error al guardar", str(e))
             return
-        self.lbl_pred.setText(f"Guardado: {ruta} ({len(salida):,} filas)")
+        self.lbl_pred.setText(f"Guardado: {ruta} ({dec(len(salida), 0, True)} filas)")
         avisos = list(getattr(salida, "attrs", {}).get("avisos", []))
-        texto = f"{len(salida):,} filas guardadas en:\n{ruta}"
+        texto = f"{dec(len(salida), 0, True)} filas guardadas en:\n{ruta}"
         if avisos:
             texto += "\n\nOjo:\n" + "\n".join("• " + a for a in avisos)
         QMessageBox.information(self, "Predicciones guardadas", texto)

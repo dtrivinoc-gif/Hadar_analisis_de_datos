@@ -31,6 +31,11 @@ import numpy as np
 import pandas as pd
 
 try:
+    from .formato import dec
+except ImportError:  # pruebas sueltas fuera del paquete
+    from formato import dec
+
+try:
     from . import pistas as _pistas
     from .prediccion import _a_datetime, _tokens, es_columna_id, normalizar_clave, tipo_columna
     from .pronostico_base import (DIAS_SEMANA, MESES, UNIDADES, ResultadoPronostico, confianza_por_datos,
@@ -226,7 +231,7 @@ def preparar_serie(df: pd.DataFrame, col_fecha, col_valor=None, agregacion: str 
     avisos_ini = []
     freq_pre = None
     if not ok.all():
-        avisos_ini.append(f"{(~ok).sum()} filas ({(~ok).mean() * 100:.0f}%) no tenían una fecha legible y no se usaron.")
+        avisos_ini.append(f"{(~ok).sum()} filas ({dec((~ok).mean() * 100, 0)}%) no tenían una fecha legible y no se usaron.")
     dt = dt[ok].reset_index(drop=True)
     dt_todas = dt
     vals = None
@@ -248,7 +253,7 @@ def preparar_serie(df: pd.DataFrame, col_fecha, col_valor=None, agregacion: str 
         if not buenos.any():
             raise ValueError(f"«{col_valor}» no tiene números.")
         if (~buenos).mean() > 0.1:
-            avisos_ini.append(f"{(~buenos).mean() * 100:.0f}% de los valores de «{col_valor}» no eran números y no se usaron.")
+            avisos_ini.append(f"{dec((~buenos).mean() * 100, 0)}% de los valores de «{col_valor}» no eran números y no se usaron.")
         dt, vals = dt[buenos].reset_index(drop=True), vals[buenos]
     freq = detectar_frecuencia(dt) if frecuencia in (None, "auto") else frecuencia
     con_filas = pd.DatetimeIndex(_bucket(dt_todas, freq).unique())
@@ -268,7 +273,7 @@ def preparar_serie(df: pd.DataFrame, col_fecha, col_valor=None, agregacion: str 
             habitual = float(np.median(cuentas.iloc[-8:-1]))
             if habitual >= 3 and float(cuentas.iloc[-1]) < 0.5 * habitual:
                 avisos.append(f"El último {UNIDADES[freq][0]} tiene {int(cuentas.iloc[-1])} registros, bastante menos que lo "
-                              f"habitual ({habitual:.0f}): si todavía no termina, su valor está subestimado y arrastra la "
+                              f"habitual ({dec(habitual, 0)}): si todavía no termina, su valor está subestimado y arrastra la "
                               f"proyección hacia abajo.")
     s = s.iloc[-MAX_PERIODOS[freq]:]
     faltantes = _indice(s.index.min(), s.index.max(), freq).difference(s.index) if len(s) else s.index[:0]
@@ -281,11 +286,11 @@ def preparar_serie(df: pd.DataFrame, col_fecha, col_valor=None, agregacion: str 
     if solo_finde:
         como = ("con 0 (no hubo ventas ni actividad registrada esos días)" if agg in ("suma", "cuenta")
                 else "con valores intermedios entre el viernes y el lunes")
-        avisos.append(f"Los días sin datos son siempre sábado y domingo ({relleno * 100:.0f}% del período): parece que no se "
+        avisos.append(f"Los días sin datos son siempre sábado y domingo ({dec(relleno * 100, 0)}% del período): parece que no se "
                       f"registra actividad en fin de semana. Se completaron {como}; el patrón semanal que se vea es "
                       f"consecuencia de eso, no un fallo de los datos.")
     elif relleno > 0.2:
-        avisos.append(f"El {relleno * 100:.0f}% de los períodos no tenía datos y se rellenó: "
+        avisos.append(f"El {dec(relleno * 100, 0)}% de los períodos no tenía datos y se rellenó: "
                       f"los resultados pueden ser poco fiables.")
     y = s.to_numpy(dtype="float64")
     m = periodo_estacional(freq, len(y))
@@ -459,6 +464,7 @@ class Proyeccion:
     z: float
     no_negativa: bool
     cobertura_honesta: bool = False   # True si la cobertura se midió con pruebas que NO fijaron el ancho del rango
+    residuos: object = None           # errores del método elegido en las pruebas pasadas (muestra, para el modo experto)
 
 
 def _backtest(y: np.ndarray, h: int, m):
@@ -545,6 +551,43 @@ def _factor_t(nivel: float, nu: float) -> float:
     return float(np.clip(q / z, 1.0, 2.5))
 
 
+def _muestra_residuos(E, maximo: int = 400):
+    """Hasta `maximo` errores de las pruebas pasadas, espaciados parejo (determinista) para el gráfico del modo experto."""
+    v = np.asarray(E, dtype="float64").ravel()
+    v = v[np.isfinite(v)]
+    if len(v) > maximo:
+        v = v[np.linspace(0, len(v) - 1, maximo).astype(int)]
+    return v
+
+
+def experto_series(p: "Proyeccion", h: int) -> dict:
+    """Detalles técnicos de una proyección para el modo experto (todo ya calculado; aquí solo se ordena)."""
+    filas = [("Método elegido", p.modelo_nombre)]
+    if p.n_origenes:
+        filas += [("Pruebas pasadas (orígenes)", dec(p.n_origenes, 0)),
+                  ("Horizonte comprobado", f"{dec(p.h_eval, 0)} períodos (se pidieron {dec(h, 0)})"),
+                  ("Evaluación honesta", "Sí: el método se eligió con una parte de las pruebas y se evaluó con otra"
+                   if p.honesta else "No: había pocas pruebas y se usaron los mismos casos para elegir y evaluar"),
+                  ("Error típico del método (RMSE)", dec(p.rmse_modelo, 3)),
+                  ("Error de la respuesta más simple (RMSE)", dec(p.rmse_base, 3)),
+                  ("Mejora sobre lo más simple", pct_txt(p.mejora))]
+        if p.cobertura_honesta and np.isfinite(p.cobertura):
+            filas.append((f"El rango de {pct_txt(p.nivel)} acertó en", f"{pct_txt(p.cobertura)} de pruebas que no fijaron su ancho"))
+        else:
+            filas.append((f"El rango de {pct_txt(p.nivel)}", "no se pudo comprobar (pocas pruebas)"))
+    filas += [("Nivel del rango", pct_txt(p.nivel)), ("Semilla", "no aplica: el cálculo es determinista (mismos datos, mismo resultado)")]
+    metodos = sorted(((k, float(v)) for k, v in (p.scores or {}).items() if np.isfinite(v)), key=lambda kv: kv[1])
+    return {"titulo": "Detalles técnicos", "filas": filas, "metodos": metodos,
+            "metodos_titulo": "Métodos probados y su error típico (menor es mejor)",
+            "residuos": None if p.residuos is None or len(p.residuos) == 0 else [float(x) for x in p.residuos],
+            "residuos_titulo": "Cuánto se equivocó el método en las pruebas pasadas (la barra del centro es acertar)"}
+
+
+def _con_experto(res, p, h):
+    res.experto = experto_series(p, h)
+    return res
+
+
 def proyectar(serie: SerieTiempo, h: int, nivel: float = 0.8) -> Proyeccion:
     y = serie.y
     n = len(y)
@@ -619,19 +662,19 @@ def proyectar(serie: SerieTiempo, h: int, nivel: float = 0.8) -> Proyeccion:
     nombres = {nombre_modelo(*c): s for c, s in scores.items()}
     return Proyeccion(serie.freq, _futuras(serie.fechas[-1], h, serie.freq), f, lo, hi, sigma, sigma_ac, elegido,
                       nombre_modelo(*elegido), nombres, rmse_modelo, rmse_base, mejora, cobertura, K, h_eval,
-                      honesta, nivel, z, no_neg, cob_honesta)
+                      honesta, nivel, z, no_neg, cob_honesta, _muestra_residuos(E))
 
 
 def _confianza_proy(p: Proyeccion, n: int):
     if p.n_origenes < 4 or n < 24:
         return "baja", "hay pocos datos para comprobar el método contra lo que ya pasó."
     cob_ok = p.cobertura_honesta and not np.isnan(p.cobertura)
-    cob_txt = (f"el rango acertó en {p.cobertura * 100:.0f}% de pruebas que no usó para fijar su ancho"
+    cob_txt = (f"el rango acertó en {dec(p.cobertura * 100, 0)}% de pruebas que no usó para fijar su ancho"
                if cob_ok else "no hubo pruebas suficientes para comprobar si el rango acierta")
     if p.mejora >= 0.25 and cob_ok and p.cobertura >= 0.65 and n >= 60:
-        return "alta", (f"el método reduce el error en {p.mejora * 100:.0f}% frente a la respuesta más simple (repetir lo último o el promedio), y {cob_txt}.")
+        return "alta", (f"el método reduce el error en {dec(p.mejora * 100, 0)}% frente a la respuesta más simple (repetir lo último o el promedio), y {cob_txt}.")
     if p.mejora >= 0.08:
-        return "media", (f"el método mejora {p.mejora * 100:.0f}% a la respuesta más simple (repetir lo último o el promedio); {cob_txt}.")
+        return "media", (f"el método mejora {dec(p.mejora * 100, 0)}% a la respuesta más simple (repetir lo último o el promedio); {cob_txt}.")
     return "baja", ("el método casi no mejora a la respuesta más simple (repetir lo último o el promedio): no se encontró un "
                     "patrón que aprovechar. El rango sigue siendo válido, pero es amplio.")
 
@@ -639,8 +682,8 @@ def _confianza_proy(p: Proyeccion, n: int):
 def _avisos_proyeccion(serie: SerieTiempo, p: Proyeccion, h: int) -> list:
     av = list(serie.advertencias)
     if p.cobertura_honesta and not np.isnan(p.cobertura) and p.cobertura < 0.65:
-        av.append(f"El rango acertó solo en {p.cobertura * 100:.0f}% de pruebas que no usó para fijar su ancho (debería ser "
-                  f"cerca de {p.nivel * 100:.0f}%): tómalo como orientativo.")
+        av.append(f"El rango acertó solo en {dec(p.cobertura * 100, 0)}% de pruebas que no usó para fijar su ancho (debería ser "
+                  f"cerca de {dec(p.nivel * 100, 0)}%): tómalo como orientativo.")
     if not p.honesta and p.n_origenes:
         av.append("Hay pocas pruebas pasadas, así que el método se eligió y evaluó con los mismos casos: "
                   "las cifras de calidad pueden ser algo optimistas.")
@@ -688,7 +731,7 @@ def analizar_proyeccion(df: pd.DataFrame, cfg) -> ResultadoPronostico:
     y = serie.y
     acumula = serie.agregacion in ("suma", "cuenta")
     ht = duracion_txt(h, serie.freq)
-    rango_pct = f"{nivel * 100:.0f}%"
+    rango_pct = f"{dec(nivel * 100, 0)}%"
     if acumula:
         total = float(p.central.sum())
         w = p.z * float(p.sigma_acum[-1])
@@ -715,12 +758,13 @@ def analizar_proyeccion(df: pd.DataFrame, cfg) -> ResultadoPronostico:
                  "cuánto error evita el método frente a la respuesta más simple"))
     det = [serie.explicacion + f" Se usó el método «{p.modelo_nombre}».",
            f"Rango de {rango_pct}: según cuánto se equivocó el método en {p.n_origenes} pruebas hechas sobre el pasado."]
-    return ResultadoPronostico(
+    _res = ResultadoPronostico(
         "proyeccion", "Proyección", titular, "info", conf, motivo, tarj, det,
         ["El comportamiento reciente se mantiene; no se conocen promociones, cierres, cambios de precio ni otros eventos futuros."],
         _avisos_proyeccion(serie, p, h), _tabla_proyeccion(p), "Proyección período a período",
         grafico_serie(serie, p), {"modelo": p.modelo_nombre, "mejora": p.mejora, "cobertura": p.cobertura, "cobertura_honesta": p.cobertura_honesta,
                                   "error": p.rmse_modelo, "error_base": p.rmse_base, "periodos": len(y)})
+    return _con_experto(_res, p, h)
 
 
 # ----------------------------------------------------------------------
@@ -985,18 +1029,19 @@ def analizar_umbral(df: pd.DataFrame, cfg) -> ResultadoPronostico:
         tarj = [(f(k_c) if k_c is not None else "—", "Fecha más probable",
                  f"cuando el valor esperado cruza {num_txt(lim)}" if k_c is not None else f"no cruza en {duracion_txt(h, serie.freq)}"),
                 (f"{f(k_pronto)} – {f(k_tarde) if k_tarde is not None else 'más tarde'}", "Rango de fechas",
-                 f"del caso más temprano al más tardío razonable ({nivel * 100:.0f}%)"),
+                 f"del caso más temprano al más tardío razonable ({dec(nivel * 100, 0)}%)"),
                 (pct_txt(p_max), "Probabilidad máxima", f"de estar más allá del límite en algún período de los próximos {duracion_txt(h, serie.freq)}")]
     tabla = pd.DataFrame({"Fecha": p.fechas, "Esperado": p.central, "Mínimo probable": p.bajo,
                           "Máximo probable": p.alto, "Prob. de pasar el límite": probs})
     det = [serie.explicacion + f" Método: «{p.modelo_nombre}».",
            f"La probabilidad de cada período sale de cuánto se equivocó el método en {p.n_origenes} pruebas sobre el pasado."]
-    return ResultadoPronostico(
+    _res = ResultadoPronostico(
         "umbral", "Umbral", titular, nivel_u, conf, motivo, tarj, det,
         ["La serie sigue comportándose como hasta ahora; no considera eventos futuros ni acciones que se tomen."],
         avisos, tabla, "Probabilidad de pasar el límite, período a período",
         grafico_serie(serie, p, umbral=lim),
         {"umbral": lim, "ya_pasado": ya, "prob_max": p_max, "prob_final": p_final, "modelo": p.modelo_nombre})
+    return _con_experto(_res, p, h)
 
 
 def analizar_saturacion(df: pd.DataFrame, cfg) -> ResultadoPronostico:
@@ -1044,11 +1089,12 @@ def analizar_saturacion(df: pd.DataFrame, cfg) -> ResultadoPronostico:
            f"Para saturación suele ser más útil mirar el PICO de cada período que el promedio (por eso se usa «{serie.agregacion}» salvo que indiques otra cosa)."]
     tabla = pd.DataFrame({"Fecha": p.fechas, "Uso esperado": p.central, "Máximo probable": p.alto,
                           "Prob. de saturar": probs, "% de la capacidad": p.central / cap if cap else np.nan})
-    return ResultadoPronostico(
+    _res = ResultadoPronostico(
         "saturacion", "Saturación", titular, nivel_u, conf, motivo, tarj, det,
         ["La demanda sigue creciendo o variando como hasta ahora; no considera ampliaciones de capacidad."],
         avisos, tabla, "Probabilidad de saturación, período a período", grafico_serie(serie, p, umbral=cap),
         {"capacidad": cap, "prob_max": pmax, "hist_sobre": hist_sobre, "modelo": p.modelo_nombre})
+    return _con_experto(_res, p, h)
 
 
 # ----------------------------------------------------------------------
@@ -1412,23 +1458,23 @@ def analizar_escenario(df: pd.DataFrame, cfg) -> ResultadoPronostico:
         avisos.append(f"Se midió el efecto con {rez} período(s) de retraso.")
     signo = "sube" if cambio >= 0 else "baja"
     if not distingue:
-        titular = (f"Si «{col_x}» {signo} {abs(cambio) * 100:.0f}%, el efecto sobre «{serie.nombre}» no se distingue de cero con estos datos "
+        titular = (f"Si «{col_x}» {signo} {dec(abs(cambio) * 100, 0)}%, el efecto sobre «{serie.nombre}» no se distingue de cero con estos datos "
                    f"(entre {pct_txt(e_lo, 1, True)} y {pct_txt(e_hi, 1, True)}).")
         conf = "baja"
         motivo = "el rango incluye el cero: con el historial disponible no se puede afirmar que la variable tenga efecto."
     else:
-        titular = (f"Si «{col_x}» {signo} {abs(cambio) * 100:.0f}%, «{serie.nombre}» cambiaría entre {pct_txt(e_lo, 1, True)} y "
+        titular = (f"Si «{col_x}» {signo} {dec(abs(cambio) * 100, 0)}%, «{serie.nombre}» cambiaría entre {pct_txt(e_lo, 1, True)} y "
                    f"{pct_txt(e_hi, 1, True)} (lo más probable: {pct_txt(e0, 1, True)}).")
         conf = "media" if n >= 30 else "baja"
         motivo = f"se midió sobre {n} períodos y el rango no incluye el cero; sigue siendo una asociación, no una prueba de causa."
-    tarj = [(pct_txt(e0, 1, True), "Efecto más probable", f"sobre «{serie.nombre}» si «{col_x}» {signo} {abs(cambio) * 100:.0f}%"),
+    tarj = [(pct_txt(e0, 1, True), "Efecto más probable", f"sobre «{serie.nombre}» si «{col_x}» {signo} {dec(abs(cambio) * 100, 0)}%"),
             (f"{pct_txt(e_lo, 1, True)} a {pct_txt(e_hi, 1, True)}", "Rango", "95% de los casos plausibles según los datos"),
             (pct_txt(aporte), "Qué tanto explica", "parte de las variaciones que se asocia a esta variable")]
     det = [serie.explicacion, ("Se usó una relación porcentaje-porcentaje (elasticidad)." if loglog
                                else "Se usó una relación lineal (la variable o el valor tienen ceros o negativos)."),
            f"Nivel de partida: «{col_x}» ≈ {num_txt(x_ref)} (promedio reciente) → {num_txt(x_new)}."]
     if loglog:
-        det.append(f"Elasticidad estimada: {beta[1]:.2f} (si la variable sube 1%, el valor cambia {beta[1]:.2f}%).")
+        det.append(f"Elasticidad estimada: {dec(beta[1], 2)} (si la variable sube 1%, el valor cambia {dec(beta[1], 2)}%).")
     return ResultadoPronostico(
         "escenario", "Escenario", titular, "info", conf, motivo, tarj, det,
         ["La relación observada en el pasado se mantiene y el resto de las condiciones no cambia."], avisos,

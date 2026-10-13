@@ -4,7 +4,7 @@ import prediccion as P
 from prediccion import ConfigPrediccion as CP
 import ajustes as A
 
-def _datos_con_deriva(n=500, seed=0, con_fecha=True):
+def _datos_con_deriva(n=420, seed=0, con_fecha=True):
     """La relación cambia con el tiempo: primera mitad y > 0 si x > 0; segunda mitad al revés."""
     rng = np.random.default_rng(seed)
     x = rng.normal(size=n); t = np.arange(n)

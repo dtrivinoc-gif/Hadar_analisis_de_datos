@@ -43,6 +43,13 @@ from dataclasses import dataclass, field, fields
 import numpy as np
 import pandas as pd
 
+try:
+    from .avisos import ordenar_avisos, ETIQUETA as _ETIQUETA_AVISO
+    from .formato import dec
+except ImportError:  # pruebas sueltas fuera del paquete
+    from avisos import ordenar_avisos, ETIQUETA as _ETIQUETA_AVISO
+    from formato import dec
+
 MAX_CATEGORIAS = 250          # HistGradientBoosting admite categorías nativas hasta ~255
 MAX_CLASES = 100
 MUESTRA_DIAGNOSTICO = 100_000
@@ -268,6 +275,11 @@ def inferir_tipo_problema(serie: pd.Series, manual: str = "auto") -> str:
     return "regresion"
 
 
+def pct_txt_(x) -> str:
+    """0.153 -> '15%' (en el formato de números elegido)."""
+    return f"{dec(float(x) * 100, 0)}%" if x is not None and np.isfinite(x) else "—"
+
+
 def columnas_fecha(df: pd.DataFrame, excluir=()) -> list:
     """Columnas de la tabla que parecen fechas (mira solo una muestra, así es barato)."""
     salida = []
@@ -478,10 +490,10 @@ def _fmt(x) -> str:
         return "—"
     a = abs(x)
     if a >= 1000:
-        return f"{x:,.0f}"
+        return f"{dec(x, 0, True)}"
     if a >= 1:
-        return f"{x:,.2f}"
-    return f"{x:.4f}"
+        return f"{dec(x, 2, True)}"
+    return f"{dec(x, 4)}"
 
 
 def _mejora_de(tipo, m, b) -> float:
@@ -524,6 +536,7 @@ class ResultadoEntrenamiento:
     tipo_salida: str = ""              # valor | probabilidad | ranking (qué significa el número que se entrega)
     calibracion: dict | None = field(default=None, repr=False)   # medición de calibración (dos clases)
     calibrador: object = field(default=None, repr=False)         # corrección en memoria, o None
+    semilla: int | None = None         # semilla fija con la que se entrenó (mismo dato + misma semilla = mismo resultado)
 
     # ---- lectura simple del resultado (para la pantalla) --------------
     def mejora(self) -> float:
@@ -552,7 +565,7 @@ class ResultadoEntrenamiento:
         domina = top is not None and top[1] >= 85 and mej >= 0.8
         if casi_perfecto or domina:
             if top is not None and top[1] >= 60:
-                frase = (f"Una sola columna («{top[0]}») concentra el {top[1]:.0f}% de las decisiones. Suele pasar "
+                frase = (f"Una sola columna («{top[0]}») concentra el {dec(top[1], 0)}% de las decisiones. Suele pasar "
                          f"cuando esa columna es casi lo mismo que lo que predices (por ejemplo, un total calculado "
                          f"con los mismos datos). Desmárcala en el Paso 2 y vuelve a entrenar para ver el resultado real.")
             else:
@@ -560,15 +573,15 @@ class ResultadoEntrenamiento:
                          "respuesta (un total, una copia, algo que solo se sabe después de que ocurre).")
             return "sospechoso", "Revisa: resultado sospechosamente bueno", frase
         if self.tipo == "regresion":
-            detalle = f"Reduce el error en {mej * 100:.0f}% frente a responder siempre el promedio."
+            detalle = f"Reduce el error en {dec(mej * 100, 0)}% frente a responder siempre el promedio."
         elif self._caso_raro():
-            detalle = (f"Detecta el {m['recall_min'] * 100:.0f}% de los casos «{self.clase_minoritaria}» y, cuando "
-                       f"los marca, acierta el {m['precision_min'] * 100:.0f}% de las veces. Como son pocos casos, "
+            detalle = (f"Detecta el {dec(m['recall_min'] * 100, 0)}% de los casos «{self.clase_minoritaria}» y, cuando "
+                       f"los marca, acierta el {dec(m['precision_min'] * 100, 0)}% de las veces. Como son pocos casos, "
                        f"acertar en general no sirve de medida: responder siempre lo más frecuente acertaría el "
-                       f"{b['accuracy'] * 100:.0f}%.")
+                       f"{dec(b['accuracy'] * 100, 0)}%.")
         else:
-            detalle = (f"Acierta el {m['accuracy'] * 100:.0f}% de las veces; responder siempre la clase más "
-                       f"frecuente acertaría el {b['accuracy'] * 100:.0f}%.")
+            detalle = (f"Acierta el {dec(m['accuracy'] * 100, 0)}% de las veces; responder siempre la clase más "
+                       f"frecuente acertaría el {dec(b['accuracy'] * 100, 0)}%.")
         if self.n_pliegues > 1 and self.mejora_sd() >= 0.15:
             detalle += " El resultado cambia bastante de una prueba a otra: tómalo como aproximado."
         if mej >= 0.8:
@@ -608,29 +621,78 @@ class ResultadoEntrenamiento:
         m, b = self.metricas, self.baseline
         if self.tipo == "regresion":
             return [
-                (f"{self.mejora() * 100:.0f}%", "Menos error que adivinar",
+                (f"{dec(self.mejora() * 100, 0)}%", "Menos error que adivinar",
                  "frente a responder siempre el promedio"
-                 + (f" (± {self.mejora_sd() * 100:.0f} entre pruebas)" if self.n_pliegues > 1 else "")),
+                 + (f" (± {dec(self.mejora_sd() * 100, 0)} entre pruebas)" if self.n_pliegues > 1 else "")),
                 (_fmt(m["mae"]), "Error promedio", f"cuánto se equivoca en promedio, en las unidades de «{self.objetivo}»"),
-                (f"{max(m['r2'], 0) * 100:.0f}%", "Variación explicada", "qué parte de las diferencias entre filas logra explicar (R²)"),
+                (f"{dec(max(m['r2'], 0) * 100, 0)}%", "Variación explicada", "qué parte de las diferencias entre filas logra explicar (R²)"),
             ]
-        tercera = ((f"{m['auc']:.2f}".replace(".", ","), "Separa las clases (AUC)", "0,5 es azar y 1 es perfecto")
+        tercera = ((dec(m['auc'], 2), "Separa las clases (AUC)", f"{dec(0.5, 1)} es azar y 1 es perfecto")
                    if m.get("auc") is not None else
-                   (f"{m['f1'] * 100:.0f}%", "Equilibrio entre clases", "qué tan parejo acierta en todas (F1)"))
+                   (f"{dec(m['f1'] * 100, 0)}%", "Equilibrio entre clases", "qué tan parejo acierta en todas (F1)"))
         if self._caso_raro():
             return [
-                (f"{m['recall_min'] * 100:.0f}%", "Casos detectados",
+                (f"{dec(m['recall_min'] * 100, 0)}%", "Casos detectados",
                  f"de los casos «{self.clase_minoritaria}» que había, en datos que no vio al entrenar"),
-                (f"{m['precision_min'] * 100:.0f}%", "Alarmas correctas",
+                (f"{dec(m['precision_min'] * 100, 0)}%", "Alarmas correctas",
                  "cuando marca un caso, acierta así de seguido"),
                 tercera,
             ]
         return [
-            (f"{m['accuracy'] * 100:.0f}%", "Aciertos", "en datos que no vio al entrenar"
-             + (f" (± {self.metricas_sd.get('accuracy', 0) * 100:.0f} entre pruebas)" if self.n_pliegues > 1 else "")),
-            (f"{b['accuracy'] * 100:.0f}%", "Respuesta fácil", "acertando siempre la clase más frecuente"),
+            (f"{dec(m['accuracy'] * 100, 0)}%", "Aciertos", "en datos que no vio al entrenar"
+             + (f" (± {dec(self.metricas_sd.get('accuracy', 0) * 100, 0)} entre pruebas)" if self.n_pliegues > 1 else "")),
+            (f"{dec(b['accuracy'] * 100, 0)}%", "Respuesta fácil", "acertando siempre la clase más frecuente"),
             tercera,
         ]
+
+    def detalle_experto(self) -> dict:
+        """Detalles técnicos para el modo experto: cómo se probó, con cuánto, cuánto se equivocó y contra qué se comparó."""
+        m, b, sd = self.metricas, self.baseline, self.metricas_sd or {}
+        modos = {"aleatoria": "filas mezcladas al azar", "temporal": "por fecha (se prueba con lo más nuevo)",
+                 "grupos": "por grupos (un grupo nunca queda en entrenamiento y prueba a la vez)"}
+        filas = [("Tipo de problema", "regresión (un número)" if self.tipo == "regresion" else "clasificación (una categoría)"),
+                 ("Cómo se probó", modos.get(self.modo_validacion, self.modo_validacion)),
+                 ("Pruebas (pliegues)", dec(self.n_pliegues, 0)),
+                 ("Filas de entrenamiento", dec(self.n_entrenamiento, 0, True)),
+                 ("Filas de prueba (en total)", dec(self.n_validacion, 0, True)),
+                 ("Iteraciones del modelo", dec(self.n_iteraciones, 0)),
+                 ("Semilla", "—" if self.semilla is None else str(self.semilla)),
+                 ("Mejora sobre la respuesta fácil", f"{pct_txt_(self.mejora())} (± {pct_txt_(self.mejora_sd())} entre pruebas)")]
+        metodos = []
+        if self.tipo == "regresion":
+            metodos = [("Este modelo (RMSE)", m.get("rmse")), ("Responder siempre el promedio (RMSE)", b.get("rmse")),
+                       ("Modelo lineal simple (RMSE)", b.get("lineal_rmse"))]
+            titulo_m = "Error típico en datos que no vio (menor es mejor)"
+        else:
+            e = lambda v: None if v is None else 1.0 - float(v)
+            metodos = [("Este modelo (error pareja entre clases)", e(m.get("bal_acc"))),
+                       ("Responder siempre la clase más frecuente", e(b.get("bal_acc"))),
+                       ("Modelo lineal simple", e(b.get("lineal_bal_acc")))]
+            titulo_m = "Error en datos que no vio, parejo entre clases (menor es mejor)"
+        metodos = [(k, float(v)) for k, v in metodos if v is not None and np.isfinite(v)]
+        c = self.calibracion or {}
+        if c.get("verificable"):
+            filas += [("Calibración: error por tramos", f"{dec(c['ece'], 3)} (tolerancia {dec(c.get('tolerancia', 0), 3)})"),
+                      ("Brier (menor es mejor)", f"{dec(c['brier'], 4)} frente a {dec(c['brier_base'], 4)} de decir siempre la tasa base"),
+                      ("Corrección de probabilidades", {"isotonica": "isotónica", "platt": "sigmoide (Platt)"}.get(c.get("metodo"), "no hizo falta" if c.get("calibrada") else "no se aplicó"))]
+        elif c.get("motivo"):
+            filas.append(("Calibración", "no comprobada: " + c["motivo"]))
+        if self.tipo_salida:
+            filas.append(("El número que se entrega es", {"valor": "un valor pronosticado", "probabilidad": "una probabilidad",
+                                                           "ranking": "un puntaje para ordenar"}.get(self.tipo_salida, self.tipo_salida)))
+        residuos = None
+        if self.tipo == "regresion" and self.validacion is not None:
+            try:
+                reales, pred = (np.asarray(v, dtype="float64") for v in self.validacion)
+                r = (pred - reales)[np.isfinite(pred - reales)]
+                if len(r) > 400:
+                    r = r[np.linspace(0, len(r) - 1, 400).astype(int)]
+                residuos = [float(x) for x in r]
+            except Exception:
+                residuos = None
+        return {"titulo": "Detalles técnicos", "filas": filas, "metodos": metodos, "metodos_titulo": titulo_m,
+                "residuos": residuos, "residuos_titulo": "Cuánto se equivocó el modelo en datos que no vio (el centro es acertar)"
+                if residuos else ""}
 
     def texto_validacion(self) -> str:
         modos = {"aleatoria": "con las filas mezcladas al azar", "temporal": "respetando el orden de las fechas "
@@ -639,10 +701,10 @@ class ResultadoEntrenamiento:
         modo = modos.get(self.modo_validacion, "")
         if self.n_pliegues > 1:
             return (f"Se probó {self.n_pliegues} veces {modo}: en cada una el modelo entrenó con unas "
-                    f"{self.n_entrenamiento:,} filas y se evaluó con otras que no había visto "
-                    f"({self.n_validacion:,} en total). Las cifras son el promedio de las pruebas; "
+                    f"{dec(self.n_entrenamiento, 0, True)} filas y se evaluó con otras que no había visto "
+                    f"({dec(self.n_validacion, 0, True)} en total). Las cifras son el promedio de las pruebas; "
                     f"luego el modelo se reentrenó con todas las filas.")
-        return (f"Se entrenó con {self.n_entrenamiento:,} filas y se probó con {self.n_validacion:,} "
+        return (f"Se entrenó con {dec(self.n_entrenamiento, 0, True)} filas y se probó con {dec(self.n_validacion, 0, True)} "
                 f"que el modelo no había visto ({modo}); luego se reentrenó con todas.")
 
     def texto_lineal(self) -> str | None:
@@ -653,7 +715,7 @@ class ResultadoEntrenamiento:
                     f"(este modelo: {_fmt(m['rmse'])}).")
         if self.tipo == "clasificacion" and b.get("lineal_bal_acc") is not None:
             return (f"Referencia: un modelo lineal simple acierta de forma pareja entre clases el "
-                    f"{b['lineal_bal_acc'] * 100:.0f}% (este modelo: {m['bal_acc'] * 100:.0f}%).")
+                    f"{dec(b['lineal_bal_acc'] * 100, 0)}% (este modelo: {dec(m['bal_acc'] * 100, 0)}%).")
         return None
 
     def lineas_resumen(self) -> list:
@@ -668,19 +730,19 @@ class ResultadoEntrenamiento:
                 mejora = (1 - m["rmse"] / b["rmse"]) * 100 if b["rmse"] else 0
                 lineas.append(
                     f"Si siempre respondieras el promedio, el error típico sería {_fmt(b['rmse'])}: "
-                    f"el modelo lo reduce en {mejora:.0f}%."
+                    f"el modelo lo reduce en {dec(mejora, 0)}%."
                 )
-            lineas.append(f"Explica el {max(m['r2'], 0) * 100:.0f}% de la variación (R² = {m['r2']:.3f}).")
+            lineas.append(f"Explica el {dec(max(m['r2'], 0) * 100, 0)}% de la variación (R² = {dec(m['r2'], 3)}).")
         else:
-            lineas.append(f"Acierta «{self.objetivo}» el {m['accuracy'] * 100:.1f}% de las veces en datos que no vio al entrenar.")
+            lineas.append(f"Acierta «{self.objetivo}» el {dec(m['accuracy'] * 100, 1)}% de las veces en datos que no vio al entrenar.")
             lineas.append(
-                f"Responder siempre la clase más frecuente acertaría el {b['accuracy'] * 100:.1f}%."
+                f"Responder siempre la clase más frecuente acertaría el {dec(b['accuracy'] * 100, 1)}%."
             )
             if self._caso_raro():
-                lineas.append(f"Detecta el {m['recall_min'] * 100:.0f}% de los casos «{self.clase_minoritaria}» "
-                              f"y acierta el {m['precision_min'] * 100:.0f}% de las veces que los marca.")
+                lineas.append(f"Detecta el {dec(m['recall_min'] * 100, 0)}% de los casos «{self.clase_minoritaria}» "
+                              f"y acierta el {dec(m['precision_min'] * 100, 0)}% de las veces que los marca.")
             if m.get("auc") is not None:
-                lineas.append(f"AUC: {m['auc']:.3f} (1 es perfecto, 0.5 es azar).")
+                lineas.append(f"AUC: {dec(m['auc'], 3)} (1 es perfecto, {dec(0.5, 1)} es azar).")
         extra = self.texto_lineal()
         if extra:
             lineas.append(extra)
@@ -816,7 +878,7 @@ def diagnosticar_variables(df: pd.DataFrame, objetivo: str, columnas: list, tipo
                 if ok.sum() >= MINIMO_FILAS and xn[ok].nunique() > 1 and yn[ok].nunique() > 1:
                     r = abs(float(np.corrcoef(xn[ok].to_numpy(float), yn[ok].to_numpy(float))[0, 1]))
                     if np.isfinite(r) and r >= UMBRAL_FUGA:
-                        salida.append((str(c), f"es casi una copia de «{objetivo}» (correlación {r:.3f})"))
+                        salida.append((str(c), f"es casi una copia de «{objetivo}» (correlación {dec(r, 3)})"))
             elif tipo == "clasificacion" and t in ("numerica", "numerica_texto") and y_txt.nunique() == 2:
                 # número que casi copia una respuesta de dos clases (por ejemplo 0/1)
                 xn = pd.to_numeric(s, errors="coerce")
@@ -825,7 +887,7 @@ def diagnosticar_variables(df: pd.DataFrame, objetivo: str, columnas: list, tipo
                 if ok.sum() >= MINIMO_FILAS and xn[ok].nunique() > 1:
                     r = abs(float(np.corrcoef(xn[ok].to_numpy(float), cod[ok].to_numpy(float))[0, 1]))
                     if np.isfinite(r) and r >= UMBRAL_FUGA:
-                        salida.append((str(c), f"es casi una copia de «{objetivo}» (correlación {r:.3f})"))
+                        salida.append((str(c), f"es casi una copia de «{objetivo}» (correlación {dec(r, 3)})"))
             elif tipo == "clasificacion" and t in ("categorica", "booleana"):
                 nn = int(s.notna().sum())
                 nun = int(s.nunique(dropna=True))
@@ -837,7 +899,7 @@ def diagnosticar_variables(df: pd.DataFrame, objetivo: str, columnas: list, tipo
                 pureza = float(por_cat.sum() / len(par))
                 frecuente = float(par["y"].value_counts(normalize=True).iloc[0])
                 if pureza >= 0.995 and pureza - frecuente >= 0.02:
-                    salida.append((str(c), f"sus valores casi determinan «{objetivo}» ({pureza * 100:.1f}% de las filas)"))
+                    salida.append((str(c), f"sus valores casi determinan «{objetivo}» ({dec(pureza * 100, 1)}% de las filas)"))
         except Exception:
             continue
     return salida
@@ -994,7 +1056,7 @@ def entrenar(df: pd.DataFrame, config: ConfigPrediccion, columnas: list,
         rng = np.random.default_rng(config.semilla)
         pos = np.sort(rng.choice(pos, size=int(config.max_filas), replace=False))
         advertencias.append(
-            f"La tabla es grande: se usó una muestra de {len(pos):,} filas "
+            f"La tabla es grande: se usó una muestra de {dec(len(pos), 0, True)} filas "
             f"(ajustable en Opciones avanzadas)."
         )
     modo = config.validacion if config.validacion in ("aleatoria", "temporal", "grupos") else "aleatoria"
@@ -1024,7 +1086,7 @@ def entrenar(df: pd.DataFrame, config: ConfigPrediccion, columnas: list,
     if n_dup and n_dup / len(datos) >= UMBRAL_DUPLICADAS and any(
             datos[c].nunique(dropna=True) >= 50 for c in columnas if c in datos.columns):
         advertencias.append(
-            f"{n_dup:,} filas ({n_dup / len(datos) * 100:.0f}%) son idénticas a otra en las columnas que usa el modelo. "
+            f"{dec(n_dup, 0, True)} filas ({dec(n_dup / len(datos) * 100, 0)}%) son idénticas a otra en las columnas que usa el modelo. "
             "Si una copia cae en el entrenamiento y otra en la prueba, la nota sale más alta que la real. "
             "Hadar no las borró: revisa si son repeticiones por error" + (" o prueba «por fecha»." if modo == "aleatoria" else "."))
 
@@ -1259,11 +1321,6 @@ def entrenar(df: pd.DataFrame, config: ConfigPrediccion, columnas: list,
         raras = [str(clases[i]) for i, c in enumerate(cuentas) if 0 < c < 5]
         if raras:
             advertencias.append("Hay clases con menos de 5 filas, el modelo casi no puede aprenderlas: " + ", ".join(raras[:5]) + ".")
-        if usar_pesos:
-            advertencias.append(
-                "Hay una clase poco frecuente, así que se le dio más peso para que el modelo no la ignore. "
-                "Por eso las probabilidades que entrega sirven para ordenar casos (cuál es más probable), "
-                "no como porcentaje real.")
     if n_val_total < MINIMO_VALIDACION:
         advertencias.append(
             f"Hay pocas filas de prueba ({n_val_total}): el resultado es poco confiable; "
@@ -1303,6 +1360,16 @@ def entrenar(df: pd.DataFrame, config: ConfigPrediccion, columnas: list,
             tipo_salida = "ranking"
             calibracion = {"motivo": "con más de dos categorías Hadar no comprueba la calibración", "verificable": False,
                            "calibrada": False}
+    if usar_pesos:
+        if tipo_salida == "probabilidad":
+            advertencias.append("Hay una clase poco frecuente: se le dio más peso para que el modelo no la ignore, y después "
+                                "se corrigieron las probabilidades con lo observado en datos que no vio.")
+        elif config.salida == "probabilidad":
+            advertencias.append("Hay una clase poco frecuente, así que se le dio más peso para que el modelo no la ignore. "
+                                "Por eso las probabilidades que entrega sirven para ordenar casos (cuál es más probable), "
+                                "no como porcentaje real.")
+        else:
+            advertencias.append("Hay una clase poco frecuente, así que se le dio más peso para que el modelo no la ignore.")
     if calibracion is not None and calibracion.get("verificable") and tipo_salida == "ranking" and not calibracion.get("calibrada"):
         advertencias.append("Las probabilidades que da el modelo no coinciden con lo que ocurre en datos que no vio "
                             "(dice, por ejemplo, 30% y ocurre otra proporción): úsalas para ordenar, no como porcentajes.")
@@ -1315,7 +1382,7 @@ def entrenar(df: pd.DataFrame, config: ConfigPrediccion, columnas: list,
         validacion=validacion, revision=revision,
         metricas_sd=metricas_sd, mejoras_pliegue=mejoras, n_pliegues=len(partes),
         modo_validacion=modo, balanceado=usar_pesos, clase_minoritaria=clase_min,
-        tipo_salida=tipo_salida, calibracion=calibracion, calibrador=calibrador,
+        tipo_salida=tipo_salida, calibracion=calibracion, calibrador=calibrador, semilla=config.semilla,
     )
 
 
@@ -1334,7 +1401,7 @@ def predecir(resultado: ResultadoEntrenamiento, df: pd.DataFrame,
     modelo = resultado.modelo
     avisos = []
     for col, (n_nuevas, ejemplo) in getattr(resultado.preprocesador, "desconocidas", {}).items():
-        avisos.append(f"{n_nuevas:,} filas ({n_nuevas / max(len(df), 1) * 100:.1f}%) traen en «{col}» valores que el modelo "
+        avisos.append(f"{dec(n_nuevas, 0, True)} filas ({dec(n_nuevas / max(len(df), 1) * 100, 1)}%) traen en «{col}» valores que el modelo "
                       f"nunca vio (por ejemplo «{ejemplo}»): para esas filas el modelo no tiene cómo usar esa columna "
                       f"y la predicción es menos confiable.")
 

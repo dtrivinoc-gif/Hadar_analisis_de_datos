@@ -114,6 +114,7 @@ class FormatoNumeros(unittest.TestCase):
     def test_fecha_txt(self):
         self.assertEqual(fecha_txt(pd.Timestamp("2024-05-31")), "31 may 2024"); self.assertEqual(fecha_txt(None), "—"); self.assertEqual(fecha_txt(pd.NaT), "—")
 
+@LENTO
 class KaplanMeier(unittest.TestCase):
     """F0b: tiempos exponenciales (media 100, mediana real 69.3) con casos abiertos censurados en la fecha de corte."""
     def _mediana(self, seed, n=500):

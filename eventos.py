@@ -27,6 +27,11 @@ import numpy as np
 import pandas as pd
 
 try:
+    from .formato import dec
+except ImportError:  # pruebas sueltas fuera del paquete
+    from formato import dec
+
+try:
     from . import pistas as _pistas
     from .prediccion import (ConfigPrediccion, _a_datetime, columnas_a_usar, columnas_fecha, entrenar, es_columna_id,
                              normalizar_clave, predecir, sugerir_columnas, tipo_columna)
@@ -44,8 +49,10 @@ DIA = np.timedelta64(1, "D")
 _NEGATIVOS = {"", "0", "no", "false", "falso", "none", "nan", "null", "ok", "-", "n/a", "na"}
 
 
-def _con_tipo(tipo_salida: str, resultado):
+def _con_tipo(tipo_salida: str, resultado, experto=None):
     resultado.tipo_salida = tipo_salida or ""
+    if experto is not None:
+        resultado.experto = experto
     return resultado
 
 
@@ -483,7 +490,7 @@ def analizar_falla(df: pd.DataFrame, cfg) -> ResultadoPronostico:
                f"(entre {pct_txt(r['Probabilidad (mínimo probable)'])} y {pct_txt(r['Probabilidad (máximo probable)'])})"
                + (f"; {n_alto} superan el 50%." if n_alto else "."))
     nivel = "alerta" if n_alto else "atencion" if n_riesgo else "info"
-    tarj = [(str(n_riesgo), f"Con ≥{umbral * 100:.0f}% de riesgo", f"de {len(tabla)} elementos, en {num_txt(w)} días"),
+    tarj = [(str(n_riesgo), f"Con ≥{dec(umbral * 100, 0)}% de riesgo", f"de {len(tabla)} elementos, en {num_txt(w)} días"),
             (num_txt(esperados, 1), "Eventos esperados", f"suma de probabilidades en {num_txt(w)} días"),
             (pct_txt(r[col_p]), "Mayor riesgo", str(r["Elemento"]))]
     det = ["La probabilidad de cada elemento depende de cuánto tiempo lleva sin evento: si ya sobrevivió mucho, "
@@ -592,7 +599,7 @@ def analizar_falla_modelo(df: pd.DataFrame, cfg) -> ResultadoPronostico:
         res.tarjetas(), res.lineas_resumen(),
         ["Las condiciones recientes de cada elemento seguirán pareciéndose a las que tenían antes de fallar los demás."],
         avisos, pred, "Riesgo actual de cada elemento", None,
-        {"metricas": dict(res.metricas), "mejora": float(res.mejora())}))
+        {"metricas": dict(res.metricas), "mejora": float(res.mejora())}), res.detalle_experto())
 
 
 # ----------------------------------------------------------------------
@@ -633,7 +640,7 @@ def analizar_duracion(df: pd.DataFrame, cfg) -> ResultadoPronostico:
         n0 = int(cero_cerrado.sum())
         if medio is not None and _g(cfg, "ceros_mismo_dia", "medio_dia") != "descartar":
             dur = np.where(cero_cerrado, medio, dur)
-            avisos.append(f"{n0} casos ({n0 / max(int((~invalido).sum()), 1) * 100:.0f}%) terminaron el mismo día (0 días): "
+            avisos.append(f"{n0} casos ({dec(n0 / max(int((~invalido).sum()), 1) * 100, 0)}%) terminaron el mismo día (0 días): "
                           f"se contaron como medio día porque no hay hora. Descartarlos habría alargado el tiempo típico.")
         elif medio is not None:
             avisos.append(f"{n0} casos terminaron el mismo día (0 días) y no se usaron, como pediste en Ajustes: el tiempo "
@@ -815,4 +822,4 @@ def analizar_clasificacion(df: pd.DataFrame, cfg) -> ResultadoPronostico:
         "info", conf, "calidad medida sobre filas que el modelo no vio al entrenar.", res.tarjetas(),
         res.lineas_resumen(), ["Los casos futuros se parecen a los del historial."] + [n for n in notas_val if n.startswith("Se probó")],
         avisos + [n for n in notas_val if not n.startswith("Se probó")], tabla,
-        "Qué variables pesan más", None, {"metricas": dict(res.metricas), "mejora": float(res.mejora())}))
+        "Qué variables pesan más", None, {"metricas": dict(res.metricas), "mejora": float(res.mejora())}), res.detalle_experto())

@@ -19,8 +19,12 @@ import numpy as np
 import pandas as pd
 
 try:
+    from .avisos import ETIQUETA, ordenar_avisos
+    from .formato import dec, get_formato_numerico, loc, set_formato_numerico
     from .prediccion import _a_datetime, tipo_columna
 except ImportError:
+    from avisos import ETIQUETA, ordenar_avisos
+    from formato import dec, get_formato_numerico, loc, set_formato_numerico
     from prediccion import _a_datetime, tipo_columna
 
 MESES = ["ene", "feb", "mar", "abr", "may", "jun", "jul", "ago", "sep", "oct", "nov", "dic"]
@@ -34,21 +38,8 @@ UNIDADES = {
 }
 
 
-# Formato de los números en los textos: «chileno» (1.234,5) o «estandar» (1,234.5). Es un solo lugar para todo Hadar:
-# la pantalla lo fija al cargar el proyecto (ver ajustes.py) y todas las frases lo respetan.
-FORMATO_NUMERICO = "chileno"
-
-
-def set_formato_numerico(formato: str) -> None:
-    global FORMATO_NUMERICO
-    FORMATO_NUMERICO = "estandar" if formato == "estandar" else "chileno"
-
-
-def _loc(s: str) -> str:
-    """Pasa un número escrito en formato estándar (1,234.5) al formato elegido."""
-    if FORMATO_NUMERICO != "chileno":
-        return s
-    return s.replace(",", "\x00").replace(".", ",").replace("\x00", ".")
+# El formato de los números (chileno / estándar) vive en formato.py: un solo lugar para todo Hadar.
+_loc = loc
 
 
 def fecha_txt(t, con_hora: bool = False) -> str:
@@ -166,6 +157,7 @@ class ResultadoPronostico:
     tabla_titulo: str = ""
     grafico: dict | None = field(default=None, repr=False)   # ver series_tiempo.grafico_serie
     metricas: dict = field(default_factory=dict)
+    experto: dict | None = field(default=None, repr=False)   # detalles técnicos (modo experto): filas, métodos, residuos
     tipo_salida: str = ""            # qué es el número que se entrega: valor | probabilidad | ranking (ver TEXTO_TIPO_SALIDA)
 
     def lineas_resumen(self) -> list:
@@ -175,8 +167,12 @@ class ResultadoPronostico:
             lineas.append(f"Confianza {self.confianza}: {self.por_que_confianza}")
         if self.supuestos:
             lineas.append("Qué asume Hadar: " + " ".join(self.supuestos))
-        lineas.extend("Ojo: " + a for a in self.advertencias)
+        lineas.extend(f"{ETIQUETA[a.nivel]}: {a}" for a in self.avisos_ordenados())
         return lineas
+
+    def avisos_ordenados(self) -> list:
+        """Avisos con su nivel (crítico, importante, informativo), los críticos primero. Ver avisos.py."""
+        return ordenar_avisos(self.advertencias)
 
     def texto(self) -> str:
         return "\n".join(self.lineas_resumen())
@@ -201,7 +197,7 @@ def leer_fechas(serie: pd.Series, nombre: str, exigir_validas: bool = True) -> p
     if getattr(dt.dt, "tz", None) is not None:
         dt = dt.dt.tz_localize(None)
     if exigir_validas and len(dt) and float(dt.notna().mean()) < 0.5:
-        raise ValueError(f"No pude leer fechas en «{nombre}» (solo se entendió el {dt.notna().mean() * 100:.0f}%).")
+        raise ValueError(f"No pude leer fechas en «{nombre}» (solo se entendió el {dec(dt.notna().mean() * 100, 0)}%).")
     return dt
 
 

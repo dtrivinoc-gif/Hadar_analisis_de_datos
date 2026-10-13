@@ -24,14 +24,17 @@ import pandas as pd
 
 from PySide6.QtCore import Qt, QThread, Signal
 from PySide6.QtWidgets import (
-    QApplication, QComboBox, QFileDialog, QFrame, QGridLayout, QHBoxLayout, QLabel, QLineEdit,
+    QApplication, QComboBox, QFileDialog, QFrame, QGridLayout, QHBoxLayout, QInputDialog, QLabel, QLineEdit,
     QListWidget, QListWidgetItem, QMenu, QMessageBox, QPushButton, QScrollArea, QSpinBox, QTableWidget,
     QTableWidgetItem, QVBoxLayout, QWidget, QAbstractItemView, QHeaderView,
 )
 
 from .panel import estilo_tarjeta
 from .prediccion import tipo_columna
+from . import analisis_guardados as _ag
 from .ajustes import aplicar_ajustes
+from .formato import dec
+from .avisos import CRITICO, ETIQUETA as ETIQUETA_AVISO, IMPORTANTE
 from .historial import limpiar as limpiar_historial, registrar_y_comparar
 from .pronostico_base import fecha_txt, num_txt
 from .pronosticos import (
@@ -50,6 +53,7 @@ VERDE = "#34d399"
 AMBAR = "#fbbf24"
 ROJO = "#f87171"
 GRIS = "#71717a"
+MAX_AVISOS_VISIBLES = 3        # el resto queda tras «Ver más» (los críticos siempre se ven)
 FUENTE_SERIF = '"Palatino Linotype", "Book Antiqua", Palatino, Georgia, serif'
 REGLA = "rgba(127,127,127,0.30)"
 COLOR_NIVEL = {"info": ACENTO, "atencion": AMBAR, "alerta": ROJO}
@@ -128,6 +132,10 @@ class PanelPalabras(QWidget):
         self._cargando = False
         self._firma_tablas = None
         self._hilo = None
+        self._propuestas = {}         # columnas que Hadar propuso solo (campo -> columna), para marcarlas como «propuestas»
+        self._experto_abierto = False  # el bloque «modo experto» empieza cerrado
+        self._guardados = []          # análisis guardados con nombre (solo la configuración; ver analisis_guardados.py)
+        self._refrescando_guardados = False
         self._historial = []          # resumen de cada ejecución (se guarda en el proyecto; ver historial.py)
         self._resultado = None
         self._contexto_pdf = None        # foto de lo calculado (para el PDF)
@@ -205,6 +213,20 @@ class PanelPalabras(QWidget):
         self.lbl_ejemplos.setObjectName("muted")
         self.lbl_ejemplos.setWordWrap(True)
         l1.addWidget(self.lbl_ejemplos)
+        fila_guardados = QHBoxLayout()           # análisis guardados con nombre
+        self.combo_guardados = QComboBox()
+        self.combo_guardados.setMaximumWidth(300)
+        self.combo_guardados.currentIndexChanged.connect(self._abrir_analisis)
+        fila_guardados.addWidget(self.combo_guardados)
+        self.btn_guardar_an = QPushButton("Guardar este análisis…")
+        self.btn_guardar_an.clicked.connect(self._guardar_analisis)
+        fila_guardados.addWidget(self.btn_guardar_an)
+        self.btn_borrar_an = QPushButton("Borrar")
+        self.btn_borrar_an.clicked.connect(self._borrar_analisis)
+        fila_guardados.addWidget(self.btn_borrar_an)
+        fila_guardados.addStretch(1)
+        l1.addLayout(fila_guardados)
+        self._refrescar_guardados()
         lay.addWidget(self.card_pregunta)
 
         # 2. Los datos
@@ -225,6 +247,11 @@ class PanelPalabras(QWidget):
         self.grid.setVerticalSpacing(8)
         self.grid.setColumnStretch(2, 1)
         l2.addLayout(self.grid)
+        self.lbl_propuestas = QLabel("")
+        self.lbl_propuestas.setObjectName("muted")
+        self.lbl_propuestas.setWordWrap(True)
+        self.lbl_propuestas.setVisible(False)
+        l2.addWidget(self.lbl_propuestas)
         nota = QLabel("* obligatorio")
         nota.setObjectName("muted")
         l2.addWidget(nota)
@@ -283,11 +310,14 @@ class PanelPalabras(QWidget):
             self._leer_formulario()
         d = self._cfg.to_dict()
         d["historial"] = list(self._historial)
+        d["guardados"] = list(self._guardados)
         return d
 
     def cargar_config(self, datos):
         self._cfg = ConfigPronostico.from_dict(datos)
         self._historial = limpiar_historial((datos or {}).get("historial") if isinstance(datos, dict) else None)
+        self._guardados = _ag.limpiar((datos or {}).get("guardados") if isinstance(datos, dict) else None)
+        self._refrescar_guardados()
         if self._cfg.palabra not in PALABRAS_CLAVE:
             self._cfg.palabra = "proyeccion"
         self._resultado = None
@@ -389,6 +419,70 @@ class PanelPalabras(QWidget):
             if solo_vacios and actual is not None and actual in cols:
                 continue
             setattr(self._cfg, campo, valor)
+            self._propuestas[campo] = valor
+
+    # ------------------------------------------------------------------
+    # Análisis guardados con nombre
+    # ------------------------------------------------------------------
+    def _refrescar_guardados(self, seleccionar=None):
+        self._refrescando_guardados = True
+        try:
+            self.combo_guardados.clear()
+            self.combo_guardados.addItem("Mis análisis guardados…")
+            self.combo_guardados.addItems(_ag.nombres(self._guardados))
+            i = self.combo_guardados.findText(seleccionar) if seleccionar else -1
+            self.combo_guardados.setCurrentIndex(max(i, 0))
+        finally:
+            self._refrescando_guardados = False
+        hay = len(self._guardados) > 0
+        self.combo_guardados.setVisible(hay)
+        self.btn_borrar_an.setVisible(hay)
+
+    def _guardar_analisis(self):
+        self._leer_formulario()
+        nombre, ok = QInputDialog.getText(self, "Guardar análisis", "Nombre del análisis (por ejemplo «Ventas por sucursal»):")
+        if not ok:
+            return
+        try:
+            _ag.guardar(self._guardados, nombre, self._cfg.to_dict())
+        except ValueError as e:
+            QMessageBox.warning(self, "No se pudo guardar", str(e))
+            return
+        self._refrescar_guardados(seleccionar=" ".join(nombre.split()))
+        self.lbl_estado.setText(f"Análisis guardado: «{' '.join(nombre.split())}».")
+
+    def _abrir_analisis(self, idx):
+        if self._refrescando_guardados or idx <= 0:
+            return
+        nombre = self.combo_guardados.itemText(idx)
+        d = _ag.obtener(self._guardados, nombre)
+        if d is None:
+            return
+        self.cargar_config({**d, "historial": self._historial, "guardados": self._guardados})
+        self._refrescar_guardados(seleccionar=nombre)       # la lista muestra el análisis abierto (y «Borrar» sabe cuál es)
+        self.lbl_estado.setText("Análisis abierto: revisa las columnas y pulsa Calcular.")
+
+    def _borrar_analisis(self):
+        idx = self.combo_guardados.currentIndex()
+        if idx <= 0:
+            QMessageBox.information(self, "Borrar análisis", "Elige primero el análisis que quieres borrar en la lista.")
+            return
+        nombre = self.combo_guardados.itemText(idx)
+        if QMessageBox.question(self, "Borrar análisis", f"¿Borrar «{nombre}»?") != QMessageBox.Yes:
+            return
+        _ag.borrar(self._guardados, nombre)
+        self._refrescar_guardados()
+
+    def _actualizar_propuestas(self):
+        """Avisa qué columnas eligió Hadar por su cuenta (y que se pueden cambiar). Desaparece lo que el usuario cambió."""
+        spec = PALABRAS_CLAVE[self._cfg.palabra]
+        etiquetas = {c["campo"]: c["etiqueta"] for c in spec["campos"]}
+        vigentes = [(etiquetas[c], v) for c, v in self._propuestas.items()
+                    if c in etiquetas and getattr(self._cfg, c, None) == v]
+        if vigentes:
+            self.lbl_propuestas.setText("Hadar propuso estas columnas: " + "; ".join(f"{e} → «{v}»" for e, v in vigentes)
+                                        + ". Revísalas y cámbialas si no son las que quieres antes de calcular.")
+        self.lbl_propuestas.setVisible(bool(vigentes))
 
     def _sugerir_todo(self):
         self._leer_formulario()
@@ -477,6 +571,7 @@ class PanelPalabras(QWidget):
         if "entidad" in self._widgets and "columna_entidad" in self._widgets:
             self._widgets["columna_entidad"][0].currentIndexChanged.connect(self._llenar_valores_entidad)
             self._llenar_valores_entidad()
+        self._actualizar_propuestas()
 
     def _llenar_valores_entidad(self, *_):
         par_e, par_c = self._widgets.get("entidad"), self._widgets.get("columna_entidad")
@@ -581,6 +676,7 @@ class PanelPalabras(QWidget):
         if self._hilo is not None:
             return
         self._leer_formulario()
+        self._actualizar_propuestas()
         if self._errores_form:
             self.lbl_estado.setText(" ".join(self._errores_form))
             return
@@ -695,9 +791,34 @@ class PanelPalabras(QWidget):
         if r.supuestos:
             self.res_lay.addWidget(self._titulo_chico("Qué asume Hadar"))
             self.res_lay.addWidget(self._parrafo(" ".join(r.supuestos), muted=True))
-        for aviso in r.advertencias:
-            self.res_lay.addWidget(self._parrafo(f'<span style="color:{AMBAR}">Ojo:</span> {_esc(aviso)}'))
-            self.res_lay.itemAt(self.res_lay.count() - 1).widget().setTextFormat(Qt.RichText)
+        # Avisos: los críticos primero (una fuga de datos siempre arriba y siempre visible); se ven 3 y el resto con «ver más»
+        color_aviso = {CRITICO: ROJO, IMPORTANTE: AMBAR}
+        ocultos = []
+        for i, aviso in enumerate(r.avisos_ordenados()):
+            lbl = self._parrafo(f'<span style="color:{color_aviso.get(aviso.nivel, GRIS)}">'
+                                f'{ETIQUETA_AVISO[aviso.nivel]}:</span> {_esc(aviso)}')
+            lbl.setTextFormat(Qt.RichText)
+            self.res_lay.addWidget(lbl)
+            if i >= MAX_AVISOS_VISIBLES and aviso.nivel != CRITICO:
+                lbl.setVisible(False)
+                ocultos.append(lbl)
+        if ocultos:
+            btn_mas = QPushButton(f"Ver {len(ocultos)} aviso(s) más")
+            btn_mas.setCursor(Qt.PointingHandCursor)
+            btn_mas.setStyleSheet(f"QPushButton{{background: transparent; color: {ACENTO}; border: none; "
+                                  f"text-align: left; padding: 2px 0;}} QPushButton:hover{{text-decoration: underline;}}")
+
+            def _alternar(_=None, b=btn_mas, ls=tuple(ocultos)):
+                mostrar = not ls[0].isVisible()
+                for x in ls:
+                    x.setVisible(mostrar)
+                b.setText("Ver menos avisos" if mostrar else f"Ver {len(ls)} aviso(s) más")
+            btn_mas.clicked.connect(_alternar)
+            self.res_lay.addWidget(btn_mas, 0, Qt.AlignLeft)
+
+        self._experto_abierto = False
+        if getattr(r, "experto", None):
+            self._agregar_modo_experto(r.experto)
 
         fila_btn = QHBoxLayout()
         btn = QPushButton("Copiar resumen")
@@ -711,6 +832,9 @@ class PanelPalabras(QWidget):
         accion_res = menu_pdf.addAction("Solo los resultados")
         accion_todo.triggered.connect(lambda: self._exportar_pdf("todo"))
         accion_res.triggered.connect(lambda: self._exportar_pdf("resultados"))
+        if getattr(r, "experto", None):
+            accion_tec = menu_pdf.addAction("Todo, con detalles técnicos")
+            accion_tec.triggered.connect(lambda: self._exportar_pdf("todo", tecnico=True))
         self.btn_pdf.setMenu(menu_pdf)
         # la flecha ya va en el texto: se oculta la que dibuja Qt para que no salgan dos
         self.btn_pdf.setStyleSheet("QPushButton::menu-indicator { image: none; width: 0px; }")
@@ -720,7 +844,7 @@ class PanelPalabras(QWidget):
         self.res_lay.addLayout(fila_btn)
         self.card_resultado.setVisible(True)
 
-    def _exportar_pdf(self, modo):
+    def _exportar_pdf(self, modo, tecnico=False):
         """modo = "todo" (configuración + respuesta) o "resultados" (solo la respuesta)."""
         if self._resultado is None or self._contexto_pdf is None:
             return
@@ -740,6 +864,7 @@ class PanelPalabras(QWidget):
             ruta += ".pdf"
         QApplication.setOverrideCursor(Qt.WaitCursor)
         try:
+            self._contexto_pdf.con_tecnico = bool(tecnico)
             exportar_pdf_pregunta(ruta, self._resultado, self._contexto_pdf, modo)
         except Exception as e:
             QApplication.restoreOverrideCursor()
@@ -787,6 +912,88 @@ class PanelPalabras(QWidget):
             lay.addWidget(self._parrafo(f"Se muestran las primeras {_MAX_FILAS_TABLA} filas de {len(df)}.", muted=True))
             return cont
         return tabla
+
+    # ------------------------------------------------------------------
+    # Modo experto: detalles técnicos, plegados (cerrado por defecto)
+    # ------------------------------------------------------------------
+    def _agregar_modo_experto(self, x):
+        btn = QPushButton("Detalles técnicos (modo experto) ▸")
+        btn.setCursor(Qt.PointingHandCursor)
+        btn.setStyleSheet(f"QPushButton{{background: transparent; color: {ACENTO}; border: none; text-align: left; "
+                          f"padding: 6px 0; font-weight: 600;}} QPushButton:hover{{text-decoration: underline;}}")
+        cuerpo = self._bloque_experto(x)
+        cuerpo.setVisible(False)
+
+        def _alternar(_=None, b=btn, c=cuerpo):
+            self._experto_abierto = not c.isVisible()
+            c.setVisible(self._experto_abierto)
+            b.setText("Detalles técnicos (modo experto) ▾" if self._experto_abierto else "Detalles técnicos (modo experto) ▸")
+        btn.clicked.connect(_alternar)
+        self.res_lay.addWidget(btn, 0, Qt.AlignLeft)
+        self.res_lay.addWidget(cuerpo)
+
+    def _bloque_experto(self, x):
+        cont = QWidget()
+        lay = QVBoxLayout(cont)
+        lay.setContentsMargins(0, 4, 0, 4)
+        lay.setSpacing(8)
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(16)
+        grid.setVerticalSpacing(4)
+        for i, (etiqueta, valor) in enumerate(x.get("filas", [])):
+            a = QLabel(str(etiqueta))
+            a.setObjectName("muted")
+            a.setWordWrap(True)
+            b = QLabel(str(valor))
+            b.setWordWrap(True)
+            b.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            grid.addWidget(a, i, 0, Qt.AlignTop)
+            grid.addWidget(b, i, 1, Qt.AlignTop)
+        grid.setColumnStretch(1, 1)
+        lay.addLayout(grid)
+        if x.get("metodos"):
+            lay.addWidget(self._titulo_chico(x.get("metodos_titulo", "Métodos probados")))
+            lay.addWidget(self._tabla(pd.DataFrame({"Método": [n for n, _ in x["metodos"]],
+                                                    "Error": [dec(v, 3) for _, v in x["metodos"]]})))
+        g = self._histograma_residuos(x.get("residuos"))
+        if g is not None:
+            lay.addWidget(self._titulo_chico(x.get("residuos_titulo") or "Errores en las pruebas pasadas"))
+            lay.addWidget(g)
+        return cont
+
+    def _histograma_residuos(self, residuos):
+        """Distribución de los errores (estilo Tufte: poca tinta, sin cuadrícula). Una línea marca el 0 (acertar);
+        las barras de los casos más atípicos (fuera del 5%-95%) se pintan en ámbar."""
+        if pg is None or not residuos or len(residuos) < 5:
+            return None
+        try:
+            r = np.asarray(residuos, dtype=float)
+            r = r[np.isfinite(r)]
+            tope = float(np.max(np.abs(r))) or 1.0
+            cuentas, bordes = np.histogram(r, bins=21, range=(-tope, tope))
+            centros = (bordes[:-1] + bordes[1:]) / 2
+            ancho = float(bordes[1] - bordes[0]) * 0.9
+            lo, hi = np.percentile(r, [5, 95])
+            fondo = self.colors.get("bg", "#000000") if isinstance(self.colors, dict) else "#000000"
+            plot = _GraficoEstatico(background=fondo)
+            plot.setMinimumHeight(170)
+            plot.setMaximumHeight(210)
+            plot.setMenuEnabled(False)
+            plot.hideButtons()
+            plot.showGrid(x=False, y=False)
+            plot.setLabel("left", "casos")
+            for eje in ("bottom", "left"):
+                ax = plot.getAxis(eje)
+                ax.setPen(pg.mkPen(GRIS, width=1))
+                ax.setTextPen(pg.mkPen("#a1a1aa"))
+            normal = np.array([lo <= c <= hi for c in centros])
+            for mascara, color in ((normal, "#a1a1aa"), (~normal, AMBAR)):
+                if mascara.any():
+                    plot.addItem(pg.BarGraphItem(x=centros[mascara], height=cuentas[mascara], width=ancho, brush=pg.mkBrush(color), pen=pg.mkPen(None)))
+            plot.addItem(pg.InfiniteLine(pos=0.0, angle=90, pen=pg.mkPen(ACENTO, width=1.5)))
+            return plot
+        except Exception:
+            return None
 
     def _grafico(self, g):
         if pg is None or not g:

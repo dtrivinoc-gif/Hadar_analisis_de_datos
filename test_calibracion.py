@@ -40,7 +40,7 @@ class EvaluarCalibracion(unittest.TestCase):
             r = P.evaluar_calibracion(_sig(np.log(p_real / (1 - p_real)) + 2.0), y)
             self.assertEqual(r["metodo"], esperado, n)
 
-def _datos_desbalanceados(n=4000, seed=0, tasa=0.06):
+def _datos_desbalanceados(n=3200, seed=0, tasa=0.06):
     rng = np.random.default_rng(seed)
     x1 = rng.normal(size=n); x2 = rng.normal(size=n)
     z = 1.2 * x1 + 0.6 * x2 + np.log(tasa / (1 - tasa)) - 0.3

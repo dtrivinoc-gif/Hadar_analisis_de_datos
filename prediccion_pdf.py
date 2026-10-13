@@ -21,6 +21,13 @@ from dataclasses import dataclass, field
 from datetime import datetime
 
 import numpy as np
+
+try:
+    from .avisos import ETIQUETA as ETIQUETA_AVISO, ordenar_avisos
+    from .formato import dec
+except ImportError:  # pruebas sueltas fuera del paquete
+    from avisos import ETIQUETA as ETIQUETA_AVISO, ordenar_avisos
+    from formato import dec
 from PySide6.QtCore import QMarginsF, QPointF, QRectF, QSizeF, Qt, QUrl
 from PySide6.QtGui import (QColor, QFont, QFontMetrics, QImage, QPageLayout, QPageSize,
                            QPainter, QPdfWriter, QPen, QTextCursor, QTextDocument, QTextFormat, QTextTable)
@@ -336,28 +343,28 @@ def _filas_metricas(r):
                       _fmt(b.get("rmse")) if b.get("rmse") else "—",
                       _fmt(b["lineal_rmse"]) if b.get("lineal_rmse") else "—"))
         filas.append(("Error promedio absoluto (MAE)", _fmt(m["mae"]), mas_menos("mae", _fmt), "—", "—"))
-        filas.append(("Variación explicada (R²)", f"{m['r2']:.3f}", mas_menos("r2", lambda v: f"{v:.3f}"), "—", "—"))
+        filas.append(("Variación explicada (R²)", f"{dec(m['r2'], 3)}", mas_menos("r2", lambda v: f"{dec(v, 3)}"), "—", "—"))
         return filas
-    filas.append(("Aciertos", _pct(m["accuracy"]), mas_menos("accuracy", lambda v: f"{v * 100:.1f} pts"),
+    filas.append(("Aciertos", _pct(m["accuracy"]), mas_menos("accuracy", lambda v: f"{dec(v * 100, 1)} pts"),
                   _pct(b.get("accuracy")), "—"))
     filas.append(("Aciertos parejos entre clases", _pct(m["bal_acc"]),
-                  mas_menos("bal_acc", lambda v: f"{v * 100:.1f} pts"), _pct(b.get("bal_acc")),
+                  mas_menos("bal_acc", lambda v: f"{dec(v * 100, 1)} pts"), _pct(b.get("bal_acc")),
                   _pct(b.get("lineal_bal_acc"))))
-    filas.append(("Equilibrio entre clases (F1)", _pct(m["f1"]), mas_menos("f1", lambda v: f"{v * 100:.1f} pts"), "—", "—"))
+    filas.append(("Equilibrio entre clases (F1)", _pct(m["f1"]), mas_menos("f1", lambda v: f"{dec(v * 100, 1)} pts"), "—", "—"))
     if m.get("auc") is not None:
-        filas.append(("Separa las clases (AUC)", f"{m['auc']:.3f}", mas_menos("auc", lambda v: f"{v:.3f}"), "0.500 (azar)", "—"))
+        filas.append(("Separa las clases (AUC)", f"{dec(m['auc'], 3)}", mas_menos("auc", lambda v: f"{dec(v, 3)}"), f"{dec(0.5, 3)} (azar)", "—"))
     if m.get("logloss") is not None:
-        filas.append(("Pérdida logarítmica (menor es mejor)", f"{m['logloss']:.3f}",
-                      mas_menos("logloss", lambda v: f"{v:.3f}"), "—", "—"))
+        filas.append(("Pérdida logarítmica (menor es mejor)", f"{dec(m['logloss'], 3)}",
+                      mas_menos("logloss", lambda v: f"{dec(v, 3)}"), "—", "—"))
     if m.get("recall_min") is not None:
         filas.append((f"Casos «{r.clase_minoritaria}» detectados", _pct(m["recall_min"]),
-                      mas_menos("recall_min", lambda v: f"{v * 100:.1f} pts"), "—", "—"))
+                      mas_menos("recall_min", lambda v: f"{dec(v * 100, 1)} pts"), "—", "—"))
     if m.get("precision_min") is not None:
         filas.append((f"Alarmas «{r.clase_minoritaria}» correctas", _pct(m["precision_min"]),
-                      mas_menos("precision_min", lambda v: f"{v * 100:.1f} pts"), "—", "—"))
+                      mas_menos("precision_min", lambda v: f"{dec(v * 100, 1)} pts"), "—", "—"))
     if m.get("ap") is not None:
-        filas.append(("Precisión promedio de la clase rara", f"{m['ap']:.3f}",
-                      mas_menos("ap", lambda v: f"{v:.3f}"), f"{b.get('ap', 0):.3f}" if b.get("ap") is not None else "—", "—"))
+        filas.append(("Precisión promedio de la clase rara", f"{dec(m['ap'], 3)}",
+                      mas_menos("ap", lambda v: f"{dec(v, 3)}"), f"{dec(b.get('ap', 0), 3)}" if b.get("ap") is not None else "—", "—"))
     return filas
 
 
@@ -376,7 +383,7 @@ def _html_cabecera(r, ctx, modo, ahora) -> str:
               f'{_esc(sub)} · Hadar · {_esc(ahora)}</p>']
     if modo == "resultados":
         linea = [f"Tabla de entrenamiento: {cfg.get('tabla_entrenamiento') or '—'}", _texto_tipo(r, cfg),
-                 f"{r.n_entrenamiento:,} filas de entrenamiento · {r.n_validacion:,} de prueba"]
+                 f"{dec(r.n_entrenamiento, 0, True)} filas de entrenamiento · {dec(r.n_validacion, 0, True)} de prueba"]
         partes.append(f'<p style="margin-top:0; font-size:9pt; color:{GRIS};">{_esc(" · ".join(linea))}</p>')
     return "".join(partes)
 
@@ -412,8 +419,8 @@ def _html_configuracion(r, ctx) -> str:
     if modo == "grupos" and cfg.get("columna_grupo"):
         filas.append(("Columna de grupos", cfg["columna_grupo"]))
     filas.append(("Cuántas pruebas se hicieron", str(r.n_pliegues)))
-    filas.append(("Filas de entrenamiento por prueba (aprox.)", f"{r.n_entrenamiento:,}"))
-    filas.append(("Filas de prueba (en total)", f"{r.n_validacion:,}"))
+    filas.append(("Filas de entrenamiento por prueba (aprox.)", f"{dec(r.n_entrenamiento, 0, True)}"))
+    filas.append(("Filas de prueba (en total)", f"{dec(r.n_validacion, 0, True)}"))
     if r.tipo == "clasificacion":
         pref = {"auto": "Automático", "si": "Siempre", "no": "Nunca"}.get(cfg.get("balancear", "auto"), "")
         filas.append(("Más peso a la clase poco frecuente",
@@ -429,7 +436,7 @@ def _html_configuracion(r, ctx) -> str:
         ("Iteraciones usadas en el modelo final", str(r.n_iteraciones)),
         ("Tasa de aprendizaje", str(cfg.get("tasa_aprendizaje", "—"))),
         ("Profundidad máxima de los árboles", str(prof) if prof else "automática"),
-        ("Máximo de filas para entrenar", f"{int(cfg.get('max_filas', 0)):,}"),
+        ("Máximo de filas para entrenar", f"{dec(int(cfg.get('max_filas', 0)), 0, True)}"),
         ("Semilla", str(cfg.get("semilla", 0))),
     ]
     out.append(_tabla_clave_valor(filas))
@@ -490,8 +497,9 @@ def _html_resultados(r, ctx, modo, rev, b: _Constructor) -> str:
     # 1) veredicto
     out.append(f'<p style="margin-top:{_p(8)}px; font-size:13pt; color:{TINTA};">'
                f'<span style="color:{color}; font-weight:600;">{_esc(titulo)}.</span> {_esc(frase)}</p>')
-    for aviso in r.advertencias:
-        out.append(_nota("Nota: " + aviso, AMBAR))
+    color_aviso = {"critico": ROJO, "importante": AMBAR}
+    for aviso in ordenar_avisos(r.advertencias):       # el PDF respeta el orden: críticos, importantes, notas
+        out.append(_nota(f"{ETIQUETA_AVISO[aviso.nivel]}: " + aviso, color_aviso.get(aviso.nivel, GRIS)))
 
     # 2) tres cifras
     celdas = []
@@ -516,7 +524,7 @@ def _html_resultados(r, ctx, modo, rev, b: _Constructor) -> str:
     out.append(_subtitulo("El modelo frente a la respuesta fácil", 140))
     if r.tipo == "regresion":
         rb = max(base.get("rmse", 0.0), 1e-12)
-        brecha = f"{(1 - m['rmse'] / rb) * 100:.0f}% menos error" if m["rmse"] < rb else "sin mejora"
+        brecha = f"{dec((1 - m['rmse'] / rb) * 100, 0)}% menos error" if m["rmse"] < rb else "sin mejora"
         out.append(_nota("Más a la izquierda = menos error."))
         out.append(b.figura(_fig_mancuerna(m["rmse"], rb, max(m["rmse"], rb), f"con el modelo  {_fmt(m['rmse'])}",
                                            f"respondiendo el promedio  {_fmt(rb)}", brecha), ANCHO_FIG))
@@ -524,13 +532,13 @@ def _html_resultados(r, ctx, modo, rev, b: _Constructor) -> str:
         bal, fb = m["bal_acc"] * 100, base["bal_acc"] * 100
         out.append(_nota("Con clases muy desparejas, acertar en general no mide nada: se compara cuánto acierta en "
                          "cada clase por igual. Más a la derecha = mejor."))
-        out.append(b.figura(_fig_mancuerna(bal, fb, 100, f"modelo  {bal:.0f}%", f"siempre la clase más frecuente  {fb:.0f}%",
-                                           f"+{bal - fb:.0f} puntos" if bal > fb else "sin mejora"), ANCHO_FIG))
+        out.append(b.figura(_fig_mancuerna(bal, fb, 100, f"modelo  {dec(bal, 0)}%", f"siempre la clase más frecuente  {dec(fb, 0)}%",
+                                           f"+{dec(bal - fb, 0)} puntos" if bal > fb else "sin mejora"), ANCHO_FIG))
     else:
         acc, fac = m["accuracy"] * 100, base["accuracy"] * 100
         out.append(_nota("Más a la derecha = más aciertos."))
-        out.append(b.figura(_fig_mancuerna(acc, fac, 100, f"modelo  {acc:.0f}%", f"siempre la clase más frecuente  {fac:.0f}%",
-                                           f"+{acc - fac:.0f} puntos" if acc > fac else "sin mejora"), ANCHO_FIG))
+        out.append(b.figura(_fig_mancuerna(acc, fac, 100, f"modelo  {dec(acc, 0)}%", f"siempre la clase más frecuente  {dec(fac, 0)}%",
+                                           f"+{dec(acc - fac, 0)} puntos" if acc > fac else "sin mejora"), ANCHO_FIG))
     ref = r.texto_lineal()
     if ref:
         out.append(_nota(ref))
@@ -540,14 +548,14 @@ def _html_resultados(r, ctx, modo, rev, b: _Constructor) -> str:
         out.append(_subtitulo("Resultado en cada prueba", 90 + 22 * min(r.n_pliegues, 10)))
         out.append(_nota("Cuánto del error de la respuesta fácil evita el modelo en cada prueba (0% = nada, 100% = todo). "
                          "Si los puntos están muy separados, el resultado es aproximado."))
-        filas = [(f"Prueba {i + 1}", v * 100, ACENTO, f"{v * 100:.0f}%") for i, v in enumerate(r.mejoras_pliegue)]
+        filas = [(f"Prueba {i + 1}", v * 100, ACENTO, f"{dec(v * 100, 0)}%") for i, v in enumerate(r.mejoras_pliegue)]
         out.append(b.figura(_fig_puntos(filas, ancho_etiqueta=120), ANCHO_FIG))
 
     # 6) columnas
     if r.importancias:
         out.append(_subtitulo("En qué columnas se fijó más", 90 + 22 * min(len(r.importancias), 12)))
         out.append(_nota("Cuánto ayudó cada columna a adivinar. Todas suman 100%."))
-        filas = [(str(c), pct, ACENTO, "<1%" if pct < 1 else f"{pct:.0f}%") for c, pct in r.importancias[:12]]
+        filas = [(str(c), pct, ACENTO, "<1%" if pct < 1 else f"{dec(pct, 0)}%") for c, pct in r.importancias[:12]]
         out.append(b.figura(_fig_puntos(filas), ANCHO_FIG))
         if len(r.importancias) > 12:
             out.append(_nota(f"Se muestran las 12 primeras de {len(r.importancias)}."))
@@ -604,7 +612,7 @@ def _html_revision(r, rev) -> str:
                           ("+" if d > 0 else "−") + _fmt(abs(d))))
         else:
             filas.append((str(cols[0][1][i]), texto(cols[1][1][i]), texto(cols[2][1][i]),
-                          f"{float(cols[3][1][i]) * 100:.0f}%"))
+                          f"{dec(float(cols[3][1][i]) * 100, 0)}%"))
     # el color de la última columna depende de la fila: se arma a mano
     out.append(_tabla_revision(encabezados, filas, regresion))
     return "".join(out)

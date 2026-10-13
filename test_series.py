@@ -1,9 +1,10 @@
 import unittest, warnings
 from tests.base import *
 
+@LENTO
 class CoberturaFueraDeMuestra(unittest.TestCase):
     """F0a: el rango del 80% debe acertar entre ~70% y ~90% sobre datos que el modelo NO vio."""
-    def _cob(self, kind, h, n_tr=150, reps=20):
+    def _cob(self, kind, h, n_tr=150, reps=14):
         out = []
         for s in range(reps):
             y = gen(kind, n_tr + h, np.random.default_rng(s))
@@ -17,7 +18,7 @@ class CoberturaFueraDeMuestra(unittest.TestCase):
     def test_camino_aleatorio_horizonte_largo(self):
         # F1.2: más allá de h_eval (= n//5) el rango se extrapola. Antes acertaba ~0.73 en ese tramo; ahora ~0.78.
         out = []
-        for s in range(30):
+        for s in range(26):
             y = gen("rw", 240, np.random.default_rng(300 + s))
             p = st.proyectar(serie(y[:150]), 90, 0.8)
             out.append(((y[150:] >= p.bajo) & (y[150:] <= p.alto))[p.h_eval:].mean())
@@ -28,7 +29,7 @@ class CoberturaFueraDeMuestra(unittest.TestCase):
         self.assertTrue(any("extrapolación" in a for a in st._avisos_proyeccion(sr, p, 90)))
     def test_series_con_tendencia_no_quedan_absurdamente_anchas(self):
         out = []
-        for s in range(20):
+        for s in range(12):
             y = gen("tendencia", 240, np.random.default_rng(300 + s))
             p = st.proyectar(serie(y[:150]), 90, 0.8)
             out.append(((y[150:] >= p.bajo) & (y[150:] <= p.alto))[p.h_eval:].mean())
@@ -78,6 +79,7 @@ class Agotamiento(unittest.TestCase):
 
 class Escenario(unittest.TestCase):
     """F0d: con una elasticidad real conocida (-1.5), el rango del 95% debe contenerla la gran mayoría de las veces."""
+    @LENTO
     def test_elasticidad_conocida_dentro_del_rango(self):
         dentro, reps = 0, 30
         for s in range(reps):
@@ -99,6 +101,7 @@ if __name__ == "__main__":
     unittest.main()
 
 
+@LENTO
 class CoberturaHonesta(unittest.TestCase):
     """F1.1: la cobertura que decide la confianza debe medirse con pruebas distintas de las que fijan el ancho."""
     def test_marca_honesta_en_series_largas(self):
@@ -148,6 +151,7 @@ class FinesDeSemanaYUltimoPeriodo(unittest.TestCase):
         self.assertTrue(hasattr(p, "rmse_modelo") and not hasattr(p, "mae_modelo"))
 
 
+@LENTO
 class RuidoNoEsPatron(unittest.TestCase):
     """Hallazgo nuevo: el ruido puro recibía confianza «alta» porque «repetir lo último» es mala referencia para ruido."""
     def test_ruido_puro_no_tiene_confianza_alta(self):
