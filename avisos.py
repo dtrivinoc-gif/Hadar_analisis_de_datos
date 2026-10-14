@@ -69,6 +69,10 @@ NIVEL_POR_FRASE = [
     (IMPORTANTE, "parece un puntaje u orden"),
     (IMPORTANTE, "Sin columna de impacto"),
     (IMPORTANTE, "no se usaron"),
+    (IMPORTANTE, "tiene fechas posteriores a la fecha de la fila"),
+    (IMPORTANTE, "no tiene dato en"),
+    (IMPORTANTE, "ver el futuro"),
+    (IMPORTANTE, "puede incluir información posterior"),
     (IMPORTANTE, "No hay fecha de inicio de cada elemento"),
 ]
 

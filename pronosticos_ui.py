@@ -421,6 +421,11 @@ class PanelPalabras(QWidget):
             setattr(self._cfg, campo, valor)
             self._propuestas[campo] = valor
 
+    def _ajuste(self, nombre, defecto=None):
+        """Lee un ajuste del proyecto (pestaña «Ajustes»). Sin esa pestaña devuelve `defecto`."""
+        panel = getattr(self.host, "panel_ajustes", None)
+        return getattr(panel.ajustes, nombre, defecto) if panel is not None else defecto
+
     # ------------------------------------------------------------------
     # Análisis guardados con nombre
     # ------------------------------------------------------------------
@@ -711,11 +716,12 @@ class PanelPalabras(QWidget):
 
     def _fin_calculo(self, r):
         ctx = self._contexto_pendiente
-        try:    # compara con la última vez que se hizo este mismo análisis y guarda el resumen en el proyecto
-            avisos = registrar_y_comparar(self._historial, ctx.config, r, getattr(ctx, "n_filas", None))
-            r.advertencias = list(avisos) + list(r.advertencias)
-        except Exception:
-            pass                # el historial nunca debe impedir mostrar el resultado
+        if self._ajuste("comparar_ejecuciones") != "no":
+            try:    # compara con la última vez que se hizo este mismo análisis y guarda el resumen en el proyecto
+                avisos = registrar_y_comparar(self._historial, ctx.config, r, getattr(ctx, "n_filas", None))
+                r.advertencias = list(avisos) + list(r.advertencias)
+            except Exception:
+                pass            # el historial nunca debe impedir mostrar el resultado
         self._resultado = r
         self._contexto_pdf = ctx
         self.lbl_estado.setText("")
@@ -817,7 +823,7 @@ class PanelPalabras(QWidget):
             self.res_lay.addWidget(btn_mas, 0, Qt.AlignLeft)
 
         self._experto_abierto = False
-        if getattr(r, "experto", None):
+        if getattr(r, "experto", None) and self._ajuste("detalles_tecnicos") != "ocultos":
             self._agregar_modo_experto(r.experto)
 
         fila_btn = QHBoxLayout()
@@ -832,7 +838,7 @@ class PanelPalabras(QWidget):
         accion_res = menu_pdf.addAction("Solo los resultados")
         accion_todo.triggered.connect(lambda: self._exportar_pdf("todo"))
         accion_res.triggered.connect(lambda: self._exportar_pdf("resultados"))
-        if getattr(r, "experto", None):
+        if getattr(r, "experto", None) and self._ajuste("detalles_tecnicos") != "ocultos":
             accion_tec = menu_pdf.addAction("Todo, con detalles técnicos")
             accion_tec.triggered.connect(lambda: self._exportar_pdf("todo", tecnico=True))
         self.btn_pdf.setMenu(menu_pdf)

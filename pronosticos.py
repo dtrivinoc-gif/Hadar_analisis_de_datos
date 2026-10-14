@@ -67,6 +67,7 @@ class ConfigPronostico:
     fecha_corte: str | None = None
     fin_observacion: str = "auto"            # auto | global | ultimo_registro (hasta cuándo se observa a cada elemento)
     ceros_mismo_dia: str = "medio_dia"       # medio_dia | descartar (casos de 0 días con fechas sin hora)
+    fines_de_semana: str = "rellenar"        # rellenar (con 0 o valores intermedios) | ignorar (días hábiles si no hay datos en sáb/dom)
     dias_aviso_datos_antiguos: int = 45      # avisar si el último dato está a más de estos días de hoy
     # --- escenario ---
     columna_driver: str | None = None

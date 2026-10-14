@@ -33,6 +33,7 @@ DIAS_SEMANA = ["lunes", "martes", "miércoles", "jueves", "viernes", "sábado", 
 UNIDADES = {
     "H": ("hora", "horas"),
     "D": ("día", "días"),
+    "B": ("día hábil", "días hábiles"),
     "W": ("semana", "semanas"),
     "M": ("mes", "meses"),
 }

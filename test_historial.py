@@ -80,5 +80,28 @@ class Historial(unittest.TestCase):
         df = pd.DataFrame({"x": x, "y": (x + rng.normal(0, .5, n) > 0).astype(int)})
         r = pr.ejecutar(C(palabra="clasificacion", tabla="t", columna_objetivo="y"), {"t": df})
         self.assertIsNotNone(r.metricas.get("mejora"))
+
+class HistorialDeModelos(unittest.TestCase):
+    """«Entrenar un modelo» también compara con la última vez."""
+    def _res(self, ruido, n=500, seed=0):
+        import prediccion as P
+        rng = np.random.default_rng(seed); x = rng.normal(size=n)
+        df = pd.DataFrame({"x": x, "y": (x + rng.normal(0, ruido, n) > 0).astype(int)})
+        cfg = P.ConfigPrediccion(objetivo="y", tipo="clasificacion", pliegues=1)
+        return cfg, P.entrenar(df, cfg, ["x"])
+    def test_un_modelo_registra_su_mejora_y_avisa_si_cae(self):
+        cfg, r1 = self._res(0.3); _, r2 = self._res(5.0)
+        h = []
+        self.assertEqual(H.registrar_y_comparar(h, cfg.to_dict(), r1, 500, "2026-10-01"), [])
+        self.assertIsNotNone(h[0]["mejora"]); self.assertEqual(h[0]["palabra"], "modelo")
+        av = H.registrar_y_comparar(h, cfg.to_dict(), r2, 500, "2026-10-12")
+        print(f"\n[historial modelo] {h[0]['mejora']:.2f} → {h[1]['mejora']:.2f}: {av}")
+        self.assertTrue(av and "conviene revisar" in av[0])
+    def test_modelos_distintos_no_se_comparan_entre_si(self):
+        import prediccion as P
+        cfg, r = self._res(0.3)
+        otro = P.ConfigPrediccion(objetivo="otra_columna", tipo="clasificacion", pliegues=1)
+        h = []; H.registrar_y_comparar(h, cfg.to_dict(), r, 500, "2026-10-01")
+        self.assertEqual(H.registrar_y_comparar(h, otro.to_dict(), r, 500, "2026-10-02"), [])
 if __name__ == "__main__":
     unittest.main()

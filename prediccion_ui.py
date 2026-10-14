@@ -28,6 +28,7 @@ from PySide6.QtWidgets import (
 
 from .avisos import CRITICO, ETIQUETA as ETIQUETA_AVISO, IMPORTANTE, ordenar_avisos
 from .formato import dec
+from .historial import limpiar as limpiar_historial, registrar_y_comparar
 from .panel import estilo_tarjeta
 
 try:
@@ -228,6 +229,7 @@ class PanelPrediccion(QWidget):
         self.host = host
         self.colors = host.colors
         self._config = ConfigPrediccion()
+        self._historial = []          # resumen de cada entrenamiento (se guarda en el proyecto; ver historial.py)
         self._sugerencias = []
         self._cols_fecha = []
         self._resultado = None
@@ -266,6 +268,51 @@ class PanelPrediccion(QWidget):
             sub.setWordWrap(True)
             lay.addWidget(sub)
         return marco, lay
+
+    def _ajuste(self, nombre, defecto=None):
+        """Lee un ajuste del proyecto (pestaña «Ajustes»). Sin esa pestaña devuelve `defecto`."""
+        panel = getattr(self.host, "panel_ajustes", None)
+        return getattr(panel.ajustes, nombre, defecto) if panel is not None else defecto
+
+    def _agregar_modo_experto(self, lay, x):
+        """Bloque plegable (cerrado al comienzo) con los detalles técnicos del modelo."""
+        btn = QPushButton("Detalles técnicos (modo experto) ▸")
+        btn.setCursor(Qt.PointingHandCursor)
+        btn.setStyleSheet(f"QPushButton{{background: transparent; color: {ACENTO}; border: none; text-align: left; "
+                          f"padding: 6px 0; font-weight: 600;}} QPushButton:hover{{text-decoration: underline;}}")
+        cuerpo = QWidget()
+        cl = QVBoxLayout(cuerpo)
+        cl.setContentsMargins(0, 4, 0, 4)
+        cl.setSpacing(4)
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(16)
+        grid.setVerticalSpacing(4)
+        for i, (etiqueta, valor) in enumerate(x.get("filas", [])):
+            a = QLabel(str(etiqueta))
+            a.setObjectName("muted")
+            a.setWordWrap(True)
+            b = QLabel(str(valor))
+            b.setWordWrap(True)
+            b.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            grid.addWidget(a, i, 0, Qt.AlignTop)
+            grid.addWidget(b, i, 1, Qt.AlignTop)
+        grid.setColumnStretch(1, 1)
+        cl.addLayout(grid)
+        if x.get("metodos"):
+            cl.addWidget(self._titulo_chico(x.get("metodos_titulo", "Métodos probados")))
+            for nombre, err in x["metodos"]:
+                f = QLabel(f"{html.escape(str(nombre))}:  <b>{dec(err, 3)}</b>")
+                f.setTextFormat(Qt.RichText)
+                cl.addWidget(f)
+        cuerpo.setVisible(False)
+
+        def _alternar(_=None, b=btn, c=cuerpo):
+            abierto = not c.isVisible()
+            c.setVisible(abierto)
+            b.setText("Detalles técnicos (modo experto) ▾" if abierto else "Detalles técnicos (modo experto) ▸")
+        btn.clicked.connect(_alternar)
+        lay.addWidget(btn, 0, Qt.AlignLeft)
+        lay.addWidget(cuerpo)
 
     def _titulo_chico(self, texto):
         """Título de sección en versalitas, gris y discreto."""
@@ -622,10 +669,13 @@ class PanelPrediccion(QWidget):
         # borraría la configuración que el proyecto trae guardada.
         if self._firma_tablas is not None:
             self._leer_formulario()
-        return self._config.to_dict()
+        d = self._config.to_dict()
+        d["historial"] = list(self._historial)
+        return d
 
     def cargar_config(self, datos):
         self._config = ConfigPrediccion.from_dict(datos)
+        self._historial = limpiar_historial((datos or {}).get("historial") if isinstance(datos, dict) else None)
         self._resultado = None
         self._firma_tablas = None
         self._cargar_avanzado_desde_config()
@@ -913,7 +963,7 @@ class PanelPrediccion(QWidget):
         if prep.fecha_usada:
             texto += f" Los resúmenes usan solo lo anterior a la fecha «{prep.fecha_usada}» de cada fila."
         if prep.advertencias:
-            texto += "\n⚠ " + "\n⚠ ".join(prep.advertencias)
+            texto += "\n⚠ " + "\n⚠ ".join(ordenar_avisos(prep.advertencias))
         self.lbl_rel_info.setText(texto)
         return prep.df_entrenamiento, (prep.df_prueba if prep.df_prueba is not None else df_prueba)
 
@@ -1128,6 +1178,13 @@ class PanelPrediccion(QWidget):
         QMessageBox.warning(self, "No se pudo entrenar", mensaje)
 
     def _fin_entrenamiento(self, resultado):
+        if self._ajuste("comparar_ejecuciones") != "no":
+            try:    # compara con la última vez que se entrenó este mismo modelo y guarda el resumen en el proyecto
+                n = (resultado.n_entrenamiento or 0) + (resultado.n_validacion or 0)
+                resultado.advertencias = list(registrar_y_comparar(self._historial, self._config.to_dict(), resultado, n)) \
+                    + list(resultado.advertencias)
+            except Exception:
+                pass            # el historial nunca debe impedir mostrar el resultado
         self._resultado = resultado
         self.lbl_estado.setText("Listo.")
         try:
@@ -1292,6 +1349,13 @@ class PanelPrediccion(QWidget):
         info.setWordWrap(True)
         lay.addSpacing(6)
         lay.addWidget(info)
+
+        # 7) detalles técnicos plegados (cerrados al comienzo); se pueden ocultar en «Ajustes»
+        if self._ajuste("detalles_tecnicos") != "ocultos":
+            try:
+                self._agregar_modo_experto(lay, r.detalle_experto())
+            except Exception:
+                pass
 
     def _grafico_predicho_real(self, r):
         try:

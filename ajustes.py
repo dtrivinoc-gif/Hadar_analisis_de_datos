@@ -33,11 +33,24 @@ OPCIONES = [
      "Con fechas sin hora, un caso de 0 días significa «menos de un día». Descartarlos alarga el tiempo típico "
      "(se verían solo los casos que tardaron más).",
      [("medio_dia", "Contarlos como medio día (recomendado)"), ("descartar", "No usarlos (solo avisar)")]),
+    ("fines_de_semana", "Qué hacer si faltan siempre sábado y domingo",
+     "Si la tabla no tiene ningún dato en fin de semana (por ejemplo, un negocio que cierra), esos días pueden "
+     "rellenarse (con 0 si se suma, o con valores intermedios) o ignorarse: Hadar cuenta entonces los plazos en días "
+     "hábiles, de lunes a viernes. Si hay aunque sea un dato en fin de semana, no se ignoran.",
+     [("rellenar", "Rellenar esos días (recomendado)"), ("ignorar", "Ignorarlos: contar en días hábiles")]),
     ("validacion_con_fecha", "Cómo probar un modelo cuando la tabla tiene fechas",
      "Para saber si un modelo sirve, Hadar lo prueba con casos que no vio. «Por fecha» usa los casos más nuevos para "
      "probar y los más viejos para aprender, que es lo que pasará de verdad al predecir el futuro. Mezclar las filas al "
      "azar suele dar una nota más alta que la real cuando los datos cambian con el tiempo.",
      [("auto", "Por fecha si hay una fecha clara (recomendado)"), ("aleatoria", "Mezclar al azar (solo avisar)")]),
+    ("detalles_tecnicos", "Detalles técnicos (modo experto)",
+     "Debajo de cada resultado puede aparecer un bloque plegado, cerrado al comienzo, con cómo se probó el método, cuánto se "
+     "equivocó y contra qué se comparó. Es para quien quiera revisar los números; no hace falta abrirlo para usar el resultado.",
+     [("plegados", "Disponibles, plegados (recomendado)"), ("ocultos", "No mostrarlos")]),
+    ("comparar_ejecuciones", "Comparar con la última vez",
+     "Hadar guarda en el proyecto un resumen chico de cada análisis (fecha, cuánto mejoró, con cuántas filas; no los datos ni "
+     "el modelo) y avisa si hoy rinde distinto que la última vez, por ejemplo porque llegaron datos que cambiaron el comportamiento.",
+     [("si", "Sí, avisar y guardar el resumen (recomendado)"), ("no", "No guardar ni comparar")]),
     ("dias_aviso_datos_antiguos", "Avisar si el último dato es más viejo que…",
      "Las fechas y plazos se cuentan desde el último dato de la tabla, no desde hoy. Si ese dato es muy antiguo, "
      "Hadar lo avisa.",
@@ -51,7 +64,10 @@ class AjustesPrediccion:
     formato_numerico: str = "chileno"
     fin_observacion: str = "auto"
     ceros_mismo_dia: str = "medio_dia"
+    fines_de_semana: str = "rellenar"
     validacion_con_fecha: str = "auto"
+    detalles_tecnicos: str = "plegados"
+    comparar_ejecuciones: str = "si"
     dias_aviso_datos_antiguos: int = 45
 
     def to_dict(self) -> dict:
@@ -77,6 +93,7 @@ def aplicar_ajustes(cfg, ajustes) -> object:
     cfg.fin_observacion = a.fin_observacion
     cfg.ceros_mismo_dia = a.ceros_mismo_dia
     cfg.validacion = a.validacion_con_fecha
+    cfg.fines_de_semana = a.fines_de_semana
     cfg.dias_aviso_datos_antiguos = a.dias_aviso_datos_antiguos
     _base.set_formato_numerico(a.formato_numerico)
     return cfg

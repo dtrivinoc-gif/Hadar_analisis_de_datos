@@ -1033,13 +1033,10 @@ def _separar(tipo, config, yt, n, fechas=None, grupos=None):
     return list(KFold(n_splits=k, shuffle=True, random_state=semilla).split(idx))
 
 
-def entrenar(df: pd.DataFrame, config: ConfigPrediccion, columnas: list,
-             progreso=None, forzar_categoria=None) -> ResultadoEntrenamiento:
-    from sklearn.metrics import (accuracy_score, average_precision_score, balanced_accuracy_score,
-                                 f1_score, log_loss, mean_absolute_error, mean_squared_error,
-                                 precision_score, r2_score, recall_score, roc_auc_score)
-
-    prog = progreso or (lambda texto: None)
+def _preparar_datos(df, config, columnas, prog):
+    """Revisa lo que se pidió y deja listos los datos del modelo: (obj, columnas, pos, modo, datos, y_raw, advertencias).
+    Aquí viven las reglas de «no hay con qué»: columna objetivo, filas mínimas, muestra si es muy grande, validación elegida,
+    avisos de fecha y de filas idénticas."""
     obj = config.objetivo
     if not obj or obj not in df.columns:
         raise ValueError("Elige la columna que quieres predecir.")
@@ -1090,6 +1087,11 @@ def entrenar(df: pd.DataFrame, config: ConfigPrediccion, columnas: list,
             "Si una copia cae en el entrenamiento y otra en la prueba, la nota sale más alta que la real. "
             "Hadar no las borró: revisa si son repeticiones por error" + (" o prueba «por fecha»." if modo == "aleatoria" else "."))
 
+    return obj, columnas, pos, modo, datos, y_raw, advertencias
+
+
+def _preparar_objetivo(y_raw, config, obj):
+    """Qué se predice: (tipo, clases, y, yt). `y` es el valor real; `yt` el que ve el modelo (log o códigos de clase)."""
     tipo = inferir_tipo_problema(y_raw, config.tipo)
     clases = None
     if tipo == "regresion":
@@ -1117,14 +1119,11 @@ def entrenar(df: pd.DataFrame, config: ConfigPrediccion, columnas: list,
             )
         yt = pd.Categorical(y_raw.astype(object), categories=clases).codes.astype("int64")
         y = yt
+    return tipo, clases, y, yt
 
-    n = len(datos)
-    fechas = grupos = None
-    if modo == "temporal":
-        fechas = _a_datetime(datos[config.columna_fecha]).fillna(pd.Timestamp("1900-01-01")).to_numpy()
-    elif modo == "grupos":
-        grupos = pd.factorize(normalizar_clave(datos[config.columna_grupo]))[0]
 
+def _avisos_de_prueba(df, config, obj, modo, advertencias):
+    """Avisos sobre CÓMO se prueba: una columna que se repite (conviene probar por grupos) o una fecha (por fecha)."""
     # --- avisos útiles sobre cómo probar -------------------------------
     if modo == "aleatoria":
         repetidas = []
@@ -1142,6 +1141,9 @@ def entrenar(df: pd.DataFrame, config: ConfigPrediccion, columnas: list,
                 "Hay una columna de fecha. Si vas a predecir el futuro, prueba «Por fecha»: es más exigente y se "
                 "parece más a lo que pasará en la realidad.")
 
+
+def _avisos_de_fuga(datos, obj, columnas, tipo, advertencias):
+    """Columnas que podrían contener ya la respuesta (solo aviso; nunca se quitan columnas)."""
     # --- columnas que podrían contener ya la respuesta (solo aviso) ----
     sospechosas = diagnosticar_variables(datos, obj, columnas, tipo)
     if sospechosas:
@@ -1150,130 +1152,102 @@ def entrenar(df: pd.DataFrame, config: ConfigPrediccion, columnas: list,
             "Ojo, estas columnas podrían ser una trampa (ya contienen la respuesta o algo que solo se sabe "
             "después): " + lista + ". Si no las tendrías al momento de predecir, desmárcalas en el Paso 2.")
 
-    # --- partir en pruebas --------------------------------------------
-    partes = _separar(tipo, config, yt, n, fechas, grupos)
-    if any(len(a) < 10 or len(b) < 5 for a, b in partes):
-        raise ValueError("Hay muy pocas filas para separar una parte de prueba.")
-    usar_pesos = tipo == "clasificacion" and _usar_pesos(config, yt)
-    clase_min = None
-    if tipo == "clasificacion" and len(clases) == 2:
-        clase_min_cod = int(np.argmin(np.bincount(yt, minlength=2)))
-        clase_min = clases[clase_min_cod]
 
-    por_pliegue, base_pliegue, mejoras = [], [], []
-    importancia_total = {}
-    fallos_importancia = []
-    n_iters, tam_tr, tam_val = [], [], []
-    oof = {"pos": [], "real": [], "pred": [], "conf": [], "pbin": [], "ybin": []}
-    pos_todas = []
-    for i, (idx_tr, idx_val) in enumerate(partes):
-        prog(f"Probando el modelo ({i + 1} de {len(partes)})…" if len(partes) > 1
-             else "Entrenando y comprobando el modelo…")
-        pre = Preprocesador(columnas).ajustar(datos.iloc[idx_tr][columnas], forzar_categoria)
-        X_tr = pre.transformar(datos.iloc[idx_tr][columnas])
-        X_val = pre.transformar(datos.iloc[idx_val][columnas])
-        pesos_tr = _pesos(yt[idx_tr]) if usar_pesos else None
-        modelo = _crear_modelo(tipo, config, pre.mascara_categ, len(idx_tr))
-        try:
-            modelo.fit(X_tr, yt[idx_tr], sample_weight=pesos_tr)
-        except ValueError as e:
-            raise ValueError(f"No se pudo entrenar el modelo: {e}")
-        n_iters.append(int(getattr(modelo, "n_iter_", config.max_iter)))
-        tam_tr.append(len(idx_tr))
-        tam_val.append(len(idx_val))
-        pos_val = pos[idx_val]
-        met, bas = {}, {}
-        lineal = _referencia_lineal(tipo, X_tr, yt[idx_tr], X_val, pre.mascara_categ, config.semilla, pesos_tr)
+def _evaluar_pliegue(tipo, config, modelo, pre, X_tr, X_val, y, yt, idx_tr, idx_val, pos_val, clases, clase_min,
+                     clase_min_cod, pesos_tr, oof):
+    """Mide el modelo de UN pliegue con lo que no vio: devuelve (métricas, referencias) y agrega lo que no vio a `oof`."""
+    from sklearn.metrics import (accuracy_score, average_precision_score, balanced_accuracy_score,
+                                 f1_score, log_loss, mean_absolute_error, mean_squared_error,
+                                 precision_score, r2_score, recall_score, roc_auc_score)
+    met, bas = {}, {}
+    lineal = _referencia_lineal(tipo, X_tr, yt[idx_tr], X_val, pre.mascara_categ, config.semilla, pesos_tr)
 
-        if tipo == "regresion":
-            pred = modelo.predict(X_val)
+    if tipo == "regresion":
+        pred = modelo.predict(X_val)
+        if config.log_objetivo:
+            pred = np.clip(np.expm1(pred), 0, None)
+        real = y[idx_val]
+        met["rmse"] = float(np.sqrt(mean_squared_error(real, pred)))
+        met["mae"] = float(mean_absolute_error(real, pred))
+        met["r2"] = float(r2_score(real, pred))
+        base = float(np.mean(y[idx_tr]))
+        bas["rmse"] = float(np.sqrt(np.mean((real - base) ** 2)))
+        if lineal is not None:
             if config.log_objetivo:
-                pred = np.clip(np.expm1(pred), 0, None)
-            real = y[idx_val]
-            met["rmse"] = float(np.sqrt(mean_squared_error(real, pred)))
-            met["mae"] = float(mean_absolute_error(real, pred))
-            met["r2"] = float(r2_score(real, pred))
-            base = float(np.mean(y[idx_tr]))
-            bas["rmse"] = float(np.sqrt(np.mean((real - base) ** 2)))
-            if lineal is not None:
-                if config.log_objetivo:
-                    lineal = np.clip(np.expm1(lineal), 0, None)
-                bas["lineal_rmse"] = float(np.sqrt(mean_squared_error(real, lineal)))
+                lineal = np.clip(np.expm1(lineal), 0, None)
+            bas["lineal_rmse"] = float(np.sqrt(mean_squared_error(real, lineal)))
+        oof["pos"].append(pos_val)
+        oof["real"].append(real)
+        oof["pred"].append(pred)
+    else:
+        pred = modelo.predict(X_val)
+        real = yt[idx_val]
+        met["accuracy"] = float(accuracy_score(real, pred))
+        met["f1"] = float(f1_score(real, pred, average="macro"))
+        met["bal_acc"] = float(balanced_accuracy_score(real, pred))
+        frecuente = np.bincount(yt[idx_tr]).argmax()
+        bas["accuracy"] = float(np.mean(real == frecuente))
+        bas["bal_acc"] = 1.0 / max(len(np.unique(real)), 1)
+        if lineal is not None:
+            bas["lineal_bal_acc"] = float(balanced_accuracy_score(real, lineal))
+        met["auc"] = None
+        proba = None
+        try:
+            proba = modelo.predict_proba(X_val)
+            if len(clases) == 2 and len(np.unique(real)) == 2:
+                met["auc"] = float(roc_auc_score(real, proba[:, 1]))
+            elif len(clases) > 2 and set(np.unique(real)) <= set(modelo.classes_):
+                met["auc"] = float(roc_auc_score(
+                    real, proba, multi_class="ovr", labels=list(modelo.classes_)))
+            met["logloss"] = float(log_loss(real, proba, labels=list(modelo.classes_)))
+        except Exception:
+            pass
+        if clase_min is not None and proba is not None and clase_min_cod in list(modelo.classes_):
+            es_min = real == clase_min_cod
+            if es_min.any():
+                j = list(modelo.classes_).index(clase_min_cod)
+                met["recall_min"] = float(recall_score(es_min, pred == clase_min_cod, zero_division=0))
+                met["precision_min"] = float(precision_score(es_min, pred == clase_min_cod, zero_division=0))
+                try:
+                    met["ap"] = float(average_precision_score(es_min, proba[:, j]))
+                    bas["ap"] = float(es_min.mean())
+                except Exception:
+                    pass
+        if proba is not None:
             oof["pos"].append(pos_val)
             oof["real"].append(real)
             oof["pred"].append(pred)
-        else:
-            pred = modelo.predict(X_val)
-            real = yt[idx_val]
-            met["accuracy"] = float(accuracy_score(real, pred))
-            met["f1"] = float(f1_score(real, pred, average="macro"))
-            met["bal_acc"] = float(balanced_accuracy_score(real, pred))
-            frecuente = np.bincount(yt[idx_tr]).argmax()
-            bas["accuracy"] = float(np.mean(real == frecuente))
-            bas["bal_acc"] = 1.0 / max(len(np.unique(real)), 1)
-            if lineal is not None:
-                bas["lineal_bal_acc"] = float(balanced_accuracy_score(real, lineal))
-            met["auc"] = None
-            proba = None
-            try:
-                proba = modelo.predict_proba(X_val)
-                if len(clases) == 2 and len(np.unique(real)) == 2:
-                    met["auc"] = float(roc_auc_score(real, proba[:, 1]))
-                elif len(clases) > 2 and set(np.unique(real)) <= set(modelo.classes_):
-                    met["auc"] = float(roc_auc_score(
-                        real, proba, multi_class="ovr", labels=list(modelo.classes_)))
-                met["logloss"] = float(log_loss(real, proba, labels=list(modelo.classes_)))
-            except Exception:
-                pass
-            if clase_min is not None and proba is not None and clase_min_cod in list(modelo.classes_):
-                es_min = real == clase_min_cod
-                if es_min.any():
-                    j = list(modelo.classes_).index(clase_min_cod)
-                    met["recall_min"] = float(recall_score(es_min, pred == clase_min_cod, zero_division=0))
-                    met["precision_min"] = float(precision_score(es_min, pred == clase_min_cod, zero_division=0))
-                    try:
-                        met["ap"] = float(average_precision_score(es_min, proba[:, j]))
-                        bas["ap"] = float(es_min.mean())
-                    except Exception:
-                        pass
-            if proba is not None:
-                oof["pos"].append(pos_val)
-                oof["real"].append(real)
-                oof["pred"].append(pred)
-                oof["conf"].append(proba.max(axis=1))
-                if len(clases) == 2 and 1 in list(modelo.classes_):
-                    oof["pbin"].append(proba[:, list(modelo.classes_).index(1)])
-                    oof["ybin"].append((real == 1).astype(int))
-        por_pliegue.append(met)
-        base_pliegue.append(bas)
-        mejoras.append(_mejora_de(tipo, met, bas))
+            oof["conf"].append(proba.max(axis=1))
+            if len(clases) == 2 and 1 in list(modelo.classes_):
+                oof["pbin"].append(proba[:, list(modelo.classes_).index(1)])
+                oof["ybin"].append((real == 1).astype(int))
+    return met, bas
 
-        # --- en qué columnas se fijó (en cada prueba, sobre lo que no vio) ---
-        try:
-            from sklearn.inspection import permutation_importance
-            k = min(2000, len(idx_val))
-            sub = np.random.default_rng(config.semilla + i).choice(len(idx_val), size=k, replace=False)
-            pi = permutation_importance(
-                modelo, X_val[sub], yt[idx_val][sub], n_repeats=5, random_state=config.semilla, n_jobs=1,
-                scoring="balanced_accuracy" if tipo == "clasificacion" else None)
-            por_col = {}
-            for fuente, valor in zip(pre.fuente, pi.importances_mean):
-                por_col[fuente] = por_col.get(fuente, 0.0) + max(float(valor), 0.0)
-            tot = sum(por_col.values())
-            if tot > 0:
-                for c, v in por_col.items():
-                    importancia_total[c] = importancia_total.get(c, 0.0) + v / tot
-        except Exception as e:      # no se oculta: el usuario debe saber que falta esta sección
-            fallos_importancia.append(f"{type(e).__name__}: {str(e)[:80]}")
 
-    if fallos_importancia:
-        advertencias.append("No se pudo calcular qué columnas pesan más en el modelo (" + fallos_importancia[0]
-                            + "). El resto de los resultados no se ve afectado.")
+def _importancia_pliegue(modelo, pre, X_val, yt, idx_val, tipo, config, i, importancia_total):
+    """En qué columnas se fijó el modelo (en cada prueba, sobre lo que no vio). Suma a `importancia_total`.
+    Devuelve None si salió bien, o el motivo del fallo (nunca se calla)."""
+    try:
+        from sklearn.inspection import permutation_importance
+        k = min(2000, len(idx_val))
+        sub = np.random.default_rng(config.semilla + i).choice(len(idx_val), size=k, replace=False)
+        pi = permutation_importance(
+            modelo, X_val[sub], yt[idx_val][sub], n_repeats=5, random_state=config.semilla, n_jobs=1,
+            scoring="balanced_accuracy" if tipo == "clasificacion" else None)
+        por_col = {}
+        for fuente, valor in zip(pre.fuente, pi.importances_mean):
+            por_col[fuente] = por_col.get(fuente, 0.0) + max(float(valor), 0.0)
+        tot = sum(por_col.values())
+        if tot > 0:
+            for c, v in por_col.items():
+                importancia_total[c] = importancia_total.get(c, 0.0) + v / tot
+        return None
+    except Exception as e:      # no se oculta: el usuario debe saber que falta esta sección
+        return f"{type(e).__name__}: {str(e)[:80]}"
 
-    metricas, metricas_sd = _promediar(por_pliegue)
-    baseline, _ = _promediar(base_pliegue)
-    n_val_total = int(sum(tam_val))
 
+def _reunir_validacion(oof, tipo, clases, config):
+    """Lo que no vio, junto: (validacion para el gráfico, revision = filas que conviene mirar primero)."""
     # --- lo que no vio, junto, para la lista de revisión y el gráfico ---
     validacion, revision = None, None
     if oof["pos"]:
@@ -1295,8 +1269,11 @@ def entrenar(df: pd.DataFrame, config: ConfigPrediccion, columnas: list,
             arr = np.array(clases, dtype=object)
             revision = {"tipo": "clasificacion", "pos": p_all[orden], "real": arr[r_all[orden]],
                         "pred": arr[d_all[orden]], "extra": c_all[orden]}
+    return validacion, revision
 
-    # --- avisos sobre el resultado ------------------------------------
+
+def _avisos_de_resultado(tipo, metricas, baseline, yt, clases, n_val_total, advertencias):
+    """Avisos sobre el resultado: no mejora a lo simple, modelo lineal igual, clases con muy pocas filas, pocas pruebas."""
     if tipo == "regresion":
         if baseline["rmse"] and metricas["rmse"] > baseline["rmse"] * 0.99:
             advertencias.append(
@@ -1326,21 +1303,19 @@ def entrenar(df: pd.DataFrame, config: ConfigPrediccion, columnas: list,
             f"Hay pocas filas de prueba ({n_val_total}): el resultado es poco confiable; "
             f"con más datos las cifras serían más estables.")
 
-    importancias = []
-    tot = sum(importancia_total.values())
-    if tot > 0:
-        importancias = sorted(((c, v / tot * 100) for c, v in importancia_total.items()),
-                              key=lambda t: t[1], reverse=True)
 
-    # --- modelo final con todos los datos -----------------------------
-    prog("Entrenando el modelo final con todos los datos…")
+def _entrenar_final(datos, columnas, tipo, config, forzar_categoria, n_iters, usar_pesos, yt, n):
+    """Modelo final con todos los datos: (preprocesador, modelo, iteraciones)."""
     pre_final = Preprocesador(columnas).ajustar(datos[columnas], forzar_categoria)
     X_all = pre_final.transformar(datos[columnas])
     n_iter = max(int(np.median(n_iters)), 10)
     modelo_final = _crear_modelo(tipo, config, pre_final.mascara_categ, n, n_iter=n_iter, parar_antes=False)
     modelo_final.fit(X_all, yt, sample_weight=_pesos(yt) if usar_pesos else None)
+    return pre_final, modelo_final, n_iter
 
-    # --- ¿qué significa el número que se entrega? ---------------------------------------------------
+
+def _decidir_salida(tipo, config, clases, oof, usar_pesos, advertencias):
+    """¿Qué significa el número que se entrega? Mide la calibración y decide: (tipo_salida, calibracion, calibrador)."""
     tipo_salida, calibracion, calibrador = "", None, None
     if tipo == "regresion":
         tipo_salida = "valor"
@@ -1373,6 +1348,86 @@ def entrenar(df: pd.DataFrame, config: ConfigPrediccion, columnas: list,
     if calibracion is not None and calibracion.get("verificable") and tipo_salida == "ranking" and not calibracion.get("calibrada"):
         advertencias.append("Las probabilidades que da el modelo no coinciden con lo que ocurre en datos que no vio "
                             "(dice, por ejemplo, 30% y ocurre otra proporción): úsalas para ordenar, no como porcentajes.")
+    return tipo_salida, calibracion, calibrador
+
+
+def entrenar(df: pd.DataFrame, config: ConfigPrediccion, columnas: list,
+             progreso=None, forzar_categoria=None) -> ResultadoEntrenamiento:
+    """Entrena, prueba con lo que el modelo no vio y devuelve el resultado. Es solo el director de orquesta: cada paso
+    está en su propia función (`_preparar_datos`, `_evaluar_pliegue`, `_decidir_salida`…)."""
+    prog = progreso or (lambda texto: None)
+    obj, columnas, pos, modo, datos, y_raw, advertencias = _preparar_datos(df, config, columnas, prog)
+    tipo, clases, y, yt = _preparar_objetivo(y_raw, config, obj)
+
+    n = len(datos)
+    fechas = grupos = None
+    if modo == "temporal":
+        fechas = _a_datetime(datos[config.columna_fecha]).fillna(pd.Timestamp("1900-01-01")).to_numpy()
+    elif modo == "grupos":
+        grupos = pd.factorize(normalizar_clave(datos[config.columna_grupo]))[0]
+
+    _avisos_de_prueba(df, config, obj, modo, advertencias)
+    _avisos_de_fuga(datos, obj, columnas, tipo, advertencias)
+
+    # --- partir en pruebas --------------------------------------------
+    partes = _separar(tipo, config, yt, n, fechas, grupos)
+    if any(len(a) < 10 or len(b) < 5 for a, b in partes):
+        raise ValueError("Hay muy pocas filas para separar una parte de prueba.")
+    usar_pesos = tipo == "clasificacion" and _usar_pesos(config, yt)
+    clase_min = None
+    if tipo == "clasificacion" and len(clases) == 2:
+        clase_min_cod = int(np.argmin(np.bincount(yt, minlength=2)))
+        clase_min = clases[clase_min_cod]
+
+    por_pliegue, base_pliegue, mejoras = [], [], []
+    importancia_total = {}
+    fallos_importancia = []
+    n_iters, tam_tr, tam_val = [], [], []
+    oof = {"pos": [], "real": [], "pred": [], "conf": [], "pbin": [], "ybin": []}
+    for i, (idx_tr, idx_val) in enumerate(partes):
+        prog(f"Probando el modelo ({i + 1} de {len(partes)})…" if len(partes) > 1
+             else "Entrenando y comprobando el modelo…")
+        pre = Preprocesador(columnas).ajustar(datos.iloc[idx_tr][columnas], forzar_categoria)
+        X_tr = pre.transformar(datos.iloc[idx_tr][columnas])
+        X_val = pre.transformar(datos.iloc[idx_val][columnas])
+        pesos_tr = _pesos(yt[idx_tr]) if usar_pesos else None
+        modelo = _crear_modelo(tipo, config, pre.mascara_categ, len(idx_tr))
+        try:
+            modelo.fit(X_tr, yt[idx_tr], sample_weight=pesos_tr)
+        except ValueError as e:
+            raise ValueError(f"No se pudo entrenar el modelo: {e}")
+        n_iters.append(int(getattr(modelo, "n_iter_", config.max_iter)))
+        tam_tr.append(len(idx_tr))
+        tam_val.append(len(idx_val))
+        met, bas = _evaluar_pliegue(tipo, config, modelo, pre, X_tr, X_val, y, yt, idx_tr, idx_val, pos[idx_val], clases,
+                                    clase_min, clase_min_cod if clase_min is not None else None, pesos_tr, oof)
+        por_pliegue.append(met)
+        base_pliegue.append(bas)
+        mejoras.append(_mejora_de(tipo, met, bas))
+        fallo = _importancia_pliegue(modelo, pre, X_val, yt, idx_val, tipo, config, i, importancia_total)
+        if fallo:
+            fallos_importancia.append(fallo)
+
+    if fallos_importancia:
+        advertencias.append("No se pudo calcular qué columnas pesan más en el modelo (" + fallos_importancia[0]
+                            + "). El resto de los resultados no se ve afectado.")
+
+    metricas, metricas_sd = _promediar(por_pliegue)
+    baseline, _ = _promediar(base_pliegue)
+    n_val_total = int(sum(tam_val))
+
+    validacion, revision = _reunir_validacion(oof, tipo, clases, config)
+    _avisos_de_resultado(tipo, metricas, baseline, yt, clases, n_val_total, advertencias)
+
+    importancias = []
+    tot = sum(importancia_total.values())
+    if tot > 0:
+        importancias = sorted(((c, v / tot * 100) for c, v in importancia_total.items()),
+                              key=lambda t: t[1], reverse=True)
+
+    prog("Entrenando el modelo final con todos los datos…")
+    pre_final, modelo_final, n_iter = _entrenar_final(datos, columnas, tipo, config, forzar_categoria, n_iters, usar_pesos, yt, n)
+    tipo_salida, calibracion, calibrador = _decidir_salida(tipo, config, clases, oof, usar_pesos, advertencias)
     return ResultadoEntrenamiento(
         tipo=tipo, objetivo=obj, columnas=columnas, clases=clases,
         metricas=metricas, baseline=baseline, importancias=importancias,
@@ -1389,6 +1444,48 @@ def entrenar(df: pd.DataFrame, config: ConfigPrediccion, columnas: list,
 # ----------------------------------------------------------------------
 # Predecir
 # ----------------------------------------------------------------------
+def _puntaje(resultado, X) -> np.ndarray:
+    """La salida del modelo para las filas ya transformadas (probabilidad de la clase 1 —con el calibrador si lo hay— o el valor)."""
+    modelo = resultado.modelo
+    if resultado.tipo == "regresion":
+        v = modelo.predict(X)
+        return np.expm1(v) if resultado.log_objetivo else np.asarray(v, dtype="float64")
+    proba = modelo.predict_proba(X)
+    p1 = proba[:, list(modelo.classes_).index(1)] if 1 in list(modelo.classes_) else np.zeros(len(X))
+    if getattr(resultado, "calibrador", None) is not None:
+        p1 = resultado.calibrador.transformar(p1)
+    return np.asarray(p1, dtype="float64")
+
+
+def explicar_filas(resultado, df: pd.DataFrame, posiciones, max_factores: int = 2) -> list:
+    """Qué columnas empujan más a cada fila pedida frente a una fila «típica» de la misma tabla. Método ligero: cambia UNA
+    columna a la vez por su valor típico (la mediana de la tabla) y mide cuánto cambia la salida. Devuelve, por fila, una lista
+    de (columna, aporte) con los mayores aportes que SUBEN la salida (puede quedar vacía). Es una explicación aproximada: si dos
+    columnas dicen casi lo mismo, el aporte se reparte entre ellas."""
+    import warnings
+    pre = resultado.preprocesador
+    X = pre.transformar(df[resultado.columnas])
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        ref = np.nanmedian(X, axis=0)
+    grupos = {}
+    for j, nombre in enumerate(pre.nombres):
+        origen = nombre if nombre in resultado.columnas else nombre.split(" (")[0]
+        grupos.setdefault(origen, []).append(j)
+    pos = np.asarray(list(posiciones), dtype=int)
+    Xf = X[pos]
+    base = _puntaje(resultado, Xf)
+    aportes = [[] for _ in pos]
+    for origen, idxs in grupos.items():
+        Xc = Xf.copy()
+        Xc[:, idxs] = ref[idxs]
+        delta = base - _puntaje(resultado, Xc)
+        for k, d in enumerate(delta):
+            if np.isfinite(d) and d > 0:
+                aportes[k].append((origen, float(d)))
+    return [sorted(a, key=lambda t: -t[1])[:max_factores] for a in aportes]
+
+
 def predecir(resultado: ResultadoEntrenamiento, df: pd.DataFrame,
              columna_id: str | None = None, salida: str | None = None) -> pd.DataFrame:
     """Devuelve la tabla lista para entregar: la columna id (si existe) y la

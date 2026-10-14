@@ -33,12 +33,12 @@ except ImportError:  # pruebas sueltas fuera del paquete
 
 try:
     from . import pistas as _pistas
-    from .prediccion import (ConfigPrediccion, _a_datetime, columnas_a_usar, columnas_fecha, entrenar, es_columna_id,
+    from .prediccion import (ConfigPrediccion, _a_datetime, columnas_a_usar, columnas_fecha, entrenar, es_columna_id, explicar_filas,
                              normalizar_clave, predecir, sugerir_columnas, tipo_columna)
     from .pronostico_base import (ResultadoPronostico, confianza_por_datos, dias_txt, fecha_txt, leer_fechas, num_txt, pct_txt)
 except ImportError:
     import pistas as _pistas
-    from prediccion import (ConfigPrediccion, _a_datetime, columnas_a_usar, columnas_fecha, entrenar, es_columna_id,
+    from prediccion import (ConfigPrediccion, _a_datetime, columnas_a_usar, columnas_fecha, entrenar, es_columna_id, explicar_filas,
                             normalizar_clave, predecir, sugerir_columnas, tipo_columna)
     from pronostico_base import (ResultadoPronostico, confianza_por_datos, dias_txt, fecha_txt, leer_fechas, num_txt, pct_txt)
 
@@ -549,6 +549,30 @@ def preparar_dataset_evento(df: pd.DataFrame, col_entidad, col_fecha, mask_event
     return d, nombre
 
 
+MAX_ELEMENTOS_EXPLICADOS = 10
+NOTA_EXPLICACION = ("«Qué lo empuja» compara cada elemento con uno típico de esta misma tabla: cambia una columna a la vez por su "
+                    "valor típico y mide cuánto baja el riesgo. Es una explicación aproximada (si dos columnas dicen casi lo mismo, "
+                    "el aporte se reparte) y solo se calcula para los elementos de mayor riesgo.")
+
+
+def _explicar_top(res, ultimo: pd.DataFrame, pred: pd.DataFrame, col_ent, es_prob: bool):
+    """Texto «qué lo empuja» para los elementos de mayor riesgo (los demás quedan en blanco). None si no se pudo."""
+    try:
+        ids = ultimo[col_ent].astype(str).reset_index(drop=True)
+        posicion = {e: i for i, e in enumerate(ids)}
+        elegidos = [posicion[str(e)] for e in pred["Elemento"].head(MAX_ELEMENTOS_EXPLICADOS) if str(e) in posicion]
+        if not elegidos:
+            return None
+        aportes = explicar_filas(res, ultimo.reset_index(drop=True), elegidos)
+        texto = [""] * len(pred)
+        for k, a in enumerate(aportes[:len(pred)]):
+            fmt = (lambda d: f"+{dec(d * 100, 0)} pts") if es_prob else (lambda d: f"+{dec(d, 2)}")
+            texto[k] = ", ".join(f"{c} ({fmt(d)})" for c, d in a if d >= (0.005 if es_prob else 0.001)) or "—"
+        return texto
+    except Exception:
+        return None
+
+
 def analizar_falla_modelo(df: pd.DataFrame, cfg) -> ResultadoPronostico:
     col_ent, col_fecha = _g(cfg, "columna_entidad"), _g(cfg, "columna_fecha")
     if not col_ent or not col_fecha:
@@ -583,6 +607,9 @@ def analizar_falla_modelo(df: pd.DataFrame, cfg) -> ResultadoPronostico:
     cp = pred.columns[1]
     nivel_v, titulo_v, frase_v = res.veredicto()
     top = pred.iloc[0] if len(pred) else None
+    explicacion = _explicar_top(res, ultimo, pred, col_ent, es_prob)
+    if explicacion is not None:
+        pred["Qué lo empuja"] = explicacion
     if not es_prob:
         titular = (f"El modelo ordena los {len(pred)} elementos por riesgo de que ocurra en {num_txt(w)} días; "
                    f"el primero es «{top['Elemento']}». El número sirve para ORDENAR, no es un porcentaje real.")
@@ -596,7 +623,7 @@ def analizar_falla_modelo(df: pd.DataFrame, cfg) -> ResultadoPronostico:
     return _con_tipo(res.tipo_salida, ResultadoPronostico(
         "falla", "Falla / evento (con modelo)", titular, "atencion" if es_prob and len(pred) and float(top[cp]) >= 0.5 else "info",
         conf, f"{titulo_v}. {frase_v} (probado entrenando con lo antiguo y evaluando con lo más reciente).",
-        res.tarjetas(), res.lineas_resumen(),
+        res.tarjetas(), res.lineas_resumen() + ([NOTA_EXPLICACION] if explicacion is not None else []),
         ["Las condiciones recientes de cada elemento seguirán pareciéndose a las que tenían antes de fallar los demás."],
         avisos, pred, "Riesgo actual de cada elemento", None,
         {"metricas": dict(res.metricas), "mejora": float(res.mejora())}), res.detalle_experto())

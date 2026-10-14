@@ -53,3 +53,23 @@ class Ajustes(unittest.TestCase):
         self.assertIsNone(pb.aviso_datos_antiguos(df, ["f"], hoy=hoy, umbral_dias=45))
 if __name__ == "__main__":
     unittest.main()
+
+
+class AjustesDeLaDecisionDelDueno(unittest.TestCase):
+    """Las decisiones de producto quedan como ajustes, con un valor recomendado."""
+    def test_valores_recomendados_por_defecto(self):
+        a = A.AjustesPrediccion()
+        self.assertEqual((a.fines_de_semana, a.detalles_tecnicos, a.comparar_ejecuciones), ("rellenar", "plegados", "si"))
+    def test_todos_los_ajustes_estan_en_la_lista_de_opciones(self):
+        self.assertEqual({k for k, *_ in A.OPCIONES}, set(A.AjustesPrediccion().to_dict()))
+        self.assertEqual(len(A.OPCIONES), 8)
+    def test_valores_nuevos_se_guardan_y_los_invalidos_vuelven_al_defecto(self):
+        a = A.AjustesPrediccion.from_dict({"fines_de_semana": "ignorar", "detalles_tecnicos": "ocultos", "comparar_ejecuciones": "no"})
+        self.assertEqual((a.fines_de_semana, a.detalles_tecnicos, a.comparar_ejecuciones), ("ignorar", "ocultos", "no"))
+        b = A.AjustesPrediccion.from_dict({"fines_de_semana": "a veces", "detalles_tecnicos": 3, "comparar_ejecuciones": None})
+        self.assertEqual(b, A.AjustesPrediccion())
+    def test_cada_opcion_explica_por_que_importa(self):
+        for k, titulo, porque, ops in A.OPCIONES:
+            self.assertGreater(len(porque), 40, k)
+if __name__ == "__main__":
+    unittest.main()

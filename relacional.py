@@ -39,11 +39,19 @@ import numpy as np
 import pandas as pd
 
 try:
+    from .formato import dec
+except ImportError:  # pruebas sueltas fuera del paquete
+    from formato import dec
+
+try:
     from .prediccion import _a_datetime, es_columna_id, normalizar_clave, tipo_columna
 except ImportError:  # pruebas sueltas fuera del paquete
     from prediccion import _a_datetime, es_columna_id, normalizar_clave, tipo_columna
 
 MAX_COLS_AGG = 8            # columnas numéricas que se resumen por tabla hija
+UMBRAL_FECHA_FUTURA = 0.20      # avisar si una fecha traída de otra tabla es posterior a la de la fila en ≥ 20% de los casos
+UMBRAL_SIN_PAREJA = 0.30          # avisar si más del 30% de las filas no encuentra pareja
+MAX_REPETIDAS_CLAVE = 0.05        # clave «casi única»: hasta un 5% de repetidas se avisa como posible error de datos
 MAX_COLS_POR_TABLA = 60     # columnas que se traen de una tabla "una fila"
 MAX_COLUMNAS_NUEVAS = 200
 MAX_PROFUNDIDAD = 3
@@ -380,15 +388,23 @@ def _ampliar(nombre, prof, camino, ctx: _Contexto, fechas_base=None) -> pd.DataF
 
         otra_df = _ampliar(otra, prof - 1, camino + [nombre], ctx) if prof > 1 else ctx.tablas[otra].reset_index(drop=True)
         cb, co = _codigos(df[col_propia], otra_df[col_otra])
+        # «sin pareja» = clave vacía o que no aparece en la otra tabla (los códigos de
+        # _codigos existen para todas las claves, así que no basta mirar cb < 0)
+        con_pareja = np.isin(cb, co[co >= 0]) if len(co) else np.zeros(len(cb), dtype=bool)
+        if len(cb) and float(1.0 - con_pareja.mean()) > UMBRAL_SIN_PAREJA:
+            donde = f"«{nombre}»" if es_base else f"«{nombre}» (tabla intermedia, alcanzada por «{camino[-1]}»)"
+            ctx.avisar(f"Más del 30% de las filas de {donde} no tiene dato en «{otra}» "
+                       f"(unión por {col_propia}): esa relación puede aportar poco.")
         if es_base:
-            # «sin pareja» = clave vacía o que no aparece en la otra tabla (los códigos de
-            # _codigos existen para todas las claves, así que no basta mirar cb < 0)
-            con_pareja = np.isin(cb, co[co >= 0]) if len(co) else np.zeros(len(cb), dtype=bool)
-            if len(cb) and float(1.0 - con_pareja.mean()) > 0.30:
-                ctx.avisar(f"Más del 30% de las filas de «{nombre}» no tiene dato en «{otra}» "
-                           f"(unión por {col_propia}): esa relación puede aportar poco.")
             ctx.claves_base.add(col_propia)
         unica = _es_unica(co)
+        if not unica:
+            validos_o = co[co >= 0]
+            repetidas = len(validos_o) - len(np.unique(validos_o))
+            if 0 < repetidas <= MAX_REPETIDAS_CLAVE * len(validos_o):
+                ctx.avisar(f"La clave «{col_otra}» de «{otra}» tiene {dec(repetidas, 0, True)} fila(s) repetida(s) "
+                           f"(de {dec(len(validos_o), 0, True)}): por eso se resumió en vez de traer sus datos directamente. "
+                           f"Si esa clave debería ser única, revisa los repetidos.")
 
         base_pref = otra if otra not in prefijos_usados else f"{otra}[{col_propia}]"
         prefijos_usados.add(otra)
@@ -401,6 +417,21 @@ def _ampliar(nombre, prof, camino, ctx: _Contexto, fechas_base=None) -> pd.DataF
             bloque = _traer_una_fila(cb, otra_df, co, traer, f"{base_pref}.")
             for c in bloque.columns:
                 ctx.info[c] = f"Viene de «{otra}» (unida por {col_propia})"
+            if es_base and fechas_base is not None:
+                # Una unión «una fila apunta a una fila» trae TODO lo que hay en la otra tabla. Si una fecha de allá es
+                # posterior a la fecha de la fila, el modelo podría enterarse del futuro (un cierre, una baja…).
+                for c in traer:
+                    if tipo_columna(otra_df[c]) not in ("fecha", "fecha_texto"):
+                        continue
+                    vals = _fecha_ns(bloque[f"{base_pref}.{c}"])
+                    ok = (vals.notna() & fechas_base.notna()).to_numpy()
+                    if ok.sum() >= 5:
+                        frac = float((vals.to_numpy()[ok] > fechas_base.to_numpy()[ok]).mean())
+                        if frac >= UMBRAL_FECHA_FUTURA:
+                            ctx.avisar(f"«{c}» de «{otra}» tiene fechas posteriores a la fecha de la fila en "
+                                       f"{dec(frac * 100, 0)}% de los casos: podría traer información del futuro (por ejemplo, un "
+                                       f"cierre o una baja que ocurre después de lo que se quiere predecir). Si no estaría "
+                                       f"disponible al momento de predecir, quítala.")
             nuevas.append(bloque)
             continue
 

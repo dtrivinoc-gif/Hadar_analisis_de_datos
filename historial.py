@@ -25,7 +25,7 @@ _ORDEN_CONF = {"baja": 0, "media": 1, "alta": 2}
 # Qué define que dos ejecuciones sean «el mismo análisis» (no el horizonte ni la fecha de corte: eso cambia a propósito)
 CAMPOS_CLAVE = ("palabra", "tabla", "columna_fecha", "columna_valor", "columna_objetivo", "columna_evento", "valor_evento",
                 "columna_entidad", "columna_inicio", "columna_fin", "columna_riesgo", "columna_impacto", "columna_driver",
-                "columna_stock", "columna_grupo", "metodo_evento")
+                "columna_stock", "columna_grupo", "metodo_evento", "tabla_entrenamiento", "objetivo", "tipo")
 
 
 def _como_dict(cfg) -> dict:
@@ -42,6 +42,13 @@ def clave_analisis(cfg) -> str:
 
 
 def _mejora(res):
+    f = getattr(res, "mejora", None)
+    if callable(f):                                   # resultado de un modelo (Entrenar un modelo)
+        try:
+            v = float(f())
+            return v if v == v else None
+        except Exception:
+            return None
     m = getattr(res, "metricas", None) or {}
     v = m.get("mejora")
     try:
@@ -53,7 +60,7 @@ def _mejora(res):
 
 def resumen_de(cfg, res, n_filas=None, ahora=None) -> dict:
     ahora = pd.Timestamp(ahora) if ahora is not None else pd.Timestamp.now()
-    return {"fecha": ahora.strftime("%Y-%m-%d %H:%M"), "clave": clave_analisis(cfg), "palabra": getattr(res, "palabra", ""),
+    return {"fecha": ahora.strftime("%Y-%m-%d %H:%M"), "clave": clave_analisis(cfg), "palabra": getattr(res, "palabra", "") or "modelo",
             "mejora": _mejora(res), "confianza": getattr(res, "confianza", ""), "n": int(n_filas) if n_filas else None,
             "tipo_salida": getattr(res, "tipo_salida", ""), "config": config_clave(cfg)}
 

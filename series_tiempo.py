@@ -49,16 +49,16 @@ except ImportError:  # pruebas sueltas fuera del paquete
                                  aplicar_fecha_corte)
 
 MIN_PERIODOS = 12
-MAX_PERIODOS = {"H": 2000, "D": 3000, "W": 1000, "M": 600}
+MAX_PERIODOS = {"H": 2000, "D": 3000, "B": 2200, "W": 1000, "M": 600}
 MAX_AJUSTE_HOLT = 600          # puntos con que se ajusta la tendencia suavizada
 K_ORIGENES = 16                # cuántos «puntos del pasado» se usan para probar
 MIN_ORIGENES_HONESTOS = 8      # con menos, elegir y evaluar se hace con las mismas pruebas (se avisa)
-MIN_PERIODOS_ESTACION = {"H": 72, "D": 21, "W": 104, "M": 24}
-BASE_ESTACION = {"H": 24, "D": 7, "W": 52, "M": 12}
-HORIZONTE_DEFECTO = {"H": 48, "D": 30, "W": 12, "M": 6}
-HORIZONTE_UMBRAL = {"H": 72, "D": 90, "W": 26, "M": 12}
-HORIZONTE_AGOTAMIENTO = {"H": 24 * 60, "D": 365, "W": 104, "M": 36}
-VENTANA_CONSUMO = {"H": 168, "D": 56, "W": 13, "M": 12}
+MIN_PERIODOS_ESTACION = {"H": 72, "D": 21, "B": 15, "W": 104, "M": 24}
+BASE_ESTACION = {"H": 24, "D": 7, "B": 5, "W": 52, "M": 12}
+HORIZONTE_DEFECTO = {"H": 48, "D": 30, "B": 20, "W": 12, "M": 6}
+HORIZONTE_UMBRAL = {"H": 72, "D": 90, "B": 65, "W": 26, "M": 12}
+HORIZONTE_AGOTAMIENTO = {"H": 24 * 60, "D": 365, "B": 260, "W": 104, "M": 36}
+VENTANA_CONSUMO = {"H": 168, "D": 56, "B": 40, "W": 13, "M": 12}
 MAX_ENTIDADES = 3000
 N_SIMULACIONES = 600
 EXPONENTE_MIN_EXTRAPOLACION = 0.5   # el error de «seguir el último dato» crece al menos como √horizonte
@@ -129,11 +129,29 @@ def detectar_frecuencia(dt: pd.Series) -> str:
     return "M"
 
 
+def _decidir_dias_habiles(freq: str, dt: pd.Series, fines_de_semana: str, avisos: list) -> str:
+    """Con «ignorar fines de semana» (Ajustes), una serie diaria sin NINGÚN dato en sábado ni domingo se cuenta en días
+    hábiles (lunes a viernes) en vez de rellenar esos días con 0. Si hay datos en fin de semana no se aplica: ignorarlos
+    sería descartar datos reales."""
+    if fines_de_semana != "ignorar" or freq != "D":
+        return freq
+    dow = dt.dropna().dt.dayofweek
+    if dow.nunique() < 3 or (dt.max() - dt.min()).days < 14:          # con tan poca historia no se puede afirmar nada de los fines de semana
+        return freq
+    n_fin = int((dow >= 5).sum())
+    if n_fin:
+        avisos.append(f"No se ignoraron los fines de semana: hay {dec(n_fin, 0, True)} registros en sábado o domingo.")
+        return freq
+    avisos.append("Se ignoraron los fines de semana (como pediste en Ajustes): no hay datos en sábado ni domingo, así que los "
+                  "plazos se cuentan en días hábiles (lunes a viernes) y esos días no se rellenaron con 0.")
+    return "B"
+
+
 def _bucket(dt: pd.Series, freq: str) -> pd.Series:
     if freq == "H":
         return dt.dt.floor("h")
     n = dt.dt.normalize()
-    if freq == "D":
+    if freq in ("D", "B"):
         return n
     if freq == "W":
         return n - pd.to_timedelta(dt.dt.dayofweek, unit="D")
@@ -141,6 +159,8 @@ def _bucket(dt: pd.Series, freq: str) -> pd.Series:
 
 
 def _paso(freq: str):
+    if freq == "B":
+        return pd.offsets.BDay()          # días hábiles: lunes a viernes
     return {"H": pd.Timedelta(hours=1), "D": pd.Timedelta(days=1), "W": pd.Timedelta(days=7)}.get(freq)
 
 
@@ -220,7 +240,7 @@ _VERBO = {"suma": "Se sumó", "promedio": "Se promedió", "ultimo": "Se tomó el
 
 def preparar_serie(df: pd.DataFrame, col_fecha, col_valor=None, agregacion: str = "auto",
                    frecuencia: str = "auto", col_entidad=None, entidad=None,
-                   agregacion_defecto: str = "suma") -> SerieTiempo:
+                   agregacion_defecto: str = "suma", fines_de_semana: str = "rellenar") -> SerieTiempo:
     if not col_fecha or col_fecha not in df.columns:
         raise ValueError("Elige la columna de fecha.")
     if col_valor is not None and col_valor not in df.columns:
@@ -256,6 +276,7 @@ def preparar_serie(df: pd.DataFrame, col_fecha, col_valor=None, agregacion: str 
             avisos_ini.append(f"{dec((~buenos).mean() * 100, 0)}% de los valores de «{col_valor}» no eran números y no se usaron.")
         dt, vals = dt[buenos].reset_index(drop=True), vals[buenos]
     freq = detectar_frecuencia(dt) if frecuencia in (None, "auto") else frecuencia
+    freq = _decidir_dias_habiles(freq, dt_todas, fines_de_semana, avisos_ini)
     con_filas = pd.DatetimeIndex(_bucket(dt_todas, freq).unique())
     s = _agregar(dt, vals, freq, agg)
     avisos = list(avisos_ini)
@@ -267,7 +288,7 @@ def preparar_serie(df: pd.DataFrame, col_fecha, col_valor=None, agregacion: str 
             avisos.append("Se dejó fuera el último período porque está incompleto (sumarlo daría un valor engañosamente bajo).")
     # último día/hora que parece a medio llenar (solo importa si se suma o se cuenta): solo se AVISA, no se descarta,
     # porque con fechas y horas no se puede saber con certeza si ya terminó
-    if agg in ("suma", "cuenta") and freq in ("D", "H") and len(s) >= 9:
+    if agg in ("suma", "cuenta") and freq in ("D", "B", "H") and len(s) >= 9:
         cuentas = _bucket(dt, freq).value_counts().sort_index()
         if len(cuentas) >= 9:
             habitual = float(np.median(cuentas.iloc[-8:-1]))
@@ -305,7 +326,7 @@ def serie_desde_cfg(df, cfg, agregacion_defecto: str = "suma") -> SerieTiempo:
     df = aplicar_fecha_corte(df, _g(cfg, "columna_fecha"), _g(cfg, "fecha_corte"))
     return preparar_serie(df, _g(cfg, "columna_fecha"), _g(cfg, "columna_valor"), _g(cfg, "agregacion", "auto"),
                           _g(cfg, "frecuencia", "auto"), _g(cfg, "columna_entidad"), _g(cfg, "entidad"),
-                          agregacion_defecto=agregacion_defecto)
+                          agregacion_defecto=agregacion_defecto, fines_de_semana=_g(cfg, "fines_de_semana", "rellenar"))
 
 
 # ----------------------------------------------------------------------
@@ -866,11 +887,11 @@ def analizar_tendencia(df: pd.DataFrame, cfg) -> ResultadoPronostico:
 # ----------------------------------------------------------------------
 # Palabra clave: ESTACIONALIDAD
 # ----------------------------------------------------------------------
-_CICLOS = {"D": [("semana", 7)], "H": [("día", 24), ("semana", 168)], "W": [("año", 52)], "M": [("año", 12)]}
+_CICLOS = {"D": [("semana", 7)], "B": [("semana", 5)], "H": [("día", 24), ("semana", 168)], "W": [("año", 52)], "M": [("año", 12)]}
 
 
 def _clave_calendario(fechas: pd.DatetimeIndex, freq: str, mm: int):
-    if freq == "D":
+    if freq in ("D", "B"):
         return fechas.dayofweek.to_numpy()
     if freq == "H":
         return fechas.hour.to_numpy() if mm == 24 else (fechas.dayofweek * 24 + fechas.hour).to_numpy()
@@ -880,7 +901,7 @@ def _clave_calendario(fechas: pd.DatetimeIndex, freq: str, mm: int):
 
 
 def _etiqueta_pos(freq: str, mm: int, k: int) -> str:
-    if freq == "D":
+    if freq in ("D", "B"):
         return DIAS_SEMANA[k]
     if freq == "H":
         return f"{k:02d}:00" if mm == 24 else f"{DIAS_SEMANA[k // 24]} {k % 24:02d}:00"
@@ -1101,8 +1122,8 @@ def analizar_saturacion(df: pd.DataFrame, cfg) -> ResultadoPronostico:
 # Palabra clave: AGOTAMIENTO (stock, batería, presupuesto, espacio…)
 # ----------------------------------------------------------------------
 def _pos_calendario(fechas, freq: str):
-    if freq == "D":
-        return pd.DatetimeIndex(fechas).dayofweek.to_numpy(), 7
+    if freq in ("D", "B"):
+        return pd.DatetimeIndex(fechas).dayofweek.to_numpy(), (7 if freq == "D" else 5)
     if freq == "H":
         return pd.DatetimeIndex(fechas).hour.to_numpy(), 24
     return None, None
@@ -1149,7 +1170,9 @@ def _cuantil(T: np.ndarray, q: float) -> float:
     return float(Ts[min(int(np.ceil(q * len(Ts))) - 1, len(Ts) - 1) if q > 0 else 0])
 
 
-def analizar_agotamiento(df: pd.DataFrame, cfg) -> ResultadoPronostico:
+def _leer_consumo(df, cfg):
+    """Lee la tabla y deja el consumo por fecha y elemento: (base, avisos, derivado, df, col_ent, stock_num).
+    Si no hay columna de consumo, lo deduce de lo que baja el stock."""
     col_fecha = _g(cfg, "columna_fecha")
     col_cons = _g(cfg, "columna_valor")
     col_stock = _g(cfg, "columna_stock")
@@ -1189,9 +1212,16 @@ def analizar_agotamiento(df: pd.DataFrame, cfg) -> ResultadoPronostico:
     if (base["consumo"] < 0).any():
         avisos.append("Hay consumos negativos (devoluciones o ajustes); se contaron como cero.")
         base["consumo"] = base["consumo"].clip(lower=0)
+    return base, avisos, derivado, df, col_ent, stock_num
+
+
+def _ventana_y_stocks(base, cfg, df, col_ent, stock_num, avisos):
+    """Elige el período de consumo reciente y el stock actual de cada elemento:
+    (base de la ventana, consumo por elemento y período, stocks, frecuencia, fin, largo de la ventana, períodos de la ventana)."""
     dt_all = pd.Series(base["dt"].to_numpy())
     freq = _g(cfg, "frecuencia", "auto")
     freq = detectar_frecuencia(dt_all) if freq in (None, "auto") else freq
+    freq = _decidir_dias_habiles(freq, dt_all, _g(cfg, "fines_de_semana", "rellenar"), avisos)
     base["per"] = _bucket(pd.Series(base["dt"].to_numpy()), freq).to_numpy()
     fin = base["per"].max()
     k_v = int(_g(cfg, "ventana", 0)) or VENTANA_CONSUMO[freq]
@@ -1224,6 +1254,48 @@ def analizar_agotamiento(df: pd.DataFrame, cfg) -> ResultadoPronostico:
     if len(piv) > MAX_ENTIDADES:
         piv = piv.loc[piv.sum(axis=1).sort_values(ascending=False).index[:MAX_ENTIDADES]]
         avisos.append(f"Había más de {MAX_ENTIDADES} elementos; se analizaron los {MAX_ENTIDADES} con más consumo.")
+    return base, piv, stocks, freq, fin, k_v, idx_v
+
+
+def _tendencia_consumo(yv) -> str:
+    """«sube», «baja» o «estable» según el primer y el último tercio del consumo reciente (solo si la diferencia es clara)."""
+    tr = "estable"
+    if len(yv) >= 9:
+        t3 = len(yv) // 3
+        p1, p3 = yv[:t3], yv[-t3:]
+        a, b = float(p1.mean()), float(p3.mean())
+        se = sqrt(float(p1.var()) / len(p1) + float(p3.var()) / len(p3))
+        claro = abs(b - a) > 2.0 * max(se, 1e-12)
+        if claro and a > 0 and b / a > 1.25:
+            tr = "sube"
+        elif claro and a > 0 and b / a < 0.75:
+            tr = "baja"
+        elif claro and a == 0 and b > 0:
+            tr = "sube"
+    return tr
+
+
+def _plazos_agotamiento(reg, stock, media, yv, hcap, freq, m, idx_v, pos_v, rng, n_sim):
+    """Completa la fila del elemento con cuánto tarda en agotarse (rápido, probable, lento) o por qué no se puede decir."""
+    if stock <= 0:
+        reg.update({"Pronto": 0.0, "Central": 0.0, "Tarde": 0.0, "Cobertura": "ya agotado"})
+    elif media <= 0:
+        reg.update({"Pronto": np.inf, "Central": np.inf, "Tarde": np.inf, "Cobertura": "sin consumo reciente"})
+    elif stock / media > hcap:
+        reg.update({"Pronto": np.inf, "Central": np.inf, "Tarde": np.inf, "Cobertura": f"más de {duracion_txt(hcap, freq)}"})
+    else:
+        hmax = int(min(hcap, np.ceil(3 * stock / media) + 5))
+        pos_f = None
+        if m:
+            fut = _futuras(pd.Timestamp(idx_v[-1]), hmax, freq)
+            pos_f = _pos_calendario(fut, freq)[0]
+        T = _simular_agotamiento(yv, float(stock), hmax, pos_v, pos_f, m, rng, n_sim)
+        reg.update({"Pronto": _cuantil(T, 0.10), "Central": _cuantil(T, 0.50), "Tarde": _cuantil(T, 0.90),
+                    "Cobertura": ""})
+
+
+def _simular_elementos(base, cfg, piv, stocks, idx_v, freq, fin, avisos):
+    """Simula el agotamiento de cada elemento: (tabla ordenada, m, unidad, unidades, fecha de partida, simulaciones)."""
     # primer período con datos de cada entidad dentro de la ventana
     primer = base.groupby("ent")["per"].min()
     hcap = int(_g(cfg, "horizonte", 0)) or HORIZONTE_AGOTAMIENTO[freq]
@@ -1246,36 +1318,10 @@ def analizar_agotamiento(df: pd.DataFrame, cfg) -> ResultadoPronostico:
         if len(yv) == 0:
             continue
         media = float(yv.mean())
-        tr = "estable"
-        if len(yv) >= 9:
-            t3 = len(yv) // 3
-            p1, p3 = yv[:t3], yv[-t3:]
-            a, b = float(p1.mean()), float(p3.mean())
-            se = sqrt(float(p1.var()) / len(p1) + float(p3.var()) / len(p3))
-            claro = abs(b - a) > 2.0 * max(se, 1e-12)
-            if claro and a > 0 and b / a > 1.25:
-                tr = "sube"
-            elif claro and a > 0 and b / a < 0.75:
-                tr = "baja"
-            elif claro and a == 0 and b > 0:
-                tr = "sube"
+        tr = _tendencia_consumo(yv)
         reg = {"Elemento": ent, "Stock actual": float(stock), "Consumo medio por " + uno: media,
                "Tendencia del consumo": tr, "Períodos observados": len(yv)}
-        if stock <= 0:
-            reg.update({"Pronto": 0.0, "Central": 0.0, "Tarde": 0.0, "Cobertura": "ya agotado"})
-        elif media <= 0:
-            reg.update({"Pronto": np.inf, "Central": np.inf, "Tarde": np.inf, "Cobertura": "sin consumo reciente"})
-        elif stock / media > hcap:
-            reg.update({"Pronto": np.inf, "Central": np.inf, "Tarde": np.inf, "Cobertura": f"más de {duracion_txt(hcap, freq)}"})
-        else:
-            hmax = int(min(hcap, np.ceil(3 * stock / media) + 5))
-            pos_f = None
-            if m:
-                fut = _futuras(pd.Timestamp(idx_v[-1]), hmax, freq)
-                pos_f = _pos_calendario(fut, freq)[0]
-            T = _simular_agotamiento(yv, float(stock), hmax, pos_v, pos_f, m, rng, n_sim)
-            reg.update({"Pronto": _cuantil(T, 0.10), "Central": _cuantil(T, 0.50), "Tarde": _cuantil(T, 0.90),
-                        "Cobertura": ""})
+        _plazos_agotamiento(reg, stock, media, yv, hcap, freq, m, idx_v, pos_v, rng, n_sim)
         filas.append(reg)
     if sin_stock:
         avisos.append(f"{len(sin_stock)} elemento(s) no tienen stock conocido y no se analizaron: "
@@ -1283,7 +1329,11 @@ def analizar_agotamiento(df: pd.DataFrame, cfg) -> ResultadoPronostico:
     if not filas:
         raise ValueError("No se pudo calcular el agotamiento: faltan datos de stock o de consumo.")
     res = pd.DataFrame(filas).sort_values("Central", kind="stable").reset_index(drop=True)
+    return res, m, uno, varios, ultima_fecha, n_sim
 
+
+def _fechas_y_confianza(res, ultima_fecha, freq, varios, avisos):
+    """Agrega las fechas probables y calcula la confianza: (tabla, confianza, motivo)."""
     def fecha_de(T):
         if not np.isfinite(T):
             return pd.NaT
@@ -1293,15 +1343,20 @@ def analizar_agotamiento(df: pd.DataFrame, cfg) -> ResultadoPronostico:
     res["Fecha probable"] = [fecha_de(v) for v in res["Central"]]
     res["Fecha tarde"] = [fecha_de(v) for v in res["Tarde"]]
     n_per = int(res["Períodos observados"].median())
-    conf = confianza_por_datos(n_per, 14 if freq == "D" else 6, 42 if freq == "D" else 12)
+    conf = confianza_por_datos(n_per, 14 if freq in ("D", "B") else 6, 42 if freq in ("D", "B") else 12)
     motivo = (f"se usó lo que se consumió en los últimos {n_per} {varios}; "
               f"con menos de {14 if freq == 'D' else 6} el consumo típico es incierto.")
     if (res["Tendencia del consumo"] == "sube").any():
         avisos.append("En algunos elementos el consumo viene subiendo: el cálculo asume que seguirá como en el período "
                       "reciente, así que podrían agotarse antes.")
+    return res, conf, motivo
+
+
+def _titular_agotamiento(res, cfg, freq, uno, varios):
+    """La respuesta en una frase y las tres tarjetas: (titular, nivel, tarjetas, urgentes, ventana de alerta)."""
     alerta_w = float(_g(cfg, "ventana_dias", 14))
     # ventana de alerta expresada en períodos
-    w_per = {"H": alerta_w * 24, "D": alerta_w, "W": alerta_w / 7, "M": alerta_w / 30.4}[freq]
+    w_per = {"H": alerta_w * 24, "D": alerta_w, "B": alerta_w * 5 / 7, "W": alerta_w / 7, "M": alerta_w / 30.4}[freq]
     urgentes = int((res["Pronto"] <= w_per).sum())
     primero = res.iloc[0]
     if len(res) == 1:
@@ -1340,6 +1395,16 @@ def analizar_agotamiento(df: pd.DataFrame, cfg) -> ResultadoPronostico:
         tarj = [(str(urgentes), "En riesgo pronto", f"podrían agotarse en menos de {num_txt(alerta_w)} días"),
                 (str(len(res)), "Elementos analizados", "ordenados del que se acaba primero al último"),
                 (duracion_txt(primero["Central"], freq) if np.isfinite(primero["Central"]) else "—", "El más urgente", str(primero["Elemento"]))]
+    return titular, nivel, tarj, urgentes, alerta_w
+
+
+def analizar_agotamiento(df: pd.DataFrame, cfg) -> ResultadoPronostico:
+    """Cuánto dura el stock de cada elemento. Director de orquesta: cada paso está en su propia función."""
+    base, avisos, derivado, df, col_ent, stock_num = _leer_consumo(df, cfg)
+    base, piv, stocks, freq, fin, k_v, idx_v = _ventana_y_stocks(base, cfg, df, col_ent, stock_num, avisos)
+    res, m, uno, varios, ultima_fecha, n_sim = _simular_elementos(base, cfg, piv, stocks, idx_v, freq, fin, avisos)
+    res, conf, motivo = _fechas_y_confianza(res, ultima_fecha, freq, varios, avisos)
+    titular, nivel, tarj, urgentes, alerta_w = _titular_agotamiento(res, cfg, freq, uno, varios)
     tabla = res.copy()
     for c in ("Pronto", "Central", "Tarde"):
         tabla = tabla.rename(columns={c: {"Pronto": f"Si se gasta rápido ({varios})", "Central": f"Lo más probable ({varios})",
@@ -1354,11 +1419,14 @@ def analizar_agotamiento(df: pd.DataFrame, cfg) -> ResultadoPronostico:
         "Cuánto dura cada elemento", None, {"frecuencia": freq, "urgentes": urgentes, "elementos": len(res)})
 
 
+
 def _siguiente_n(t: pd.Timestamp, n_periodos: float, freq: str):
     if freq == "M":
         meses = int(np.floor(n_periodos))
         base = t + pd.DateOffset(months=meses)
         return base + pd.Timedelta(days=(n_periodos - meses) * 30.4)
+    if freq == "B":
+        return t + pd.offsets.BDay(int(round(n_periodos)))
     return t + _paso(freq) * n_periodos
 
 
