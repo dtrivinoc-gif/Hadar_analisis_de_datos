@@ -14,19 +14,21 @@ Reglas que se respetan a propósito:
   * No se guarda ningún modelo (sin pickle): solo los números que ya salieron.
   * Sin Qt: se puede probar sola.
 
-Hoy guarda dos cosas: las predicciones por fila (Datos y Alarmas) y los
+Hoy guarda tres cosas: las predicciones por fila (Datos y Alarmas), los
 resultados de las «Preguntas» (proyección, agotamiento…) que el usuario
-decide llevar al Panel («Lo que se viene»).
+decide llevar al Panel («Lo que se viene»), y los resultados de comparar lo
+predicho con lo real (el «circuito de retorno», ver retorno.py).
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 
 import numpy as np
 import pandas as pd
 
 SUFIJO_SI_REPETIDA = " (Hadar)"
+_COL_ID = "__id__"
 
 
 @dataclass
@@ -34,8 +36,15 @@ class PrediccionesPublicadas:
     tabla: str                 # tabla a la que pertenecen las filas
     datos: pd.DataFrame        # mismo índice que la tabla; solo las columnas predichas
     objetivo: str              # qué se predijo
-    tipo_salida: str           # "valor" | "probabilidad" | "" (clase)
+    tipo_salida: str           # "valor" | "probabilidad" | "ranking" | "" (clase)
     calculado_en: str          # fecha y hora, en texto
+    # Para poder comparar después con lo real (retorno.py):
+    modo: str = ""             # regresion | clase | probabilidad | probabilidades | ranking
+    ids: "pd.Series | None" = None     # identificador de cada fila (la columna id de la tabla), si había
+    id_nombre: str = ""
+    clase_positiva: str = ""   # a qué clase se refiere la probabilidad (caso de 2 clases)
+    etiquetas: dict = field(default_factory=dict)      # {columna: clase} cuando hay una probabilidad por clase
+    referencia: dict = field(default_factory=dict)     # los números de validación con que se entrenó el modelo
 
 
 @dataclass
@@ -52,6 +61,7 @@ class PronosticoPublicado:
     tabla: str = ""
     calculado_en: str = ""
     aviso_critico: str = ""    # solo si hubo un aviso crítico (si no, vacío)
+    ventanas: list = field(default_factory=list)   # fechas futuras que predice (ver pronostico_base.ventana_fechas)
 
     def a_dict(self) -> dict:
         return {k: getattr(self, k) for k in self.__dataclass_fields__}
@@ -118,21 +128,38 @@ class Tablero:
     def __init__(self):
         self._pred: dict[str, PrediccionesPublicadas] = {}
         self._pron: dict[str, PronosticoPublicado] = {}
+        self._ret: dict[str, dict] = {}      # {tabla: última comparación con lo real}
 
     # ------------------------------------------------------------------ publicar
     def publicar_predicciones(self, tabla, df_tabla, salida, objetivo, *, es_probabilidad=False,
                               clases=None, tipo_salida="", posicional_seguro=False,
-                              calculado_en=None) -> PrediccionesPublicadas:
+                              calculado_en=None, referencia=None) -> PrediccionesPublicadas:
         """Guarda las predicciones de `tabla`. Lanza ValueError (con un mensaje
         en palabras simples) si no se pueden emparejar con sus filas."""
         alineada = alinear_salida(salida, df_tabla, posicional_seguro)
         nombres = _nombres_de_columnas(alineada.columns, objetivo, es_probabilidad, clases)
-        alineada = alineada[list(nombres)].rename(columns=nombres)
+        originales = list(nombres)
+        alineada = alineada[originales].rename(columns=nombres)
         existentes = {str(c) for c in df_tabla.columns}
         alineada.columns = [c + SUFIJO_SI_REPETIDA if c in existentes else c for c in alineada.columns]
+        binaria = es_probabilidad and len(clases or []) == 2 and len(originales) == 1
+        if tipo_salida == "valor":
+            modo = "regresion"
+        elif es_probabilidad:
+            modo = ("ranking" if tipo_salida == "ranking" else "probabilidad") if binaria else "probabilidades"
+        else:
+            modo = "clase"
+        id_col = salida.columns[0]
         pub = PrediccionesPublicadas(
             tabla=tabla, datos=alineada, objetivo=str(objetivo), tipo_salida=tipo_salida or "",
-            calculado_en=calculado_en or datetime.now().strftime("%d/%m/%Y %H:%M"))
+            calculado_en=calculado_en or datetime.now().strftime("%d/%m/%Y %H:%M"),
+            modo=modo,
+            ids=df_tabla[id_col].copy() if id_col in df_tabla.columns else None,
+            id_nombre=str(id_col) if id_col in df_tabla.columns else "",
+            clase_positiva=str(clases[1]) if binaria else "",
+            etiquetas=({c: str(o) for c, o in zip(alineada.columns, originales)}
+                       if es_probabilidad and not binaria else {}),
+            referencia={str(k): float(v) for k, v in (referencia or {}).items() if v is not None})
         self._pred[tabla] = pub
         return pub
 
@@ -199,7 +226,9 @@ class Tablero:
             confianza=str(getattr(r, "confianza", "media") or "media"),
             por_que_confianza=str(getattr(r, "por_que_confianza", "") or ""), tabla=str(tabla or ""),
             calculado_en=calculado_en or datetime.now().strftime("%d/%m/%Y %H:%M"),
-            aviso_critico=str(aviso_critico or ""))
+            aviso_critico=str(aviso_critico or ""),
+            ventanas=[dict(v) for v in (getattr(r, "rango_fechas", None) or [])
+                      if isinstance(v, dict) and v.get("desde")])
         self._pron[p.clave] = p
         return p
 
@@ -209,8 +238,40 @@ class Tablero:
         lista = [p for p in self._pron.values() if tabla is None or p.tabla == tabla]
         return sorted(lista, key=lambda p: _ORDEN_NIVEL.get(p.nivel, 3))
 
+    def ventanas_futuras(self, tabla=None) -> list:
+        """Las fechas futuras que predicen los pronósticos publicados (para dibujarlas, por ejemplo en la
+        Línea de Tiempo): una por elemento, con el título, el nivel y la tabla del pronóstico al que pertenecen."""
+        out = []
+        for p in self.pronosticos(tabla):
+            for v in p.ventanas:
+                out.append({**v, "titulo": p.titulo or p.palabra, "nivel": p.nivel, "tabla": p.tabla, "clave": p.clave})
+        return out
+
     def quitar_pronostico(self, clave):
         self._pron.pop(clave, None)
+
+    # ------------------------------------------------------------------ retorno (predicho vs real)
+    def publicacion(self, tabla):
+        """Las predicciones por fila de `tabla` (o None)."""
+        return self._pred.get(tabla)
+
+    def registrar_retorno(self, tabla, resultado: dict):
+        """Guarda la última comparación con lo real de `tabla` (la anterior se reemplaza)."""
+        self._ret[tabla] = dict(resultado)
+
+    def retorno(self, tabla):
+        return self._ret.get(tabla)
+
+    def retornos(self) -> list:
+        """Las comparaciones guardadas, las peores primero (alerta, atención, info, bien)."""
+        orden = {"alerta": 0, "atencion": 1, "info": 2, "bien": 3}
+        return sorted(self._ret.values(), key=lambda d: orden.get(d.get("nivel"), 4))
+
+    def quitar_retorno(self, tabla):
+        self._ret.pop(tabla, None)
+
+    def retornos_a_lista(self) -> list:
+        return list(self._ret.values())
 
     def pronosticos_a_lista(self) -> list:
         return [p.a_dict() for p in self._pron.values()]
@@ -219,31 +280,45 @@ class Tablero:
         """Algo liviano y estable que cambia cuando cambian las predicciones;
         sirve para saber si hay cambios sin guardar en el proyecto."""
         return ([(t, p.calculado_en, p.datos.shape) for t, p in sorted(self._pred.items())]
-                + [(c, p.calculado_en) for c, p in sorted(self._pron.items())])
+                + [(c, p.calculado_en) for c, p in sorted(self._pron.items())]
+                + [("retorno", t, d.get("comparado_en")) for t, d in sorted(self._ret.items())])
 
     # ------------------------------------------------------------------ olvidar
     def quitar(self, tabla):
         """Olvida todo lo que se publicó sobre `tabla` (sus datos cambiaron)."""
         self._pred.pop(tabla, None)
+        self._ret.pop(tabla, None)
         for c in [c for c, p in self._pron.items() if p.tabla == tabla]:
             del self._pron[c]
 
     def limpiar(self):
         self._pred.clear()
         self._pron.clear()
+        self._ret.clear()
 
     # ------------------------------------------------------------------ proyecto
     def a_meta(self) -> dict:
         """Lo liviano (texto) para proyecto.json; los números van aparte, en parquet."""
         return {t: {"objetivo": p.objetivo, "tipo_salida": p.tipo_salida,
-                    "calculado_en": p.calculado_en, "columnas": list(p.datos.columns)}
+                    "calculado_en": p.calculado_en, "columnas": list(p.datos.columns),
+                    "modo": p.modo, "id_nombre": p.id_nombre, "clase_positiva": p.clase_positiva,
+                    "etiquetas": dict(p.etiquetas), "referencia": dict(p.referencia)}
                 for t, p in self._pred.items()}
 
     def frames(self) -> dict:
-        return {t: p.datos for t, p in self._pred.items()}
+        """Los números predichos por tabla. Si había una columna que identifica cada fila, va aparte
+        como «__id__» (se separa de nuevo al abrir el proyecto)."""
+        out = {}
+        for t, p in self._pred.items():
+            d = p.datos
+            if p.ids is not None:
+                d = d.copy()
+                d[_COL_ID] = p.ids.to_numpy()
+            out[t] = d
+        return out
 
     @classmethod
-    def desde_proyecto(cls, meta, frames, pronosticos=None):
+    def desde_proyecto(cls, meta, frames, pronosticos=None, retornos=None):
         """Rearma el tablero de un proyecto guardado. Los proyectos antiguos no
         traen nada y quedan con el tablero vacío."""
         tb = cls()
@@ -251,11 +326,21 @@ class Tablero:
             p = PronosticoPublicado.desde_dict(d) if isinstance(d, dict) else None
             if p is not None:
                 tb._pron[p.clave] = p
+        for d in (retornos or []):
+            if isinstance(d, dict) and d.get("tabla"):
+                tb._ret[d["tabla"]] = d
         for tabla, m in (meta or {}).items():
             datos = (frames or {}).get(tabla)
             if datos is None:
                 continue
+            ids = None
+            if _COL_ID in datos.columns:
+                datos = datos.copy()
+                ids = datos.pop(_COL_ID)
             tb._pred[tabla] = PrediccionesPublicadas(
                 tabla=tabla, datos=datos, objetivo=str(m.get("objetivo", "")),
-                tipo_salida=m.get("tipo_salida", ""), calculado_en=m.get("calculado_en", ""))
+                tipo_salida=m.get("tipo_salida", ""), calculado_en=m.get("calculado_en", ""),
+                modo=m.get("modo", ""), ids=ids, id_nombre=m.get("id_nombre", ""),
+                clase_positiva=m.get("clase_positiva", ""), etiquetas=dict(m.get("etiquetas") or {}),
+                referencia=dict(m.get("referencia") or {}))
         return tb

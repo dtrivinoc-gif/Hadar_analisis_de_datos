@@ -74,7 +74,8 @@ def guardar_proyecto(ruta, *, tablas, nombre_tabla_activa, relaciones_ontologia,
                       filtro_columna, filtro_valores, notas_manuales, indicadores,
                       ml_activado=False, linea_base_ml=None, fuentes_datos=None,
                       ml_multivariado_activado=False, procedencia=None, prediccion=None,
-                      panel=None, tablero_meta=None, tablero_tablas=None, tablero_pronosticos=None):
+                      panel=None, tablero_meta=None, tablero_tablas=None, tablero_pronosticos=None,
+                      tablero_retornos=None):
     """
     ... (ver parámetros existentes arriba)
     panel: dict con lo que el usuario eligió en Personalizar del Panel (qué
@@ -92,6 +93,8 @@ def guardar_proyecto(ruta, *, tablas, nombre_tabla_activa, relaciones_ontologia,
     tablero_pronosticos: lista de dicts con los pronósticos que el usuario llevó
         al Panel («Lo que se viene»): solo texto (titular con rango, confianza,
         fecha). Tampoco es un modelo.
+    tablero_retornos: lista de dicts con la última comparación de lo predicho con
+        lo real, por tabla (ver retorno.py): solo texto y números.
     fuentes_datos: dict {nombre_tabla: {"tipo": "archivo"|"sql_server"|"api_pos", ...}}
         de dónde vino cada tabla, para poder "Actualizar desde la fuente"
         más adelante sin volver a pedir todo desde cero.
@@ -132,6 +135,7 @@ def guardar_proyecto(ruta, *, tablas, nombre_tabla_activa, relaciones_ontologia,
         "panel": json.loads(json.dumps(panel or {}, default=str)),
         "tablero": {},
         "tablero_pronosticos": json.loads(json.dumps(tablero_pronosticos or [], default=str)),
+        "tablero_retornos": json.loads(json.dumps(tablero_retornos or [], default=str)),
     }
 
     # Predicciones del tablero: guardarlas nunca debe impedir guardar el
@@ -169,7 +173,9 @@ class ProyectoCargado:
                  filtro_columna, filtro_valores, notas_manuales, indicadores_dict,
                  ml_activado=False, linea_base_ml=None, fuentes_datos=None,
                  ml_multivariado_activado=False, procedencia=None, prediccion=None,
-                 panel=None, tablero_meta=None, tablero_tablas=None, tablero_pronosticos=None):
+                 panel=None, tablero_meta=None, tablero_tablas=None, tablero_pronosticos=None,
+                 tablero_retornos=None):
+        self.tablero_retornos = tablero_retornos or []         # [] en proyectos antiguos
         self.tablero_pronosticos = tablero_pronosticos or []   # [] en proyectos antiguos
         self.tablero_meta = tablero_meta or {}       # {} en proyectos antiguos
         self.tablero_tablas = tablero_tablas or {}   # {nombre_tabla: DataFrame con las predicciones}
@@ -237,6 +243,7 @@ def abrir_proyecto(ruta):
             tablero_meta=tablero_meta,
             tablero_tablas=tablero_tablas,
             tablero_pronosticos=metadata.get("tablero_pronosticos", []),
+            tablero_retornos=metadata.get("tablero_retornos", []),
         )
 
 

@@ -31,10 +31,11 @@ from PySide6.QtGui import QColor, QPen, QCursor, QPixmap, QPainter, QAction, QKe
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QComboBox, QPushButton,
     QGraphicsLineItem, QDialog, QDialogButtonBox, QMessageBox, QToolButton,
-    QMenu, QFrame, QScrollArea,
+    QMenu, QFrame, QScrollArea, QCheckBox,
 )
 
 from .config import COLOR_ACCENT, COLOR_DANGER, DONUT_PALETTE
+from .linea_tiempo_futuro import dibujar_ventanas, quitar_ventanas
 from .anomalias import detectar_columnas_fecha, SemanticAnomalyDetector
 from .linea_tiempo import (
     sugerir_pares_temporales, construir_serie_hitos, construir_intervalos,
@@ -389,6 +390,18 @@ class LineaTiempoPanel(QWidget):
         self.menu_columnas_mostrar = _MenuMultiCheck(self.btn_columnas_mostrar)
         self.btn_columnas_mostrar.setMenu(self.menu_columnas_mostrar)
         toolbar.addWidget(self.btn_columnas_mostrar)
+
+        # «Lo que se viene»: dibuja sobre el eje de fechas las ventanas de tiempo que predicen los
+        # pronósticos que se llevaron al Panel (agotamiento, umbral, saturación, vida útil).
+        self._items_futuro = []
+        self.chk_futuro = QCheckBox("Mostrar lo que se viene")
+        self.chk_futuro.setToolTip(
+            "Marca en la línea de tiempo las fechas futuras que predicen los pronósticos que llevaste al Panel "
+            "(desde Predicción > Preguntas > «Llevar al Panel»). Franja = entre dos fechas; línea punteada = la "
+            "fecha más probable. Son estimaciones, no datos.")
+        self.chk_futuro.setEnabled(False)
+        self.chk_futuro.toggled.connect(lambda _=False: self._dibujar_futuro())
+        toolbar.addWidget(self.chk_futuro)
         toolbar.addStretch()
         layout.addLayout(toolbar)
 
@@ -676,6 +689,8 @@ class LineaTiempoPanel(QWidget):
     # ------------------------------------------------------------------
     def _limpiar_plots(self):
         self._ocultar_popups()
+        quitar_ventanas(self.plot_principal, getattr(self, "_items_futuro", []))
+        self._items_futuro = []
         for scatter in self._scatters_hitos.values():
             self.plot_principal.removeItem(scatter)
         self._scatters_hitos.clear()
@@ -805,6 +820,7 @@ class LineaTiempoPanel(QWidget):
         self._dibujar_hitos_multi(df)
         self._redibujar_conexiones(df)
         self._pintar_marcadores_anomalias()
+        self._dibujar_futuro()
 
         # Bug real: self._columnas_mostrar guarda tuplas (tabla, columna)
         # desde que "Fechas a mostrar" se extendió a otras tablas -- un
@@ -1177,6 +1193,38 @@ class LineaTiempoPanel(QWidget):
         finally:
             self._actualizando_desde_slider = False
         self._redibujar_principal()
+
+    def _dibujar_futuro(self):
+        """Dibuja (o quita) las ventanas de «lo que se viene» según el interruptor. Si hay fechas futuras,
+        amplía el eje para que se vean junto a los datos."""
+        quitar_ventanas(self.plot_principal, self._items_futuro)
+        self._items_futuro = []
+        tablero = getattr(self.host, "tablero", None)
+        ventanas = tablero.ventanas_futuras() if tablero is not None else []
+        self.chk_futuro.setEnabled(bool(ventanas))
+        if not ventanas:
+            self.chk_futuro.setToolTip(
+                "Todavía no hay fechas futuras que mostrar. Calcula un agotamiento, umbral, saturación o vida útil "
+                "en Predicción > Preguntas y usa «Llevar al Panel».")
+        if not ventanas or not self.chk_futuro.isChecked():
+            self.plot_principal.enableAutoRange(axis="x")      # el eje vuelve a ajustarse a los datos
+            return
+        items, extremos = dibujar_ventanas(self.plot_principal, ventanas)
+        self._items_futuro = items
+        if extremos is None:
+            return
+        xs = getattr(self, "_hitos_xs_ordenados", None)
+        lo, hi = extremos
+        if xs is not None and len(xs):
+            lo, hi = min(lo, float(np.min(xs))), max(hi, float(np.max(xs)))
+        self.plot_principal.setXRange(lo, hi, padding=0.04)
+
+    def refrescar_futuro(self):
+        """Lo llama la ventana principal cuando se lleva un pronóstico nuevo al Panel (o se quita)."""
+        try:
+            self._dibujar_futuro()
+        except Exception:
+            pass
 
     def refrescar_vista(self):
         """Redibuja con los filtros de Datos actuales (buscador de filas,

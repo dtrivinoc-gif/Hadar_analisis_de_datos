@@ -160,6 +160,7 @@ class ResultadoPronostico:
     metricas: dict = field(default_factory=dict)
     experto: dict | None = field(default=None, repr=False)   # detalles técnicos (modo experto): filas, métodos, residuos
     tipo_salida: str = ""            # qué es el número que se entrega: valor | probabilidad | ranking (ver TEXTO_TIPO_SALIDA)
+    rango_fechas: list = field(default_factory=list)   # fechas FUTURAS que predice, como dato (ver ventana_fechas); [] si no aplica
 
     def lineas_resumen(self) -> list:
         lineas = [self.titular]
@@ -177,6 +178,26 @@ class ResultadoPronostico:
 
     def texto(self) -> str:
         return "\n".join(self.lineas_resumen())
+
+
+def ventana_fechas(etiqueta, desde, hasta=None, probable=None, horizonte_hasta=None):
+    """Una ventana de fechas futuras que predice una respuesta, como dato (no como texto del titular).
+    Fechas en texto ISO (seguro para guardar en el proyecto). `desde` es la más temprana razonable; `hasta`, la más
+    tardía (None = no se sabe, «en adelante»); `probable`, la más probable; `horizonte_hasta`, hasta dónde se miró.
+    Devuelve None si no hay una fecha de inicio válida."""
+    def iso(t):
+        if t is None:
+            return None
+        try:
+            t = pd.Timestamp(t)
+        except (ValueError, TypeError):
+            return None
+        return None if pd.isna(t) else t.isoformat()
+    d = iso(desde)
+    if d is None:
+        return None
+    return {"etiqueta": str(etiqueta), "desde": d, "hasta": iso(hasta), "probable": iso(probable),
+            "horizonte_hasta": iso(horizonte_hasta)}
 
 
 def confianza_por_datos(n_eventos_o_periodos: int, minimo: int, bueno: int) -> str:

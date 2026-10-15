@@ -13,6 +13,8 @@ Flujo para el usuario:
   4. "Generar predicciones…": guarda un CSV listo para entregar.
   5. "Usar en Datos y Alarmas": deja las predicciones por fila a la vista de
      las otras pestañas (ver tablero.py), sin guardar ningún archivo.
+  6. "Comparar con lo real…": cuando ya se sabe lo que pasó, compara lo predicho
+     con lo real y dice si acertó tanto como prometía (ver retorno.py).
 
 Cada proyecto guarda su propia configuración (ver proyecto.py); el modelo
 entrenado NO se guarda, se reentrena con un clic (ver nota en prediccion.py).
@@ -25,7 +27,7 @@ from PySide6.QtGui import QColor, QFont, QPainter, QPen
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog,
     QFrame, QGridLayout, QHBoxLayout, QHeaderView, QLabel, QMenu, QMessageBox, QProgressBar,
-    QPushButton, QScrollArea, QSpinBox, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
+    QInputDialog, QPushButton, QScrollArea, QSpinBox, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
 from .avisos import CRITICO, ETIQUETA as ETIQUETA_AVISO, IMPORTANTE, ordenar_avisos
@@ -37,6 +39,8 @@ try:
     import pyqtgraph as pg
 except Exception:  # sin pyqtgraph se omite solo el gráfico
     pg = None
+from .retorno import referencia_de
+from .retorno_ui import DialogoComparar, mostrar_resultado
 from .relacional import Enlace, SIN_FECHA, enlaces_disponibles, preparar
 from .prediccion_pdf import ContextoPDF, exportar_pdf
 from .prediccion import _fmt as _formatear
@@ -603,6 +607,15 @@ class PanelPrediccion(QWidget):
         self.btn_usar.clicked.connect(self._usar_en_otras_pestanas)
         self.btn_usar.setEnabled(False)
         fila2.addWidget(self.btn_usar)
+        # Siempre disponible si hay tablero: las predicciones pueden venir de un proyecto
+        # guardado (donde ya no existe el modelo), y para comparar no hace falta el modelo.
+        self.btn_comparar = QPushButton("Comparar con lo real…")
+        self.btn_comparar.setToolTip(
+            "Cuando ya sabes lo que pasó: compara las predicciones que dejaste en Datos y Alarmas con el "
+            "resultado real y te dice si Hadar acertó tanto como prometía.")
+        self.btn_comparar.clicked.connect(self._comparar_con_lo_real)
+        self.btn_comparar.setVisible(getattr(self.host, "tablero", None) is not None)
+        fila2.addWidget(self.btn_comparar)
         self.btn_pdf = QPushButton("Exportar PDF ▾")
         menu_pdf = QMenu(self.btn_pdf)
         accion_todo = menu_pdf.addAction("Todo (configuración y resultados)")
@@ -1593,7 +1606,7 @@ class PanelPrediccion(QWidget):
             tablero.publicar_predicciones(
                 nombre, original, salida, r.objetivo, es_probabilidad=es_prob, clases=r.clases,
                 tipo_salida=getattr(salida, "attrs", {}).get("tipo_salida", ""),
-                posicional_seguro=self._df_test_ef is None)
+                posicional_seguro=self._df_test_ef is None, referencia=referencia_de(r))
         except Exception as e:
             QApplication.restoreOverrideCursor()
             QMessageBox.warning(self, "No se pudo usar la predicción", str(e))
@@ -1608,6 +1621,37 @@ class PanelPrediccion(QWidget):
         avisos = list(getattr(salida, "attrs", {}).get("avisos", []))
         if avisos:
             QMessageBox.information(self, "Predicciones listas", "Ojo:\n" + "\n".join("• " + a for a in avisos))
+
+    def _comparar_con_lo_real(self):
+        """Compara las predicciones que están en el tablero con lo que de verdad pasó."""
+        tablero = getattr(self.host, "tablero", None)
+        if tablero is None:
+            return
+        con_pred = [t for t in tablero.tablas() if tablero.publicacion(t) is not None]
+        if not con_pred:
+            QMessageBox.information(
+                self, "Todavía no hay predicciones",
+                "Primero usa «Usar en Datos y Alarmas» para dejar predicciones por fila. Después, cuando ya "
+                "sepas lo que pasó, vuelve aquí para compararlas.")
+            return
+        tabla = self.combo_test.currentText()
+        if tabla not in con_pred:
+            if len(con_pred) == 1:
+                tabla = con_pred[0]
+            else:
+                tabla, ok = QInputDialog.getItem(self, "¿Cuáles predicciones?", "Tabla de las predicciones:",
+                                                 con_pred, 0, False)
+                if not ok:
+                    return
+        pub = tablero.publicacion(tabla)
+        dlg = DialogoComparar(self, getattr(self.host, "tablas", {}) or {}, pub)
+        if dlg.exec() != DialogoComparar.Accepted or dlg.resultado is None:
+            return
+        tablero.registrar_retorno(tabla, dlg.resultado)
+        avisar = getattr(self.host, "_retorno_registrado", None)
+        if avisar is not None:
+            avisar(tabla)
+        mostrar_resultado(self, dlg.resultado)
 
     def _generar_predicciones(self):
         df = self._df_test_ef if self._df_test_ef is not None else self._df_prueba()

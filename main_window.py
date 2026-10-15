@@ -2687,6 +2687,7 @@ class HadarApp(QMainWindow):
                 tablero_meta=self.tablero.a_meta(),
                 tablero_tablas=self.tablero.frames(),
                 tablero_pronosticos=self.tablero.pronosticos_a_lista(),
+                tablero_retornos=self.tablero.retornos_a_lista(),
             )
         except Exception as e:
             QMessageBox.critical(self, "Error al guardar el proyecto", str(e))
@@ -2720,7 +2721,8 @@ class HadarApp(QMainWindow):
         self.tablas = datos_proyecto.tablas
         # Las predicciones guardadas con el proyecto (vacío en proyectos antiguos).
         self.tablero = Tablero.desde_proyecto(
-            datos_proyecto.tablero_meta, datos_proyecto.tablero_tablas, datos_proyecto.tablero_pronosticos)
+            datos_proyecto.tablero_meta, datos_proyecto.tablero_tablas, datos_proyecto.tablero_pronosticos,
+            datos_proyecto.tablero_retornos)
         self.nombre_tabla_activa = (
             datos_proyecto.nombre_tabla_activa if datos_proyecto.nombre_tabla_activa in self.tablas
             else next(iter(self.tablas))
@@ -3167,10 +3169,19 @@ class HadarApp(QMainWindow):
             self.statusBar().showMessage(
                 f"Predicciones listas para «{tabla}». Elige esa tabla en Datos para verlas.", 10000)
 
+    def _retorno_registrado(self, tabla):
+        """La pestaña Predicción comparó lo predicho con lo real."""
+        if hasattr(self, "panel_control"):
+            self.panel_control.notificar_cambio()
+        self.statusBar().showMessage(
+            f"Comparación de «{tabla}» guardada. Se ve en el Panel, en «Qué tan bien acertó».", 8000)
+
     def _pronostico_publicado(self, titulo):
         """La pestaña Predicción (Preguntas) llevó una respuesta al Panel."""
         if hasattr(self, "panel_control"):
             self.panel_control.notificar_cambio()
+        if hasattr(self, "panel_linea_tiempo"):
+            self.panel_linea_tiempo.refrescar_futuro()
         self.statusBar().showMessage(f"«{titulo}» agregado al Panel, en «Lo que se viene».", 8000)
 
     def apply_table_filter(self):

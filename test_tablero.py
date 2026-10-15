@@ -368,5 +368,330 @@ class TestPronosticos(unittest.TestCase):
         self.assertEqual(t2.pronosticos()[0].a_dict(), t.pronosticos()[0].a_dict())
 
 
+class TestRetorno(unittest.TestCase):
+    """Comparar lo predicho con lo que de verdad pasó, con el motor real y respuesta conocida."""
+
+    @classmethod
+    def setUpClass(cls):
+        try:
+            from hadar import prediccion as P
+            from hadar import retorno as R
+        except ImportError:
+            import prediccion as P
+            import retorno as R
+        cls.P, cls.R = P, R
+        rng = np.random.default_rng(3)
+        n = 4000
+        d = pd.DataFrame({"cliente_id": np.arange(n), "precio": rng.normal(100, 20, n),
+                          "tienda": rng.choice(list("ABCDE"), n)})
+        d["ventas"] = d["precio"] * 0.5 + (d["tienda"] == "A") * 30 + rng.normal(0, 3, n)
+        z = (d["precio"] - 100) / 15 + (d["tienda"] == "A") * 1.0
+        d["alto"] = np.where(rng.random(n) < 1 / (1 + np.exp(-z)), "si", "no")
+        cls.entrena = d.iloc[:2500].reset_index(drop=True)
+        cls.futuro = d.iloc[2500:].reset_index(drop=True)             # lo que «todavía no pasó»
+        cls.prueba = cls.futuro.drop(columns=["ventas", "alto"]).copy()
+        cls.prueba.index = cls.prueba.index + 7000                    # índice distinto, a propósito
+
+    def _publicar(self, objetivo, salida="clase", n_prueba=None):
+        P = self.P
+        otra = "alto" if objetivo == "ventas" else "ventas"
+        cfg = P.ConfigPrediccion(tabla_entrenamiento="t", objetivo=objetivo, salida=salida, max_iter=60)
+        sug = P.sugerir_columnas(self.entrena, objetivo)
+        res = P.entrenar(self.entrena, cfg, P.columnas_a_usar(sug, {otra: "ignorar"}), progreso=lambda *_: None)
+        prueba = self.prueba if n_prueba is None else self.prueba.iloc[:n_prueba]
+        sal = P.predecir(res, prueba, "cliente_id", salida)
+        t = Tablero()
+        es_prob = res.tipo != "regresion" and salida == "probabilidad"
+        pub = t.publicar_predicciones("prueba", prueba, sal, res.objetivo, es_probabilidad=es_prob,
+                                      clases=res.clases, tipo_salida=sal.attrs.get("tipo_salida", ""),
+                                      referencia=self.R.referencia_de(res))
+        return t, pub, res
+
+    def test_regresion_que_acierta_como_prometia(self):
+        t, pub, res = self._publicar("ventas")
+        self.assertEqual(pub.modo, "regresion")
+        self.assertIn("mae", pub.referencia)
+        real = self.futuro[["cliente_id", "ventas"]].sample(frac=1, random_state=0)     # otro orden
+        r = self.R.comparar(pub, real, "ventas", "cliente_id")
+        self.assertEqual((r["n_comparadas"], r["emparejadas_por"]), (1500, "id"))
+        self.assertEqual(r["nivel"], "bien", r["lineas"])
+        self.assertLess(r["numeros"]["veces_lo_esperado"], 1.25)
+
+    def test_regresion_cuando_la_realidad_cambio(self):
+        t, pub, res = self._publicar("ventas")
+        real = self.futuro[["cliente_id", "ventas"]].copy()
+        real["ventas"] = real["ventas"] * 2 + 50                          # el mundo cambió
+        r = self.R.comparar(pub, real, "ventas", "cliente_id")
+        self.assertEqual(r["nivel"], "alerta", r["lineas"])
+        self.assertTrue(any("veces ese" in l for l in r["lineas"]))
+        self.assertTrue(any("de menos" in l for l in r["lineas"]))        # predijo de menos: lo dice
+
+    def test_probabilidad_bien_calibrada_y_mal_calibrada(self):
+        t, pub, res = self._publicar("alto", salida="probabilidad")
+        self.assertEqual((pub.modo, pub.clase_positiva), ("probabilidad", str(res.clases[1])))
+        bueno = self.R.comparar(pub, self.futuro[["cliente_id", "alto"]], "alto", "cliente_id")
+        self.assertIn(bueno["nivel"], ("bien", "atencion"), bueno["lineas"])
+        self.assertIsNotNone(bueno["numeros"]["brier"])
+        invertido = self.futuro[["cliente_id", "alto"]].copy()
+        invertido["alto"] = invertido["alto"].map({"si": "no", "no": "si"})   # la realidad contradice al modelo
+        malo = self.R.comparar(pub, invertido, "alto", "cliente_id")
+        self.assertEqual(malo["nivel"], "alerta", malo["lineas"])
+        self.assertTrue(any("No mejora" in l or "Ojo" in l for l in malo["lineas"]))
+
+    def test_clase_exacta(self):
+        t, pub, res = self._publicar("alto", salida="clase")
+        self.assertEqual(pub.modo, "clase")
+        r = self.R.comparar(pub, self.futuro[["cliente_id", "alto"]], "alto", "cliente_id")
+        self.assertGreater(r["numeros"]["accuracy"], 0.6)
+        self.assertNotEqual(r["nivel"], "alerta", r["lineas"])
+
+    def test_pocos_casos_no_se_pone_nota(self):
+        t, pub, res = self._publicar("ventas", n_prueba=12)
+        r = self.R.comparar(pub, self.futuro[["cliente_id", "ventas"]], "ventas", "cliente_id")
+        self.assertEqual(r["n_comparadas"], 12)
+        self.assertEqual(r["nivel"], "info")
+        self.assertTrue(any("pocos casos" in l for l in r["lineas"]))
+
+    def test_filas_sin_valor_real_todavia(self):
+        t, pub, res = self._publicar("ventas")
+        real = self.futuro[["cliente_id", "ventas"]].copy()
+        real.loc[real.index[:100], "ventas"] = np.nan                    # esas todavía no ocurrieron
+        r = self.R.comparar(pub, real, "ventas", "cliente_id")
+        self.assertEqual((r["n_comparadas"], r["n_sin_real"]), (1400, 100))
+        self.assertTrue(any("todavía no tienen valor real" in l for l in r["lineas"]))
+
+    def test_emparejar_con_cuidado(self):
+        t, pub, res = self._publicar("ventas")
+        real = self.futuro[["cliente_id", "ventas"]]
+        # sin id: solo si son las mismas filas en el mismo orden
+        r = self.R.comparar(pub, real, "ventas")
+        self.assertEqual(r["emparejadas_por"], "orden")
+        self.assertTrue(any("por su orden" in l for l in r["lineas"]))
+        with self.assertRaises(ValueError) as cm:
+            self.R.comparar(pub, real.iloc[:-5], "ventas")
+        self.assertIn("mismas filas", str(cm.exception))
+        # id repetido en la tabla real
+        dup = real.copy()
+        dup["cliente_id"] = 1
+        with self.assertRaises(ValueError):
+            self.R.comparar(pub, dup, "ventas", "cliente_id")
+        # el id llega como texto en un lado y como número en el otro
+        texto = real.assign(cliente_id=real["cliente_id"].astype(str))
+        self.assertEqual(self.R.comparar(pub, texto, "ventas", "cliente_id")["n_comparadas"], 1500)
+        # columna que no existe
+        with self.assertRaises(ValueError):
+            self.R.comparar(pub, real, "no_existe", "cliente_id")
+        # ninguna fila en común
+        ajeno = real.assign(cliente_id=real["cliente_id"] + 10**6)
+        with self.assertRaises(ValueError):
+            self.R.comparar(pub, ajeno, "ventas", "cliente_id")
+
+    def test_predicciones_sin_id_no_se_emparejan_por_id(self):
+        df = _tabla(con_id=False)
+        t = Tablero()
+        pub = t.publicar_predicciones("t", df, pd.DataFrame({"Id": np.arange(6), "y": np.arange(6.0)}), "y",
+                                      tipo_salida="valor", posicional_seguro=True)
+        self.assertIsNone(pub.ids)
+        real = pd.DataFrame({"k": np.arange(6), "y": np.arange(6.0)})
+        with self.assertRaises(ValueError) as cm:
+            self.R.comparar(pub, real, "y", "k")
+        self.assertIn("identifique cada fila", str(cm.exception))
+        self.assertEqual(self.R.comparar(pub, real, "y")["emparejadas_por"], "orden")
+
+    def test_sobrevive_al_guardar_y_abrir_el_proyecto(self):
+        import tempfile, os
+        try:
+            from hadar import proyecto
+        except ImportError:
+            import proyecto
+        t, pub, res = self._publicar("alto", salida="probabilidad")
+        real = self.futuro[["cliente_id", "alto"]]
+        antes = self.R.comparar(pub, real, "alto", "cliente_id", comparado_en="x")
+        t.registrar_retorno("prueba", antes)
+        ruta = os.path.join(tempfile.mkdtemp(), "p.hadarproy")
+        proyecto.guardar_proyecto(ruta, tablas={"prueba": self.prueba}, nombre_tabla_activa="prueba",
+                                  relaciones_ontologia=None, filtro_columna=None, filtro_valores=[],
+                                  notas_manuales={}, indicadores=[], tablero_meta=t.a_meta(),
+                                  tablero_tablas=t.frames(), tablero_retornos=t.retornos_a_lista())
+        p = proyecto.abrir_proyecto(ruta)
+        t2 = Tablero.desde_proyecto(p.tablero_meta, p.tablero_tablas, p.tablero_pronosticos, p.tablero_retornos)
+        pub2 = t2.publicacion("prueba")
+        self.assertEqual((pub2.modo, pub2.clase_positiva, pub2.id_nombre), (pub.modo, pub.clase_positiva, "cliente_id"))
+        self.assertEqual(pub2.referencia, pub.referencia)
+        despues = self.R.comparar(pub2, real, "alto", "cliente_id", comparado_en="x")
+        self.assertEqual(antes, despues)                                   # mismo resultado tras reabrir
+        self.assertEqual(t2.retorno("prueba"), antes)
+        self.assertNotIn("__id__", t2.con_predicciones(self.prueba, "prueba").columns)   # el id no se cuela en Datos
+
+    def test_retornos_en_el_tablero(self):
+        t = Tablero()
+        antes = t.firma()
+        t.registrar_retorno("a", {"tabla": "a", "nivel": "bien", "comparado_en": "1"})
+        t.registrar_retorno("b", {"tabla": "b", "nivel": "alerta", "comparado_en": "2"})
+        self.assertNotEqual(antes, t.firma())
+        self.assertEqual([d["tabla"] for d in t.retornos()], ["b", "a"])    # lo peor primero
+        t.quitar("b")                                                      # esa tabla cambió
+        self.assertEqual([d["tabla"] for d in t.retornos()], ["a"])
+        t.limpiar()
+        self.assertEqual(t.retornos(), [])
+        self.assertEqual(Tablero.desde_proyecto({}, {}, None, [{"basura": 1}, "x"]).retornos(), [])
+
+
+class TestFechasFuturasDelMotor(unittest.TestCase):
+    """Las preguntas que responden con fechas las entregan también como dato (rango_fechas), no solo en el titular.
+    Datos inventados de respuesta conocida; el motor es el de verdad."""
+
+    @classmethod
+    def setUpClass(cls):
+        try:
+            from hadar import pronosticos as PR
+            from hadar.pronostico_base import fecha_txt, ventana_fechas
+        except ImportError:
+            import pronosticos as PR
+            from pronostico_base import fecha_txt, ventana_fechas
+        cls.PR, cls.fecha_txt, cls.ventana_fechas = PR, staticmethod(fecha_txt), staticmethod(ventana_fechas)
+        rng = np.random.default_rng(1)
+        n = 240
+        f = pd.date_range("2026-01-01", periods=n, freq="D")
+        cls.ultimo = f[-1]
+        v = 100 + 0.8 * np.arange(n) + 6 * np.sin(2 * np.pi * np.arange(n) / 7) + rng.normal(0, 4, n)
+        cls.serie = pd.DataFrame({"fecha": f, "valor": v})
+        filas = []
+        for prod, (stock0, cons) in {"A": (400, 8), "B": (900, 6), "C": (300, 2)}.items():
+            st = stock0
+            for d in f[-60:]:
+                st -= max(0, rng.normal(cons, 1.5))
+                filas.append((d, prod, max(st, 0)))
+        cls.stock = pd.DataFrame(filas, columns=["fecha", "producto", "stock"])
+        ev = []
+        for m in range(12):
+            t = pd.Timestamp("2026-01-01") + pd.Timedelta(days=int(rng.integers(0, 20)))
+            while t < pd.Timestamp("2026-08-30"):
+                ev.append((t, f"M{m}"))
+                t += pd.Timedelta(days=int(rng.normal(30, 5)))
+        cls.eventos = pd.DataFrame(ev, columns=["fecha", "maquina"])
+
+    def _correr(self, palabra, df, **kw):
+        return self.PR.ejecutar(self.PR.ConfigPronostico(palabra=palabra, tabla="t", **kw), {"t": df})
+
+    def _t(self, texto):
+        return pd.Timestamp(texto)
+
+    def test_umbral_que_se_cruza(self):
+        r = self._correr("umbral", self.serie, columna_fecha="fecha", columna_valor="valor", umbral=330.0,
+                         agregacion="promedio")
+        self.assertEqual(len(r.rango_fechas), 1)
+        w = r.rango_fechas[0]
+        desde, probable, hasta = self._t(w["desde"]), self._t(w["probable"]), self._t(w["hasta"])
+        self.assertTrue(self.ultimo < desde <= probable <= hasta <= self._t(w["horizonte_hasta"]))
+        for fecha in (desde, probable, hasta):                       # el dato dice lo mismo que el titular
+            self.assertIn(self.fecha_txt(fecha), r.titular)
+
+    def test_umbral_que_no_se_cruza_no_inventa_fechas(self):
+        r = self._correr("umbral", self.serie, columna_fecha="fecha", columna_valor="valor", umbral=5000.0,
+                         agregacion="promedio")
+        self.assertEqual(r.rango_fechas, [])
+
+    def test_saturacion(self):
+        r = self._correr("saturacion", self.serie, columna_fecha="fecha", columna_valor="valor", capacidad=330.0,
+                         agregacion="max")
+        w = r.rango_fechas[0]
+        self.assertIsNone(w["hasta"])                                # «desde»: no hay fecha tardía
+        self.assertTrue(self.ultimo < self._t(w["desde"]) <= self._t(w["probable"]) <= self._t(w["horizonte_hasta"]))
+        self.assertIn(self.fecha_txt(self._t(w["probable"])), r.titular)
+        ya = self._correr("saturacion", self.serie, columna_fecha="fecha", columna_valor="valor", capacidad=100.0,
+                          agregacion="max")
+        self.assertEqual(ya.rango_fechas, [])                        # ya está saturado: no hay «cuándo»
+
+    def test_agotamiento_por_elemento(self):
+        r = self._correr("agotamiento", self.stock, columna_fecha="fecha", columna_stock="stock",
+                         columna_entidad="producto")
+        etiquetas = [w["etiqueta"] for w in r.rango_fechas]
+        self.assertEqual(etiquetas[0], "A")                          # el más urgente primero
+        self.assertLessEqual(len(etiquetas), 5)
+        self.assertIn("«A»", r.titular)
+        for w in r.rango_fechas:
+            self.assertGreaterEqual(self._t(w["desde"]), self.ultimo)
+            if w["hasta"]:
+                self.assertTrue(self._t(w["desde"]) <= self._t(w["probable"]) <= self._t(w["hasta"]))
+        desde_c = self._t(next(w for w in r.rango_fechas if w["etiqueta"] == "C")["desde"])
+        desde_b = self._t(next(w for w in r.rango_fechas if w["etiqueta"] == "B")["desde"])
+        self.assertLess(desde_c, desde_b)                            # C tiene menos stock y gasta poco: igual antes que B
+
+    def test_vida_util_coincide_con_la_tabla(self):
+        r = self._correr("vida_util", self.eventos, columna_fecha="fecha", columna_entidad="maquina")
+        self.assertTrue(0 < len(r.rango_fechas) <= 5)
+        w = r.rango_fechas[0]
+        self.assertEqual(w["etiqueta"], str(r.tabla.iloc[0]["Elemento"]))
+        self.assertEqual(self._t(w["probable"]), r.tabla.iloc[0]["Fecha central"])
+        self.assertTrue(self._t(w["desde"]) <= self._t(w["probable"]) <= self._t(w["hasta"]))
+
+    def test_las_demas_preguntas_siguen_sin_fechas(self):
+        r = self._correr("tendencia", self.serie, columna_fecha="fecha", columna_valor="valor", agregacion="promedio")
+        self.assertEqual(r.rango_fechas, [])
+
+    def test_ventana_fechas_a_prueba_de_datos_malos(self):
+        vf = self.ventana_fechas
+        self.assertIsNone(vf("x", None))
+        self.assertIsNone(vf("x", pd.NaT))
+        self.assertIsNone(vf("x", "no es una fecha"))
+        w = vf("x", pd.Timestamp("2026-10-01"), pd.NaT, "2026-10-03")
+        self.assertEqual((w["desde"][:10], w["hasta"], w["probable"][:10]), ("2026-10-01", None, "2026-10-03"))
+        import json
+        json.dumps(w)                                                # se puede guardar en el proyecto
+
+
+class TestFechasFuturasEnElTablero(unittest.TestCase):
+    def _r(self, ventanas, nivel="alerta"):
+        r = _resultado(nivel=nivel)
+        r.rango_fechas = ventanas
+        return r
+
+    def test_se_guardan_y_se_listan_con_su_contexto(self):
+        try:
+            from hadar.pronostico_base import ventana_fechas
+        except ImportError:
+            from pronostico_base import ventana_fechas
+        t = Tablero()
+        t.publicar_pronostico("a", self._r([ventana_fechas("A", "2026-11-01", "2026-11-10", "2026-11-05"),
+                                            ventana_fechas("B", "2026-12-01")]), tabla="stock")
+        t.publicar_pronostico("b", self._r([ventana_fechas("v", "2026-12-05", None, None, "2027-01-01")], "info"),
+                              tabla="ventas")
+        v = t.ventanas_futuras()
+        self.assertEqual([x["etiqueta"] for x in v], ["A", "B", "v"])           # la alerta primero
+        self.assertEqual((v[0]["tabla"], v[0]["nivel"], v[0]["titulo"]), ("stock", "alerta", "Agotamiento"))
+        self.assertEqual([x["etiqueta"] for x in t.ventanas_futuras("ventas")], ["v"])
+        t.quitar_pronostico("a")
+        self.assertEqual([x["etiqueta"] for x in t.ventanas_futuras()], ["v"])
+
+    def test_sobreviven_al_proyecto_y_los_antiguos_abren_sin_ventanas(self):
+        try:
+            from hadar.pronostico_base import ventana_fechas
+        except ImportError:
+            from pronostico_base import ventana_fechas
+        t = Tablero()
+        t.publicar_pronostico("a", self._r([ventana_fechas("A", "2026-11-01", "2026-11-10", "2026-11-05")]), tabla="stock")
+        t2 = Tablero.desde_proyecto({}, {}, t.pronosticos_a_lista())
+        self.assertEqual(t2.ventanas_futuras(), t.ventanas_futuras())
+        lista = t.pronosticos_a_lista()
+        for d in lista:
+            d.pop("ventanas")                                       # como se guardaba antes de existir
+        self.assertEqual(Tablero.desde_proyecto({}, {}, lista).ventanas_futuras(), [])
+        self.assertEqual(len(Tablero.desde_proyecto({}, {}, lista).pronosticos()), 1)
+
+    def test_ventanas_malas_o_ausentes_no_rompen(self):
+        t = Tablero()
+        t.publicar_pronostico("a", self._r([{"etiqueta": "sin desde"}, "x", None]), tabla="t")
+        self.assertEqual(t.ventanas_futuras(), [])
+        sin_campo = _resultado()
+        del_attr = getattr(sin_campo, "rango_fechas", None)
+        t.publicar_pronostico("b", sin_campo, tabla="t")                 # un resultado que no trae el campo
+        self.assertEqual(t.ventanas_futuras(), [])
+        class Antiguo:                                                     # un objeto de una versión sin el campo
+            palabra, titulo, titular, nivel, confianza, por_que_confianza = "umbral", "Umbral", "x", "info", "media", ""
+        t.publicar_pronostico("c", Antiguo(), tabla="t")
+        self.assertEqual(t.ventanas_futuras(), [])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -104,20 +104,34 @@ class RelacionSugerida:
     razon: str                              # explicación en español, para mostrar al usuario
     tabla_principal: str | None = None      # cuál de las dos tablas parece ser la "principal" (PK)
     columna_principal: str | None = None
-    certeza_direccion: str = "sin_definir"  # "alta" | "media" | "sin_definir"
-    # "alta": una de las dos columnas es casi toda valores únicos (huella clásica de PK),
-    #         o el usuario confirmó/corrigió la dirección a mano (ver direccion_confirmada).
-    # "media": ninguna es claramente única, pero una tabla es notoriamente más chica
-    #          que la otra (pista más débil, pensada como padre de una relación 1-a-N).
-    # "sin_definir": no hay pista suficiente -- tabla_principal queda en None y el
-    #                motor de contagio (u otra parte de la app) no debería asumir dirección
-    #                sin que el usuario la confirme a mano.
+    certeza_direccion: str = "sin_definir"  # "alta" | "sin_definir"
+    # "alta": en una relación 1-a-N, el lado cuyos valores son (casi) todos únicos es
+    #         el padre mientras el otro lado repite valores; o el usuario confirmó/corrigió
+    #         la dirección a mano (ver direccion_confirmada).
+    # "sin_definir": no hay padre/hijo. Ocurre en dos casos MUY distintos, que se
+    #         distinguen con `cardinalidad`:
+    #           - "uno_a_uno": no hay nada que asignar (ambas columnas son únicas). No es
+    #             un problema; la interfaz NO debe pedir confirmación.
+    #           - "muchos_a_muchos": ambas columnas repiten valores; el usuario puede
+    #             indicar la principal a mano. tabla_principal queda en None.
+    #         El motor de contagio no debe asumir dirección mientras sea None.
     direccion_confirmada: bool = False      # True si un humano eligió/corrigió tabla_principal
     # a mano en el diagrama (distinto de 'manual', que es toda la relación
     # agregada a mano). Sirve para que "Detectar automáticamente de nuevo"
     # no pise la corrección del usuario.
     manual: bool = False                    # True si el usuario la agregó a mano (no la detectó el motor)
     detalle: dict = field(default_factory=dict)  # datos extra por si la UI los quiere (opcional)
+    cardinalidad: str = "sin_definir"       # "uno_a_uno", "uno_a_muchos", "muchos_a_muchos", "sin_definir"
+
+    @property
+    def direccion_pendiente(self) -> bool:
+        """True solo cuando falta una decisión del usuario sobre la dirección.
+        Una relación 1-a-1 NO queda pendiente: no existe padre/hijo que elegir."""
+        return (
+            not self.manual
+            and self.certeza_direccion == "sin_definir"
+            and self.cardinalidad != "uno_a_uno"
+        )
 
     def como_texto(self) -> str:
         """Frase corta lista para mostrar en la interfaz."""
@@ -182,7 +196,7 @@ def _muestra_valores(serie: pd.Series) -> set:
     return set(s.tolist())
 
 
-def _solape_valores(serie1: pd.Series, serie2: pd.Series) -> float:
+def _solape_valores(serie1: pd.Series, serie2: pd.Series, permitir_pocos_valores: bool = False) -> float:
     """
     Qué tan solapados están los valores de dos columnas, de 0 a 1.
     Se mide contra el más chico de los dos conjuntos (para que una
@@ -192,11 +206,14 @@ def _solape_valores(serie1: pd.Series, serie2: pd.Series) -> float:
     v1, v2 = _muestra_valores(serie1), _muestra_valores(serie2)
     if not v1 or not v2:
         return 0.0
-    if len(v1) < MINIMO_VALORES_DISTINTOS_PARA_SOLAPE or len(v2) < MINIMO_VALORES_DISTINTOS_PARA_SOLAPE:
-        # Muy pocos valores distintos (ej. una columna booleana "activo",
-        # o "tipo" con 2-3 categorías): el solape va a salir alto entre
-        # CUALQUIER par de tablas sin que eso signifique nada -- se
-        # ignora como evidencia de relación.
+    # Columnas con muy pocos valores distintos (activo, tipo, estado...) se
+    # "solapan" casi 100% entre CUALQUIER par de tablas, sin que eso pruebe
+    # nada. Solo se aceptan como evidencia si ambas columnas tienen nombre de
+    # llave (ej. id_region con 4 regiones), que es el caso legítimo.
+    if not permitir_pocos_valores and (
+        len(v1) < MINIMO_VALORES_DISTINTOS_PARA_SOLAPE
+        or len(v2) < MINIMO_VALORES_DISTINTOS_PARA_SOLAPE
+    ):
         return 0.0
     interseccion = v1 & v2
     mas_chico = min(len(v1), len(v2))
@@ -265,57 +282,66 @@ def _parece_columna_clave(nombre_columna: str) -> bool:
     tokens = _tokens_columna(nombre_columna)
     if any(t in patrones for t in tokens):
         return True
-    # nombres pegados sin separador tipo 'idcliente' / 'clienteid'
-    nombre_completo = _normalizar_nombre(nombre_columna)
-    return nombre_completo.startswith("id") or nombre_completo.endswith("id")
+    # CamelCase y nombres pegados: aceptar solo patrones con entidad detrás
+    # del prefijo id, o una entidad antes del sufijo id; evitar grid/solid/ideal.
+    texto = str(nombre_columna).strip()
+    compacto = _normalizar_nombre(texto)
+    if re.match(r"^[iI][dD][A-Z][a-zA-Z0-9]*$", texto):
+        return True
+    if re.match(r"^[A-Za-z][A-Za-z0-9]*ID$", texto):
+        return True
+    # Para nombres compactos en minúsculas, exigir longitud y token conocido
+    # no es fiable; preferimos no clasificarlos como clave por subcadena.
+    return compacto in {"id", "codigo", "cod", "rut", "folio", "numero", "key", "clave", "pk", "fk"}
 
 
-UMBRAL_UNICIDAD_PK = 0.95              # "casi todos los valores únicos" = huella de PK
-UMBRAL_UNICIDAD_MINIMA_TAMANO = 0.5    # bajo esto, ni vale la pena mirar el tamaño
-UMBRAL_TAMANO_NOTORIO = 0.6            # la tabla chica debe tener a lo más este % de filas de la grande
+UMBRAL_UNICIDAD_PK = 0.95    # "casi todos los valores únicos" = huella de PK
+MIN_FILAS_PARA_UNICIDAD = 3  # ÚNICO mínimo de filas para hablar de unicidad (en todo el módulo)
+
+# Valores que suelen significar "sin dato" y se repiten sin ser una relación real
+# (ej. id_cliente = 0 para "sin cliente"). No cuentan al medir unicidad.
+VALORES_CENTINELA = {0, -1, "", "0", "-1", "n/a", "na", "null", "none", "nan", "s/d", "s/i", "sin dato"}
 
 
-def _tabla_principal(
-    serie1: pd.Series, tabla1: str, total_filas1: int,
-    serie2: pd.Series, tabla2: str, total_filas2: int,
-):
-    """
-    Adivina cuál de las dos tablas es la 'principal' (lista maestra, ej.
-    Productos) y cuál es la que 'referencia' (ej. Detalle_Ventas), usando
-    dos pistas en orden de confianza:
+def _valores_para_unicidad(serie: pd.Series) -> pd.Series:
+    """Valores de la columna sin nulos, sin centinelas conocidos y sin el valor más
+    frecuente cuando este se repite (un centinela desconocido, como 9999, suele ser
+    justo ese). Así un "sin cliente" repetido no hace pasar una relación 1-a-N por
+    muchos-a-muchos. Si la columna ya era única, no se quita nada."""
+    v = serie.dropna()
+    if v.empty:
+        return v
+    if v.dtype == object:
+        v = v.astype(str).str.strip().str.lower()
+    v = v[~v.isin(VALORES_CENTINELA)]
+    if v.empty:
+        return v
+    conteos = v.value_counts()
+    if conteos.iloc[0] > 1:
+        v = v[v != conteos.index[0]]
+    return v
 
-    1. Unicidad de la columna (pista fuerte): si casi todos los valores
-       de una columna son distintos entre sí, esa columna se comporta
-       como una llave primaria -- típico de la tabla principal.
-    2. Tamaño de la tabla (pista más débil, solo como desempate): en una
-       relación 1-a-N, la tabla principal casi siempre tiene MENOS filas
-       que la tabla que la referencia (ej. 50 productos vs 8.000 líneas
-       de venta). Solo se usa si ninguna columna dio una señal clara de
-       unicidad, y solo si una tabla es notoriamente más chica que la
-       otra (para no adivinar a ciegas cuando son de tamaño parecido).
 
-    Devuelve (nombre_tabla_principal | None, certeza: "alta" | "media" | "sin_definir").
-    """
-    u1 = serie1.nunique(dropna=True) / max(len(serie1.dropna()), 1)
-    u2 = serie2.nunique(dropna=True) / max(len(serie2.dropna()), 1)
+def _es_columna_unica(serie: pd.Series) -> bool:
+    v = _valores_para_unicidad(serie)
+    n = len(v)
+    return n >= MIN_FILAS_PARA_UNICIDAD and v.nunique() / n >= UMBRAL_UNICIDAD_PK
 
-    # Pista 1 (fuerte): unicidad de columna.
-    if u1 > UMBRAL_UNICIDAD_PK and u2 <= UMBRAL_UNICIDAD_PK:
-        return tabla1, "alta"
-    if u2 > UMBRAL_UNICIDAD_PK and u1 <= UMBRAL_UNICIDAD_PK:
-        return tabla2, "alta"
 
-    # Pista 2 (débil, solo desempate): tamaño relativo de las tablas.
-    # Se exige que la columna candidata a principal tenga al menos una
-    # unicidad razonable (si no, ni siquiera parece una llave) y que la
-    # diferencia de tamaño entre tablas sea notoria, no cualquier cosa.
-    if total_filas1 > 0 and total_filas2 > 0:
-        if u1 >= UMBRAL_UNICIDAD_MINIMA_TAMANO and total_filas1 <= total_filas2 * UMBRAL_TAMANO_NOTORIO:
-            return tabla1, "media"
-        if u2 >= UMBRAL_UNICIDAD_MINIMA_TAMANO and total_filas2 <= total_filas1 * UMBRAL_TAMANO_NOTORIO:
-            return tabla2, "media"
-
-    return None, "sin_definir"
+def _clasificar_cardinalidad(serie1: pd.Series, serie2: pd.Series):
+    """Devuelve (cardinalidad, lado_padre) con lado_padre en {1, 2, None}.
+    - un lado único y el otro repite -> "uno_a_muchos"; el lado único es el padre.
+    - ambos únicos                   -> "uno_a_uno"; no hay padre/hijo.
+    - ambos repiten                  -> "muchos_a_muchos"; sin padre (lo decide el usuario).
+    Es el ÚNICO criterio de dirección del módulo."""
+    u1, u2 = _es_columna_unica(serie1), _es_columna_unica(serie2)
+    if u1 and u2:
+        return "uno_a_uno", None
+    if u1:
+        return "uno_a_muchos", 1
+    if u2:
+        return "uno_a_muchos", 2
+    return "muchos_a_muchos", None
 
 
 # ----------------------------------------------------------------------
@@ -358,14 +384,26 @@ def inferir_relaciones(
             for col1 in df1.columns:
                 for col2 in df2.columns:
                     sim_nombre = _similitud_nombres(col1, col2)
-                    ambas_son_clave = _parece_columna_clave(col1) and _parece_columna_clave(col2)
+                    col1_clave = _parece_columna_clave(col1)
+                    col2_clave = _parece_columna_clave(col2)
+                    ambas_son_clave = col1_clave and col2_clave
+                    solo_una_es_clave = col1_clave != col2_clave
 
                     # Filtro de nombre. Ojo: cuando AMBAS columnas son de tipo
                     # 'id numérico' (ej. id_cliente vs id_pedido), exigimos más
                     # parecido de nombre que en el caso general — si no, dos
                     # columnas de ids chicos (1,2,3...) casi siempre se van a
                     # 'solapar' por pura casualidad y generan relaciones falsas.
-                    umbral_nombre = 0.5 if ambas_son_clave else 0.35
+                    # Si SOLO UNA parece llave (ej. "edad" vs "id_pedido"), el parecido de
+                    # nombre debe ser mayor: con nombres cortos, SequenceMatcher da ~0.5 por
+                    # puras letras en común, y una columna de rango chico (edad, mes, cantidad)
+                    # "solapa" al 100% con cualquier secuencia de ids.
+                    if ambas_son_clave:
+                        umbral_nombre = 0.5
+                    elif solo_una_es_clave:
+                        umbral_nombre = 0.6
+                    else:
+                        umbral_nombre = 0.35
                     if sim_nombre < umbral_nombre:
                         continue
 
@@ -383,7 +421,7 @@ def inferir_relaciones(
                     if not _tipos_compatibles(df1[col1], df2[col2]):
                         continue
 
-                    solape = _solape_valores(df1[col1], df2[col2])
+                    solape = _solape_valores(df1[col1], df2[col2], permitir_pocos_valores=ambas_son_clave)
 
                     # Si el nombre no tiene pinta de ser una llave (id, código,
                     # rut, etc.), que se llamen igual no es prueba suficiente:
@@ -393,11 +431,9 @@ def inferir_relaciones(
                     if not ambas_son_clave and solape < UMBRAL_SOLAPE_MINIMO_NOMBRE_GENERICO:
                         continue
 
-                    confianza = (
-                        PESO_NOMBRE * sim_nombre
-                        + PESO_TIPO * 1.0
-                        + PESO_VALORES * solape
-                    )
+                    # El tipo incompatible ya se descarta arriba; ser compatible
+                    # no prueba una relación y no debe sumar un offset constante.
+                    confianza = PESO_NOMBRE * sim_nombre + PESO_VALORES * solape
                     if confianza < umbral_confianza:
                         continue
 
@@ -416,15 +452,18 @@ def inferir_relaciones(
                     if not partes_razon:
                         partes_razon.append("hay una coincidencia parcial de nombre y tipo de dato")
 
-                    principal, certeza_direccion = _tabla_principal(
-                        df1[col1], t1, len(df1), df2[col2], t2, len(df2)
-                    )
-                    col_principal = col1 if principal == t1 else (col2 if principal == t2 else None)
+                    cardinalidad, lado_padre = _clasificar_cardinalidad(df1[col1], df2[col2])
+                    if lado_padre == 1:
+                        principal, col_principal, certeza_direccion = t1, col1, "alta"
+                    elif lado_padre == 2:
+                        principal, col_principal, certeza_direccion = t2, col2, "alta"
+                    else:
+                        principal, col_principal, certeza_direccion = None, None, "sin_definir"
 
-                    if certeza_direccion == "media":
-                        partes_razon.append(f"{principal} parece la tabla principal por tener menos filas")
-                    elif certeza_direccion == "sin_definir":
-                        partes_razon.append("no está claro cuál tabla es la principal, revisa la dirección a mano")
+                    if cardinalidad == "uno_a_uno":
+                        partes_razon.append("cada valor aparece una sola vez en ambas tablas (relación uno a uno, no hay tabla principal)")
+                    elif cardinalidad == "muchos_a_muchos":
+                        partes_razon.append("las dos columnas repiten valores (relación muchos a muchos); si sabes cuál tabla es la principal, indícalo con clic derecho")
 
                     razon = ", ".join(partes_razon).capitalize()
 
@@ -439,6 +478,7 @@ def inferir_relaciones(
                             tabla_principal=principal,
                             columna_principal=col_principal,
                             certeza_direccion=certeza_direccion,
+                            cardinalidad=cardinalidad,
                             detalle={"similitud_nombre": round(sim_nombre, 3), "solape_valores": round(solape, 3)},
                         )
                     )
@@ -533,10 +573,12 @@ def enriquecer_tabla_con_relaciones(
         prefijo = tabla_hija
 
         conteo = df_hija.groupby(columna_hija).size().rename(f"{prefijo}__cantidad")
-        df_principal = df_principal.merge(
-            conteo, left_on=columna_principal, right_index=True, how="left",
+        # Asignar por mapa conserva exactamente las filas y su orden, incluso
+        # si la clave de la tabla principal está duplicada.
+        mapa_conteo = conteo.to_dict()
+        df_principal[f"{prefijo}__cantidad"] = (
+            df_principal[columna_principal].map(mapa_conteo).fillna(0)
         )
-        df_principal[f"{prefijo}__cantidad"] = df_principal[f"{prefijo}__cantidad"].fillna(0)
 
         columnas_numericas = [
             c for c in df_hija.select_dtypes(include="number").columns
@@ -546,9 +588,10 @@ def enriquecer_tabla_con_relaciones(
             agregados = df_hija.groupby(columna_hija)[col].agg(["sum", "mean"]).rename(
                 columns={"sum": f"{prefijo}__{col}__suma", "mean": f"{prefijo}__{col}__promedio"}
             )
-            df_principal = df_principal.merge(
-                agregados, left_on=columna_principal, right_index=True, how="left",
-            )
+            for nombre_agregado in agregados.columns:
+                df_principal[nombre_agregado] = df_principal[columna_principal].map(
+                    agregados[nombre_agregado].to_dict()
+                )
 
     return df_principal
 

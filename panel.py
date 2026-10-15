@@ -25,6 +25,7 @@ from PySide6.QtWidgets import (
     QComboBox, QMessageBox, QCheckBox, QTabWidget, QScrollArea, QApplication,
 )
 
+from .retorno import TITULAR_NIVEL
 from .config import COLOR_ACCENT, COLOR_ACCENT_3
 from .alarmas import (
     calcular_valor_actual, evaluar_regla, evaluar_columna, estado_en_palabras, lineas_filas,
@@ -1016,6 +1017,25 @@ class PanelControl(QWidget):
         self.card_pronosticos.setVisible(False)
         raiz.addWidget(self.card_pronosticos)
 
+        # «Qué tan bien acertó»: lo predicho contra lo real (circuito de retorno,
+        # ver retorno.py). Solo aparece si el usuario ya hizo alguna comparación.
+        self.card_retorno = QFrame()
+        self.card_retorno.setObjectName("panelTarjeta")
+        lr = QVBoxLayout(self.card_retorno)
+        lr.setContentsMargins(16, 12, 16, 12)
+        lr.setSpacing(8)
+        cab_re = QHBoxLayout()
+        self.lbl_retorno = QLabel("Qué tan bien acertó")
+        cab_re.addWidget(self.lbl_retorno)
+        cab_re.addStretch()
+        lr.addLayout(cab_re)
+        self.grid_retorno = QGridLayout()
+        self.grid_retorno.setSpacing(10)
+        lr.addLayout(self.grid_retorno)
+        self._chips_retorno = []
+        self.card_retorno.setVisible(False)
+        raiz.addWidget(self.card_retorno)
+
         self.card_grafico = QFrame()
         self.card_grafico.setObjectName("panelTarjeta")
         lg = QVBoxLayout(self.card_grafico)
@@ -1146,6 +1166,8 @@ class PanelControl(QWidget):
         self.card_tiempo.setStyleSheet(estilo_tarjeta(c))
         self.card_alarmas.setStyleSheet(estilo_tarjeta(c))
         self.card_pronosticos.setStyleSheet(estilo_tarjeta(c))
+        self.card_retorno.setStyleSheet(estilo_tarjeta(c))
+        self.lbl_retorno.setStyleSheet(f"color: {c['text']}; font-size: 13px;")
         self.lbl_pronosticos.setStyleSheet(f"color: {c['text']}; font-size: 13px;")
         self.lbl_alarmas.setStyleSheet(f"color: {c['text']}; font-size: 13px;")
         self.btn_alarmas.setStyleSheet(
@@ -1311,6 +1333,7 @@ class PanelControl(QWidget):
             self.card_tiempo.setVisible(False)
             self.card_alarmas.setVisible(False)
             self.card_pronosticos.setVisible(False)
+            self.card_retorno.setVisible(False)
             self.lbl_sub.setText("")
             return
         self.lbl_vacio.setVisible(False)
@@ -1337,6 +1360,7 @@ class PanelControl(QWidget):
 
         self._dibujar_alarmas(cfg.get("mostrar_alarmas", True))
         self._dibujar_pronosticos()
+        self._dibujar_retorno()
         self._dibujar_grafico(df, col_fecha, fechas)
         self._dibujar_graficos_propios(df)
         self._dibujar_hallazgos(cfg.get("mostrar_hallazgos", True))
@@ -1485,11 +1509,92 @@ class PanelControl(QWidget):
         for col in range(columnas):
             self.grid_pronosticos.setColumnStretch(col, 1)
 
+    def _dibujar_retorno(self, maximo=4, columnas=2):
+        """«Qué tan bien acertó»: la última comparación de lo predicho con lo real,
+        por tabla, las peores primero. Es el texto que dio retorno.comparar: el Panel
+        no vuelve a calcular nada."""
+        for chip in self._chips_retorno:
+            chip.setParent(None)
+            chip.deleteLater()
+        self._chips_retorno.clear()
+        tablero = getattr(self.host, "tablero", None)
+        lista = tablero.retornos() if tablero is not None else []
+        if not lista:
+            self.card_retorno.setVisible(False)
+            return
+        self.card_retorno.setVisible(True)
+        c = self.colors
+        est = colores_estado(c)
+        ambar = "#D97706" if _es_tema_claro(c) else "#FBBF24"
+        color_nivel = {"bien": est["sube"], "atencion": ambar, "alerta": est["baja"], "info": c["muted"]}
+        varias_tablas = len({d.get("tabla") for d in lista}) > 1
+        for i, d in enumerate(lista[:maximo]):
+            nivel = d.get("nivel", "info")
+            color = color_nivel.get(nivel, c["muted"])
+            borde = color if nivel == "alerta" else c["border"]
+            chip = QFrame()
+            chip.setObjectName("panelChip")
+            chip.setStyleSheet(
+                f"QFrame#panelChip {{ background: transparent; border: 1px solid {borde}; border-radius: 8px; }}"
+                "QFrame#panelChip QLabel { background: transparent; border: none; }"
+            )
+            lay = QVBoxLayout(chip)
+            lay.setContentsMargins(12, 8, 12, 8)
+            lay.setSpacing(3)
+            fila = QHBoxLayout()
+            nombre = html.escape(str(d.get("objetivo", "")))
+            if varias_tablas and d.get("tabla"):
+                nombre += f" <span style='color:{c['muted']}; font-weight:400'>· {html.escape(str(d['tabla']))}</span>"
+            titulo = QLabel(f"<span style='color:{color}'>●</span>&nbsp; " + nombre)
+            titulo.setTextFormat(Qt.RichText)
+            titulo.setWordWrap(True)
+            titulo.setStyleSheet(f"color: {c['text']}; font-size: 12px; font-weight: 600;")
+            fila.addWidget(titulo, 1)
+            quitar = QPushButton("Quitar")
+            quitar.setFlat(True)
+            quitar.setCursor(Qt.PointingHandCursor)
+            quitar.setToolTip("Quita esta comparación del Panel (no borra nada más).")
+            quitar.setStyleSheet(f"QPushButton {{ color: {c['muted']}; font-size: 11px; border: none; padding: 0 2px; }}"
+                                 f"QPushButton:hover {{ color: {c['text']}; }}")
+            quitar.clicked.connect(
+                lambda _=False, k=d.get("tabla"): QTimer.singleShot(0, lambda: self._quitar_retorno(k)))
+            fila.addWidget(quitar, 0, Qt.AlignTop)
+            lay.addLayout(fila)
+            titular = QLabel(TITULAR_NIVEL.get(nivel, ""))
+            titular.setWordWrap(True)
+            titular.setStyleSheet(f"color: {c['text']}; font-size: 13px;")
+            lay.addWidget(titular)
+            lineas = d.get("lineas", [])
+            for texto in lineas[1:3]:                  # la cifra principal y cómo se compara con lo esperado
+                lbl = QLabel(str(texto))
+                lbl.setWordWrap(True)
+                lbl.setStyleSheet(f"color: {c['text']}; font-size: 12px;")
+                lay.addWidget(lbl)
+            pie = QLabel(f"{d.get('n_comparadas', 0)} filas comparadas · el {d.get('comparado_en', '')}"
+                         f" · predicho el {d.get('predicho_en', '')}")
+            pie.setWordWrap(True)
+            pie.setStyleSheet(f"color: {c['muted']}; font-size: 11px;")
+            pie.setToolTip("\n".join(str(x) for x in lineas))
+            lay.addWidget(pie)
+            self.grid_retorno.addWidget(chip, i // columnas, i % columnas)
+            self._chips_retorno.append(chip)
+        for col in range(columnas):
+            self.grid_retorno.setColumnStretch(col, 1)
+
+    def _quitar_retorno(self, tabla):
+        tablero = getattr(self.host, "tablero", None)
+        if tablero is not None and tabla is not None:
+            tablero.quitar_retorno(tabla)
+        self._dibujar_retorno()
+
     def _quitar_pronostico(self, clave):
         tablero = getattr(self.host, "tablero", None)
         if tablero is not None:
             tablero.quitar_pronostico(clave)
         self._dibujar_pronosticos()
+        linea = getattr(self.host, "panel_linea_tiempo", None)      # sus franjas de «lo que se viene»
+        if linea is not None:
+            linea.refrescar_futuro()
 
     def _limpiar_graficos_propios(self):
         for t in self._tarjetas_graficos:

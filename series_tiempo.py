@@ -40,13 +40,13 @@ try:
     from .prediccion import _a_datetime, _tokens, es_columna_id, normalizar_clave, tipo_columna
     from .pronostico_base import (DIAS_SEMANA, MESES, UNIDADES, ResultadoPronostico, confianza_por_datos,
                                   dias_txt, duracion_txt, fecha_txt, leer_fechas, num_txt, pct_auto, pct_txt,
-                                  aplicar_fecha_corte)
+                                  aplicar_fecha_corte, ventana_fechas)
 except ImportError:  # pruebas sueltas fuera del paquete
     import pistas as _pistas
     from prediccion import _a_datetime, _tokens, es_columna_id, normalizar_clave, tipo_columna
     from pronostico_base import (DIAS_SEMANA, MESES, UNIDADES, ResultadoPronostico, confianza_por_datos,
                                  dias_txt, duracion_txt, fecha_txt, leer_fechas, num_txt, pct_auto, pct_txt,
-                                 aplicar_fecha_corte)
+                                 aplicar_fecha_corte, ventana_fechas)
 
 MIN_PERIODOS = 12
 MAX_PERIODOS = {"H": 2000, "D": 3000, "B": 2200, "W": 1000, "M": 600}
@@ -1062,6 +1062,11 @@ def analizar_umbral(df: pd.DataFrame, cfg) -> ResultadoPronostico:
         avisos, tabla, "Probabilidad de pasar el límite, período a período",
         grafico_serie(serie, p, umbral=lim),
         {"umbral": lim, "ya_pasado": ya, "prob_max": p_max, "prob_final": p_final, "modelo": p.modelo_nombre})
+    if not ya and (k_pronto is not None or k_c is not None):
+        v = ventana_fechas(serie.nombre, p.fechas[k_pronto if k_pronto is not None else k_c],
+                           p.fechas[k_tarde] if k_tarde is not None else None,
+                           p.fechas[k_c] if k_c is not None else None, horizonte_hasta=p.fechas[-1])
+        _res.rango_fechas = [v] if v else []
     return _con_experto(_res, p, h)
 
 
@@ -1115,6 +1120,10 @@ def analizar_saturacion(df: pd.DataFrame, cfg) -> ResultadoPronostico:
         ["La demanda sigue creciendo o variando como hasta ahora; no considera ampliaciones de capacidad."],
         avisos, tabla, "Probabilidad de saturación, período a período", grafico_serie(serie, p, umbral=cap),
         {"capacidad": cap, "prob_max": pmax, "hist_sobre": hist_sobre, "modelo": p.modelo_nombre})
+    if float(y[-1]) < cap and (k20 is not None or k50 is not None):
+        v = ventana_fechas(serie.nombre, p.fechas[k20 if k20 is not None else k50], None,
+                           p.fechas[k50] if k50 is not None else None, horizonte_hasta=p.fechas[-1])
+        _res.rango_fechas = [v] if v else []
     return _con_experto(_res, p, h)
 
 
@@ -1413,10 +1422,17 @@ def analizar_agotamiento(df: pd.DataFrame, cfg) -> ResultadoPronostico:
            f"{' (respetando el día de la semana)' if m == 7 else ' (respetando la hora del día)' if m == 24 else ''}; el rango es del 10% más rápido al 10% más lento."]
     if derivado:
         det.append("El consumo se dedujo de las bajas de stock.")
+    ventanas = []
+    for _, fila in res.head(5).iterrows():                       # los más urgentes (la tabla viene ordenada)
+        v = ventana_fechas(str(fila["Elemento"]) if len(res) > 1 else "Stock", fila["Fecha pronto"],
+                           fila["Fecha tarde"], fila["Fecha probable"])
+        if v:
+            ventanas.append(v)
     return ResultadoPronostico(
         "agotamiento", "Agotamiento", titular, nivel, conf, motivo, tarj, det,
         ["El consumo seguirá parecido al de los últimos períodos y no habrá reposiciones."], avisos, tabla,
-        "Cuánto dura cada elemento", None, {"frecuencia": freq, "urgentes": urgentes, "elementos": len(res)})
+        "Cuánto dura cada elemento", None, {"frecuencia": freq, "urgentes": urgentes, "elementos": len(res)},
+        rango_fechas=ventanas)
 
 
 

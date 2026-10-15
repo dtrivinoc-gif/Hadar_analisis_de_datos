@@ -72,7 +72,7 @@ from __future__ import annotations
 
 import math
 
-from PySide6.QtCore import Qt, QPointF, QRectF
+from PySide6.QtCore import Qt, QPointF, QRectF, QTimer
 from PySide6.QtGui import QColor, QFont, QPainter, QPainterPath, QPen, QBrush, QPixmap
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QComboBox,
@@ -96,6 +96,8 @@ ESPACIO_ENTRE_CAJAS_X_MAX_POR_FILA = 3   # cuántas cajas por fila antes de baja
 ESPACIO_ENTRE_CAJAS_Y = 60
 MAX_COLUMNAS_VISIBLES = 14               # si una tabla tiene más columnas, se recorta la vista (con "+N más")
 DISTANCIA_ETIQUETA_CARDINALIDAD = 16     # qué tan lejos de la caja se dibuja el "1" / "*"
+MAX_LADO_EXPORTACION = 4096                # tope de ancho/alto del pixmap exportado (px)
+MAX_PIXELES_EXPORTACION = 6_000_000      # tope de área (~24 MB a 4 bytes/px); se escala proporcional
 FACTOR_ZOOM = 1.15                       # cuánto acerca/aleja cada clic en los botones - / +
 
 
@@ -119,6 +121,9 @@ class _CajaTabla(QGraphicsRectItem):
         self.columnas = columnas
         self.colors = colors
         self.lineas_conectadas: list["_LineaRelacion"] = []
+        # Callback que pone el diálogo dueño para agrupar actualizaciones de
+        # líneas (una vez por ciclo de eventos). None -> se actualiza al tiro.
+        self.programar_lineas = None
         self._filas_columna: dict[str, QRectF] = {}
 
         self.setFlags(
@@ -234,8 +239,11 @@ class _CajaTabla(QGraphicsRectItem):
 
     def itemChange(self, change, value):
         if change == QGraphicsItem.ItemPositionHasChanged:
-            for linea in self.lineas_conectadas:
-                linea.actualizar_geometria()
+            if self.programar_lineas is not None:
+                self.programar_lineas(self.lineas_conectadas)
+            else:
+                for linea in self.lineas_conectadas:
+                    linea.actualizar_geometria()
         return super().itemChange(change, value)
 
     def mousePressEvent(self, event):
@@ -303,7 +311,10 @@ class _LineaRelacion(QGraphicsPathItem):
             etiqueta.setZValue(2)
             self._items_hijos.append(etiqueta)
 
+        self._hover = False
         self.actualizar_geometria()
+        self._tooltip_texto = self._armar_tooltip()
+        self.setToolTip(self._tooltip_texto)
 
     # -- cuál de las relaciones del grupo manda sobre el color/estilo -----
 
@@ -322,8 +333,9 @@ class _LineaRelacion(QGraphicsPathItem):
         r = self._representativa()
         if getattr(r, "manual", False):
             return QColor(COLOR_ACCENT_3)  # relación agregada a mano por el usuario
-        if getattr(r, "certeza_direccion", "alta") == "sin_definir":
+        if getattr(r, "direccion_pendiente", False):
             return QColor(COLOR_DANGER)    # dirección padre/hijo sin confirmar: salta a la vista
+        # (una relación 1:1 no tiene dirección que confirmar: se pinta por confianza)
         c = r.confianza
         if c >= 0.75:
             return QColor(COLOR_ACCENT)
@@ -352,7 +364,12 @@ class _LineaRelacion(QGraphicsPathItem):
             else:
                 p1 = self.caja_origen.punto_borde("izquierda")
                 p2 = self.caja_destino.punto_borde("derecha")
+            separacion = abs(p2.x() - p1.x())
+            margen = min(18.0, separacion / 3.0)
             medio = (p1.x() + p2.x()) / 2
+            # Evita un codo prácticamente pegado al borde en separaciones cortas.
+            if separacion >= 2 * margen:
+                medio = max(p1.x() + margen, min(medio, p2.x() - margen)) if p2.x() >= p1.x() else max(p2.x() + margen, min(medio, p1.x() - margen))
             quiebre1 = QPointF(medio, p1.y())
             quiebre2 = QPointF(medio, p2.y())
         else:
@@ -362,7 +379,11 @@ class _LineaRelacion(QGraphicsPathItem):
             else:
                 p1 = self.caja_origen.punto_borde("arriba")
                 p2 = self.caja_destino.punto_borde("abajo")
+            separacion = abs(p2.y() - p1.y())
+            margen = min(18.0, separacion / 3.0)
             medio = (p1.y() + p2.y()) / 2
+            if separacion >= 2 * margen:
+                medio = max(p1.y() + margen, min(medio, p2.y() - margen)) if p2.y() >= p1.y() else max(p2.y() + margen, min(medio, p1.y() - margen))
             quiebre1 = QPointF(p1.x(), medio)
             quiebre2 = QPointF(p2.x(), medio)
 
@@ -375,13 +396,13 @@ class _LineaRelacion(QGraphicsPathItem):
         self.setPath(camino)
 
         color = self._color_por_confianza()
-        grosor = 1.0 + 2.5 * r.confianza
+        grosor = 1.0 + 2.5 * r.confianza + (1.5 if self._hover else 0.0)
         pen = QPen(color, grosor)
         pen.setCapStyle(Qt.RoundCap)
         pen.setJoinStyle(Qt.RoundJoin)
         if getattr(r, "manual", False):
             pen.setStyle(Qt.DashLine)
-        elif getattr(r, "certeza_direccion", "alta") == "sin_definir":
+        elif getattr(r, "direccion_pendiente", False):
             pen.setStyle(Qt.DotLine)
         self.setPen(pen)
 
@@ -391,12 +412,18 @@ class _LineaRelacion(QGraphicsPathItem):
         # desplazamiento se hace hacia el primer quiebre (no hacia la
         # punta lejana), para que la etiqueta quede pegada al primer
         # tramo -- siempre horizontal o vertical, nunca en diagonal.
+        texto_muchos = "*"
         if r.tabla_principal == self.caja_origen.nombre_tabla:
             punto_uno, vecino_uno = p1, quiebre1
             punto_muchos, vecino_muchos = p2, quiebre2
         elif r.tabla_principal == self.caja_destino.nombre_tabla:
             punto_uno, vecino_uno = p2, quiebre2
             punto_muchos, vecino_muchos = p1, quiebre1
+        elif getattr(r, "cardinalidad", "") == "uno_a_uno" and not getattr(r, "manual", False):
+            # 1:1: no hay padre/hijo; se rotula "1" en ambas puntas, sin alarma.
+            punto_uno, vecino_uno = p1, quiebre1
+            punto_muchos, vecino_muchos = p2, quiebre2
+            texto_muchos = "1"
         else:
             punto_uno = punto_muchos = None
 
@@ -406,7 +433,7 @@ class _LineaRelacion(QGraphicsPathItem):
             self._etiqueta_uno.setPlainText("1")
             self._etiqueta_uno.setDefaultTextColor(color)
             self._etiqueta_uno.setPos(pos_uno.x() - 5, pos_uno.y() - 10)
-            self._etiqueta_muchos.setPlainText("*")
+            self._etiqueta_muchos.setPlainText(texto_muchos)
             self._etiqueta_muchos.setDefaultTextColor(color)
             self._etiqueta_muchos.setPos(pos_muchos.x() - 5, pos_muchos.y() - 12)
             self._etiqueta_uno.setVisible(True)
@@ -425,7 +452,12 @@ class _LineaRelacion(QGraphicsPathItem):
             else:
                 etiqueta = f"{int(r.confianza * 100)}% de confianza"
             aviso = ""
-            if not getattr(r, "manual", False) and getattr(r, "certeza_direccion", "alta") == "sin_definir":
+            cardinalidad = getattr(r, "cardinalidad", "sin_definir")
+            if cardinalidad == "muchos_a_muchos":
+                aviso = " ↔ relación muchos a muchos (M:N)"
+            elif cardinalidad == "uno_a_uno" and not getattr(r, "manual", False):
+                aviso = " ↔ relación uno a uno (1:1)"
+            elif getattr(r, "direccion_pendiente", False):
                 aviso = " ⚠ dirección sin confirmar"
             lineas.append(
                 f"{r.tabla_origen}.{r.columna_origen} ↔ {r.tabla_destino}.{r.columna_destino} "
@@ -436,26 +468,24 @@ class _LineaRelacion(QGraphicsPathItem):
         return "\n".join(lineas)
 
     def hoverEnterEvent(self, event):
-        self._tooltip_texto = self._armar_tooltip()
-        QToolTip.showText(event.screenPos(), self._tooltip_texto)
-        pen = self.pen()
-        pen.setWidthF(pen.widthF() + 1.5)
-        self.setPen(pen)
+        # El tooltip estático lo gestiona Qt. El engrosado es un ESTADO
+        # (_hover) que actualizar_geometria() aplica siempre igual; antes se
+        # sumaba grosor al pen actual y, si faltaba el hoverLeave, quedaba pegado.
+        self._hover = True
+        self.actualizar_geometria()
         super().hoverEnterEvent(event)
 
-    def hoverMoveEvent(self, event):
-        # QToolTip.showText() se esconde solo a los pocos segundos y no se
-        # reinicia con el mouse quieto encima -- por eso, mientras el mouse
-        # se siga moviendo (aunque sea un poco) dentro de la línea, se
-        # vuelve a pedir que se muestre, lo que le renueva el tiempo. Así
-        # el tooltip dura mientras el usuario lo esté leyendo de verdad.
-        if self._tooltip_texto:
-            QToolTip.showText(event.screenPos(), self._tooltip_texto)
-        super().hoverMoveEvent(event)
-
     def hoverLeaveEvent(self, event):
+        self._hover = False
         self.actualizar_geometria()
         super().hoverLeaveEvent(event)
+
+    def limpiar_hover(self):
+        """Apaga el resaltado y redibuja. El diálogo lo usa en las actualizaciones
+        diferidas: si una caja se está moviendo, el mouse está en la caja, no en la
+        línea, aunque Qt no haya enviado hoverLeaveEvent."""
+        self._hover = False
+        self.actualizar_geometria()
 
     def contextMenuEvent(self, event):
         no_manuales = [r for r in self.relaciones if not getattr(r, "manual", False)]
@@ -467,9 +497,15 @@ class _LineaRelacion(QGraphicsPathItem):
 
         accion_principal_origen = None
         accion_principal_destino = None
+        r = self._representativa()
+        es_mn = getattr(r, "cardinalidad", "sin_definir") == "muchos_a_muchos"
+        es_1a1 = getattr(r, "cardinalidad", "sin_definir") == "uno_a_uno"
         if no_manuales and self._on_confirmar_direccion is not None:
-            r = self._representativa()
             menu.addSeparator()
+            if es_mn:
+                menu.addAction("Ambas columnas repiten valores (M:N). Si sabes cuál es la principal, elígela:").setEnabled(False)
+            elif es_1a1:
+                menu.addAction("Relación 1:1 (no requiere dirección). Si una tabla es en realidad la principal, elígela:").setEnabled(False)
             marca_o = " ✓" if r.tabla_principal == self.caja_origen.nombre_tabla else ""
             marca_d = " ✓" if r.tabla_principal == self.caja_destino.nombre_tabla else ""
             accion_principal_origen = menu.addAction(f'"{self.caja_origen.nombre_tabla}" es la tabla principal{marca_o}')
@@ -517,6 +553,14 @@ class DialogoEsquemaOntologia(QDialog):
 
         self._cajas: dict[str, _CajaTabla] = {}
         self._lineas: list[_LineaRelacion] = []
+
+        # Actualización agrupada de líneas: propia de ESTE diálogo (antes era
+        # global de módulo y dos diálogos se pisaban).
+        self._lineas_pendientes: set = set()
+        self._timer_lineas = QTimer(self)
+        self._timer_lineas.setSingleShot(True)
+        self._timer_lineas.setInterval(0)
+        self._timer_lineas.timeout.connect(self._actualizar_lineas_pendientes)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(16, 16, 16, 16)
@@ -584,7 +628,8 @@ class DialogoEsquemaOntologia(QDialog):
             f"<span style='color:{colors['muted']}'>●</span> confianza baja&nbsp;&nbsp;"
             f"<span style='color:{COLOR_ACCENT_3}'>- - -</span> agregada por ti&nbsp;&nbsp;"
             f"<span style='color:{COLOR_DANGER}'>···</span> dirección sin confirmar (clic derecho)&nbsp;&nbsp;"
-            f"<b>1 / *</b> tabla principal / tabla referenciada"
+            f"<b>1 / *</b> tabla principal / tabla referenciada&nbsp;&nbsp;"
+            f"<b>1 — 1</b> relación uno a uno (sin principal)"
         )
         leyenda.setWordWrap(True)
         leyenda.setStyleSheet("font-size: 11px;")
@@ -601,7 +646,23 @@ class DialogoEsquemaOntologia(QDialog):
 
     # ------------------------------------------------------------------
 
+    def _programar_actualizacion_lineas(self, lineas):
+        self._lineas_pendientes.update(lineas)
+        if not self._timer_lineas.isActive():
+            self._timer_lineas.start()
+
+    def _actualizar_lineas_pendientes(self):
+        pendientes = list(self._lineas_pendientes)
+        self._lineas_pendientes.clear()
+        for linea in pendientes:
+            try:
+                linea.limpiar_hover()
+            except RuntimeError:
+                continue  # Qt ya destruyó el objeto gráfico
+
     def _dibujar_todo(self):
+        self._timer_lineas.stop()
+        self._lineas_pendientes.clear()
         self.escena.clear()
         self._cajas.clear()
         self._lineas.clear()
@@ -638,6 +699,7 @@ class DialogoEsquemaOntologia(QDialog):
         for i, (nombre_tabla, df) in enumerate(self.tablas.items()):
             caja = _CajaTabla(nombre_tabla, list(df.columns), self.colors)
             caja.setPos(x, y)
+            caja.programar_lineas = self._programar_actualizacion_lineas
             self.escena.addItem(caja)
             self._cajas[nombre_tabla] = caja
 
@@ -736,6 +798,8 @@ class DialogoEsquemaOntologia(QDialog):
                 continue
             r.certeza_direccion = "alta"
             r.direccion_confirmada = True
+            if getattr(r, "cardinalidad", "") in ("muchos_a_muchos", "uno_a_uno"):
+                r.cardinalidad = "uno_a_muchos"   # el usuario decidió quién es el padre
         self._dibujar_todo()
 
     def _redetectar(self):
@@ -746,6 +810,9 @@ class DialogoEsquemaOntologia(QDialog):
         respetando cualquier dirección padre/hijo que el usuario haya
         confirmado a mano en una relación detectada automáticamente."""
         manuales = [r for r in self.relaciones if getattr(r, "manual", False)]
+        # Este diccionario se reconstruye desde las relaciones vigentes en cada
+        # ejecución; no se guarda como estado persistente, por lo que no acumula
+        # direcciones huérfanas entre redetecciones.
         direcciones_confirmadas = {
             (r.tabla_origen, r.columna_origen, r.tabla_destino, r.columna_destino): r
             for r in self.relaciones
@@ -770,6 +837,8 @@ class DialogoEsquemaOntologia(QDialog):
                 r.columna_principal = vieja.columna_principal
                 r.certeza_direccion = "alta"
                 r.direccion_confirmada = True
+                if getattr(r, "cardinalidad", "") in ("muchos_a_muchos", "uno_a_uno"):
+                    r.cardinalidad = "uno_a_muchos"   # el usuario decidió quién es el padre
 
         self.relaciones = nuevas_auto + manuales
         self._dibujar_todo()
@@ -814,9 +883,20 @@ class DialogoEsquemaOntologia(QDialog):
         """Imagen (QPixmap) del esquema tal como está dibujado ahora mismo
         -- para llevarlo a la pestaña Reporte sin necesidad de abrir esta
         ventana ni pedirle nada al usuario."""
+        # Si una caja se movió en este mismo ciclo, las líneas aún no se redibujaron.
+        self._actualizar_lineas_pendientes()
         rect = self.escena.itemsBoundingRect().adjusted(-20, -20, 20, 20)
-        ancho = max(1, int(rect.width()))
-        alto = max(1, int(rect.height()))
+        ancho_f = max(1.0, rect.width())
+        alto_f = max(1.0, rect.height())
+        # Esquemas de 20-30 tablas pueden pasar de 40 MB: se escala proporcionalmente
+        # (nunca se agranda) para respetar tope de lado y de área.
+        escala = min(
+            1.0,
+            MAX_LADO_EXPORTACION / max(ancho_f, alto_f),
+            math.sqrt(MAX_PIXELES_EXPORTACION / (ancho_f * alto_f)),
+        )
+        ancho = max(1, int(ancho_f * escala))
+        alto = max(1, int(alto_f * escala))
         pixmap = QPixmap(ancho, alto)
         pixmap.fill(QColor(self.colors["bg"]))
         painter = QPainter(pixmap)

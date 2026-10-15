@@ -35,12 +35,14 @@ try:
     from . import pistas as _pistas
     from .prediccion import (ConfigPrediccion, _a_datetime, columnas_a_usar, columnas_fecha, entrenar, es_columna_id, explicar_filas,
                              normalizar_clave, predecir, sugerir_columnas, tipo_columna)
-    from .pronostico_base import (ResultadoPronostico, confianza_por_datos, dias_txt, fecha_txt, leer_fechas, num_txt, pct_txt)
+    from .pronostico_base import (ResultadoPronostico, confianza_por_datos, dias_txt, fecha_txt, leer_fechas, num_txt, pct_txt,
+                                  ventana_fechas)
 except ImportError:
     import pistas as _pistas
     from prediccion import (ConfigPrediccion, _a_datetime, columnas_a_usar, columnas_fecha, entrenar, es_columna_id, explicar_filas,
                             normalizar_clave, predecir, sugerir_columnas, tipo_columna)
-    from pronostico_base import (ResultadoPronostico, confianza_por_datos, dias_txt, fecha_txt, leer_fechas, num_txt, pct_txt)
+    from pronostico_base import (ResultadoPronostico, confianza_por_datos, dias_txt, fecha_txt, leer_fechas, num_txt, pct_txt,
+                                 ventana_fechas)
 
 MIN_EVENTOS = 3
 MIN_EVENTOS_GRUPO = 10
@@ -462,10 +464,18 @@ def analizar_vida_util(df: pd.DataFrame, cfg) -> ResultadoPronostico:
            "«duraron al menos» lo observado (así no se subestima la vida real).",
            f"El rango es del 10% al 90% de {glob.Sb.shape[0]} repeticiones del cálculo con elementos remuestreados.",
            "«Pronto/central/tarde» = en el 20% / 50% / 80% de los casos parecidos ya habría ocurrido."]
+    ventanas = []
+    for _, fila in tabla.head(5).iterrows() if len(tabla) else []:     # los más cercanos a ocurrir
+        pronto, central, tarde = (fila["Plazo pronto (días)"], fila["Plazo central (días)"], fila["Plazo tarde (días)"])
+        dia = lambda x: (tr.corte + pd.Timedelta(days=float(x))).normalize() if np.isfinite(x) else None
+        v = ventana_fechas(str(fila["Elemento"]), dia(pronto) if np.isfinite(pronto) else dia(central),
+                           dia(tarde), dia(central))
+        if v:
+            ventanas.append(v)
     return ResultadoPronostico(
         "vida_util", "Vida útil", titular, nivel, conf, motivo, tarj, det,
         _supuestos_eventos(tr.modo, tr.grupos is not None), avisos, tabla, "Cuánto falta, elemento por elemento",
-        None, {"mediana_dias": med, "eventos": glob.n_eventos, "tramos": glob.n_tramos})
+        None, {"mediana_dias": med, "eventos": glob.n_eventos, "tramos": glob.n_tramos}, rango_fechas=ventanas)
 
 
 def analizar_falla(df: pd.DataFrame, cfg) -> ResultadoPronostico:
