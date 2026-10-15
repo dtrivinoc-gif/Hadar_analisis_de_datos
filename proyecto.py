@@ -74,7 +74,7 @@ def guardar_proyecto(ruta, *, tablas, nombre_tabla_activa, relaciones_ontologia,
                       filtro_columna, filtro_valores, notas_manuales, indicadores,
                       ml_activado=False, linea_base_ml=None, fuentes_datos=None,
                       ml_multivariado_activado=False, procedencia=None, prediccion=None,
-                      panel=None):
+                      panel=None, tablero_meta=None, tablero_tablas=None, tablero_pronosticos=None):
     """
     ... (ver parámetros existentes arriba)
     panel: dict con lo que el usuario eligió en Personalizar del Panel (qué
@@ -84,6 +84,14 @@ def guardar_proyecto(ruta, *, tablas, nombre_tabla_activa, relaciones_ontologia,
         qué columna predecir, qué columnas usar o ignorar). El modelo entrenado
         NO se guarda: un .hadarproy es un .zip común y los modelos de Python
         (pickle) pueden ejecutar código al abrirse. Se reentrena con un clic.
+    tablero_meta / tablero_tablas: las predicciones por fila que la pestaña
+        Predicción dejó para las demás pestañas (ver tablero.py). Meta = textos
+        (qué se predijo, cuándo); tablas = {nombre_tabla: DataFrame} con SOLO los
+        números predichos. No es un modelo: no hay nada que se ejecute al abrir.
+        Los proyectos guardados antes no traen estas claves y abren igual.
+    tablero_pronosticos: lista de dicts con los pronósticos que el usuario llevó
+        al Panel («Lo que se viene»): solo texto (titular con rango, confianza,
+        fecha). Tampoco es un modelo.
     fuentes_datos: dict {nombre_tabla: {"tipo": "archivo"|"sql_server"|"api_pos", ...}}
         de dónde vino cada tabla, para poder "Actualizar desde la fuente"
         más adelante sin volver a pedir todo desde cero.
@@ -122,7 +130,22 @@ def guardar_proyecto(ruta, *, tablas, nombre_tabla_activa, relaciones_ontologia,
         "prediccion": prediccion or {},
         # default=str por si algún valor raro se coló en la configuración.
         "panel": json.loads(json.dumps(panel or {}, default=str)),
+        "tablero": {},
+        "tablero_pronosticos": json.loads(json.dumps(tablero_pronosticos or [], default=str)),
     }
+
+    # Predicciones del tablero: guardarlas nunca debe impedir guardar el
+    # proyecto. Si alguna tabla de predicciones no se puede escribir (por
+    # ejemplo, un índice raro), esa se omite y el resto se guarda igual.
+    tablero_ok = {}
+    for nombre, datos in (tablero_tablas or {}).items():
+        try:
+            buffer = io.BytesIO()
+            datos.to_parquet(buffer)
+            tablero_ok[nombre] = buffer.getvalue()
+            metadata["tablero"][nombre] = (tablero_meta or {}).get(nombre, {})
+        except Exception:
+            continue
 
     carpeta = os.path.dirname(ruta)
     if carpeta:
@@ -134,6 +157,8 @@ def guardar_proyecto(ruta, *, tablas, nombre_tabla_activa, relaciones_ontologia,
             buffer = io.BytesIO()
             df.to_parquet(buffer)
             z.writestr(f"tablas/{nombre}.parquet", buffer.getvalue())
+        for nombre, contenido in tablero_ok.items():
+            z.writestr(f"tablero/{nombre}.parquet", contenido)
 
 
 class ProyectoCargado:
@@ -144,7 +169,10 @@ class ProyectoCargado:
                  filtro_columna, filtro_valores, notas_manuales, indicadores_dict,
                  ml_activado=False, linea_base_ml=None, fuentes_datos=None,
                  ml_multivariado_activado=False, procedencia=None, prediccion=None,
-                 panel=None):
+                 panel=None, tablero_meta=None, tablero_tablas=None, tablero_pronosticos=None):
+        self.tablero_pronosticos = tablero_pronosticos or []   # [] en proyectos antiguos
+        self.tablero_meta = tablero_meta or {}       # {} en proyectos antiguos
+        self.tablero_tablas = tablero_tablas or {}   # {nombre_tabla: DataFrame con las predicciones}
         self.panel = panel or {}               # config del Panel (dict); {} en proyectos antiguos
         self.tablas = tablas
         self.nombre_tabla_activa = nombre_tabla_activa
@@ -169,6 +197,15 @@ def abrir_proyecto(ruta):
         for nombre in metadata["tablas"]:
             with z.open(f"tablas/{nombre}.parquet") as f:
                 tablas[nombre] = pd.read_parquet(f)
+
+        tablero_meta = {}
+        tablero_tablas = {}
+        for nombre, meta in (metadata.get("tablero") or {}).items():
+            ruta_interna = f"tablero/{nombre}.parquet"
+            if ruta_interna in z.namelist():
+                with z.open(ruta_interna) as f:
+                    tablero_tablas[nombre] = pd.read_parquet(f)
+                tablero_meta[nombre] = meta
 
         relaciones_data = metadata.get("relaciones_ontologia")
         relaciones = None
@@ -197,6 +234,9 @@ def abrir_proyecto(ruta):
             procedencia=metadata.get("procedencia", []),
             prediccion=metadata.get("prediccion", {}),
             panel=metadata.get("panel", {}),
+            tablero_meta=tablero_meta,
+            tablero_tablas=tablero_tablas,
+            tablero_pronosticos=metadata.get("tablero_pronosticos", []),
         )
 
 

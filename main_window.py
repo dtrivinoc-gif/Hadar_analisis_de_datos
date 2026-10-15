@@ -59,6 +59,7 @@ from .metricas_ui import PanelMetricas
 from .reporte_ui import PanelReporte
 from .memoria import MemoriaHadar
 from .proyecto import guardar_proyecto, abrir_proyecto, ruta_carpeta_proyectos, EXTENSION
+from .tablero import Tablero
 from .aprendizaje_adaptativo import actualizar_linea_base
 from .anomalias import SemanticAnomalyDetector, anomalias_a_notas_celda, detectar_columnas_fecha
 from .deteccion_multivariada import evaluar_confiabilidad
@@ -490,6 +491,9 @@ class HadarApp(QMainWindow):
 
         self.df = None
         self.filtered_df = None
+        # Predicciones por fila que dejó la pestaña Predicción para que Datos y
+        # Alarmas las lean (ver tablero.py). No se mezclan con self.df.
+        self.tablero = Tablero()
         self.filtro_grafico = None
         # Filtro "por anomalía" de la pestaña Datos: None = sin filtro,
         # "todas" = cualquier anomalía, o la clave interna de un tipo
@@ -1060,6 +1064,7 @@ class HadarApp(QMainWindow):
         partes.append(f"indicadores:{[ind.to_dict() for ind in self.indicadores]}")
         partes.append(f"relaciones:{self.relaciones_ontologia}")
         partes.append(f"procedencia:{self.procedencia.a_lista()}")
+        partes.append(f"predicciones:{self.tablero.firma()}")
         texto = "|".join(str(p) for p in partes)
         return hashlib.sha256(texto.encode("utf-8", errors="ignore")).hexdigest()
 
@@ -1425,6 +1430,7 @@ class HadarApp(QMainWindow):
         # maquinaria que ya existía (hojas de Excel, motor, UF, etc.), sin
         # ningún cambio de comportamiento respecto de antes.
         self.tablas = nuevas_tablas
+        self.tablero.limpiar()   # datos nuevos: las predicciones de los anteriores ya no corresponden
         self.fuentes_datos = nuevas_fuentes
         self.procedencia = BitacoraProcedencia()   # datos recién cargados: sin historia previa
         for nombre_tabla, o in nuevos_origenes.items():
@@ -2364,6 +2370,7 @@ class HadarApp(QMainWindow):
             QMessageBox.warning(self, "Algunas tablas no se pudieron traer", "\n".join(errores))
 
         self.tablas = nuevas_tablas
+        self.tablero.limpiar()   # datos nuevos: las predicciones de los anteriores ya no corresponden
         self.fuentes_datos = nuevas_fuentes
         self.procedencia = BitacoraProcedencia()   # datos recién cargados: sin historia previa
         for nombre_tabla, f in nuevas_fuentes.items():
@@ -2454,6 +2461,7 @@ class HadarApp(QMainWindow):
             QMessageBox.warning(self, "Algunas tablas no se pudieron traer", "\n".join(errores))
 
         self.tablas = nuevas_tablas
+        self.tablero.limpiar()   # datos nuevos: las predicciones de los anteriores ya no corresponden
         self.fuentes_datos = nuevas_fuentes
         self.procedencia = BitacoraProcedencia()   # datos recién cargados: sin historia previa
         for nombre_tabla, f in nuevas_fuentes.items():
@@ -2558,6 +2566,7 @@ class HadarApp(QMainWindow):
                 return
 
         self.tablas[self.nombre_tabla_activa] = df_nuevo
+        self.tablero.quitar(self.nombre_tabla_activa)   # filas nuevas: hay que volver a predecir
         self.df = df_nuevo
         # Se volvió a leer desde la MISMA fuente: se conserva de dónde vino (y cuándo
         # se cargó por primera vez), pero lo calculado antes ya no aplica.
@@ -2675,6 +2684,9 @@ class HadarApp(QMainWindow):
                 procedencia=self.procedencia.a_lista(),
                 prediccion=self._prediccion_a_dict(),
                 panel=getattr(self, "panel_config", None),
+                tablero_meta=self.tablero.a_meta(),
+                tablero_tablas=self.tablero.frames(),
+                tablero_pronosticos=self.tablero.pronosticos_a_lista(),
             )
         except Exception as e:
             QMessageBox.critical(self, "Error al guardar el proyecto", str(e))
@@ -2706,6 +2718,9 @@ class HadarApp(QMainWindow):
             return
 
         self.tablas = datos_proyecto.tablas
+        # Las predicciones guardadas con el proyecto (vacío en proyectos antiguos).
+        self.tablero = Tablero.desde_proyecto(
+            datos_proyecto.tablero_meta, datos_proyecto.tablero_tablas, datos_proyecto.tablero_pronosticos)
         self.nombre_tabla_activa = (
             datos_proyecto.nombre_tabla_activa if datos_proyecto.nombre_tabla_activa in self.tablas
             else next(iter(self.tablas))
@@ -3127,6 +3142,37 @@ class HadarApp(QMainWindow):
                     return cache["fechas"].iloc[posiciones]
         return parsear_fechas(df[col], dayfirst=dayfirst)
 
+    def _vista_con_predicciones(self, df):
+        """`df` más las columnas de predicción de la tabla activa (si la
+        pestaña Predicción dejó alguna). Es una copia liviana: ni self.df ni
+        self.filtered_df las contienen, así que Narrativa, los indicadores y
+        el resto siguen viendo solo los datos reales."""
+        if df is None:
+            return df
+        return self.tablero.con_predicciones(df, self.nombre_tabla_activa)
+
+    def _info_columnas_predichas(self, vista):
+        if vista is None or not self.tablero.hay(self.nombre_tabla_activa):
+            return {}
+        textos = self.tablero.descripciones(self.df, self.nombre_tabla_activa)
+        return {c: t for c, t in textos.items() if c in vista.columns}
+
+    def _tablero_actualizado(self, tabla):
+        """La pestaña Predicción dejó predicciones nuevas para `tabla`."""
+        if tabla == self.nombre_tabla_activa:
+            self.apply_table_filter()
+            self.statusBar().showMessage(
+                "Predicciones agregadas a Datos como columnas de solo lectura (texto de color).", 8000)
+        else:
+            self.statusBar().showMessage(
+                f"Predicciones listas para «{tabla}». Elige esa tabla en Datos para verlas.", 10000)
+
+    def _pronostico_publicado(self, titulo):
+        """La pestaña Predicción (Preguntas) llevó una respuesta al Panel."""
+        if hasattr(self, "panel_control"):
+            self.panel_control.notificar_cambio()
+        self.statusBar().showMessage(f"«{titulo}» agregado al Panel, en «Lo que se viene».", 8000)
+
     def apply_table_filter(self):
         if self.df is None:
             return
@@ -3134,7 +3180,9 @@ class HadarApp(QMainWindow):
 
         self.filtered_df = df
         self._refrescar_barra_filtro()
-        self.table_model.set_dataframe(df)
+        vista = self._vista_con_predicciones(df)
+        self.table_model.set_dataframe(vista)
+        self.table_model.set_columnas_predichas(self._info_columnas_predichas(vista))
         self.lbl_total_reg.setText(f"Total Registros: {len(df):,}")
         self.lbl_total_cols.setText(f"Total Columnas: {len(df.columns)}")
 
@@ -4036,10 +4084,11 @@ class HadarApp(QMainWindow):
     def _columnas_para_alarma(self):
         if self.df is None:
             return [], []
+        base = self._vista_con_predicciones(self.df)   # incluye las columnas predichas
         numericas = [
-            str(c) for c in self.df.columns if pd.api.types.is_numeric_dtype(self.df[c])
+            str(c) for c in base.columns if pd.api.types.is_numeric_dtype(base[c])
         ]
-        todas = [str(c) for c in self.df.columns]
+        todas = [str(c) for c in base.columns]
         return numericas, todas
 
     def _abrir_dialogo_nueva_alarma(self):
@@ -4048,7 +4097,8 @@ class HadarApp(QMainWindow):
             return
         numericas, todas = self._columnas_para_alarma()
         dialogo = DialogoAlarma(
-            [i.nombre for i in self.indicadores], numericas, todas, parent=self, df=self.df
+            [i.nombre for i in self.indicadores], numericas, todas, parent=self,
+            df=self._vista_con_predicciones(self.df)
         )
         if dialogo.exec() == QDialog.DialogCode.Accepted:
             nuevo_id = self.alarma_memoria.agregar_regla(**dialogo.get_datos())
@@ -4062,7 +4112,7 @@ class HadarApp(QMainWindow):
         numericas, todas = self._columnas_para_alarma()
         dialogo = DialogoAlarma(
             [i.nombre for i in self.indicadores], numericas, todas, regla=regla, parent=self,
-            df=self.df
+            df=self._vista_con_predicciones(self.df)
         )
         if dialogo.exec() == QDialog.DialogCode.Accepted:
             self.alarma_memoria.actualizar_regla(regla["id"], **dialogo.get_datos())
@@ -4097,7 +4147,8 @@ class HadarApp(QMainWindow):
             w.deleteLater()
         self.alarma_widgets.clear()
 
-        df = self.filtered_df if self.filtered_df is not None else self.df
+        df = self._vista_con_predicciones(
+            self.filtered_df if self.filtered_df is not None else self.df)
 
         for i, regla in enumerate(self.reglas_alarma):
             valor = calcular_valor_actual(regla, df, self.indicadores)

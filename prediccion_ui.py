@@ -11,6 +11,8 @@ Flujo para el usuario:
   3. "Entrenar modelo": muestra qué tan bien acierta frente a una respuesta
      tonta y en qué columnas se fijó.
   4. "Generar predicciones…": guarda un CSV listo para entregar.
+  5. "Usar en Datos y Alarmas": deja las predicciones por fila a la vista de
+     las otras pestañas (ver tablero.py), sin guardar ningún archivo.
 
 Cada proyecto guarda su propia configuración (ver proyecto.py); el modelo
 entrenado NO se guarda, se reentrena con un clic (ver nota en prediccion.py).
@@ -597,6 +599,10 @@ class PanelPrediccion(QWidget):
         self.btn_predecir = QPushButton("Generar predicciones…")
         self.btn_predecir.clicked.connect(self._generar_predicciones)
         fila2.addWidget(self.btn_predecir)
+        self.btn_usar = QPushButton("Usar en Datos y Alarmas")
+        self.btn_usar.clicked.connect(self._usar_en_otras_pestanas)
+        self.btn_usar.setEnabled(False)
+        fila2.addWidget(self.btn_usar)
         self.btn_pdf = QPushButton("Exportar PDF ▾")
         menu_pdf = QMenu(self.btn_pdf)
         accion_todo = menu_pdf.addAction("Todo (configuración y resultados)")
@@ -1121,12 +1127,19 @@ class PanelPrediccion(QWidget):
         self.btn_entrenar.setEnabled(not entrenando and self._objetivo_actual() is not None)
         self.btn_predecir.setEnabled(
             not entrenando and self._resultado is not None and self._df_prueba() is not None)
+        self.btn_usar.setEnabled(
+            not entrenando and self._resultado is not None and self._df_prueba() is not None
+            and getattr(self.host, "tablero", None) is not None)
         self.btn_pdf.setEnabled(
             not entrenando and self._resultado is not None and self._contexto_pdf is not None)
         if self._resultado is not None and self._df_prueba() is None:
             self.btn_predecir.setToolTip("Elige una tabla de prueba (arriba) para poder predecir sobre ella.")
+            self.btn_usar.setToolTip("Elige una tabla de prueba (arriba) para poder predecir sobre ella.")
         else:
             self.btn_predecir.setToolTip("")
+            self.btn_usar.setToolTip(
+                "Predice sobre la tabla de prueba y agrega las predicciones como columnas de solo lectura "
+                "en Datos, para usarlas en Alarmas. No cambia tus datos ni guarda ningún archivo.")
 
     # ------------------------------------------------------------------
     # Entrenar
@@ -1561,6 +1574,41 @@ class PanelPrediccion(QWidget):
     # ------------------------------------------------------------------
     # Predecir y guardar
     # ------------------------------------------------------------------
+    def _usar_en_otras_pestanas(self):
+        """Predice sobre la tabla de prueba y deja el resultado en el tablero
+        común (tablero.py): Datos lo muestra como columnas de solo lectura y
+        Alarmas puede vigilarlo. No guarda archivos ni toca los datos."""
+        tablero = getattr(self.host, "tablero", None)
+        original = self._df_prueba()
+        if self._resultado is None or original is None or tablero is None:
+            return
+        nombre = self.combo_test.currentText()
+        df = self._df_test_ef if self._df_test_ef is not None else original
+        self._leer_formulario()
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            r = self._resultado
+            salida = predecir(r, df, self._config.columna_id_salida, self._config.salida)
+            es_prob = r.tipo != "regresion" and (self._config.salida or r.salida) == "probabilidad"
+            tablero.publicar_predicciones(
+                nombre, original, salida, r.objetivo, es_probabilidad=es_prob, clases=r.clases,
+                tipo_salida=getattr(salida, "attrs", {}).get("tipo_salida", ""),
+                posicional_seguro=self._df_test_ef is None)
+        except Exception as e:
+            QApplication.restoreOverrideCursor()
+            QMessageBox.warning(self, "No se pudo usar la predicción", str(e))
+            return
+        QApplication.restoreOverrideCursor()
+        avisar = getattr(self.host, "_tablero_actualizado", None)
+        if avisar is not None:
+            avisar(nombre)
+        self.lbl_pred.setText(
+            f"Listo: {dec(len(original), 0, True)} filas de «{nombre}» con predicción. Las verás en Datos "
+            f"(texto de color, solo lectura) y puedes vigilarlas con una alarma.")
+        avisos = list(getattr(salida, "attrs", {}).get("avisos", []))
+        if avisos:
+            QMessageBox.information(self, "Predicciones listas", "Ojo:\n" + "\n".join("• " + a for a in avisos))
+
     def _generar_predicciones(self):
         df = self._df_test_ef if self._df_test_ef is not None else self._df_prueba()
         if self._resultado is None or df is None:

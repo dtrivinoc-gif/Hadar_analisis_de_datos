@@ -831,6 +831,13 @@ class PanelPalabras(QWidget):
         btn.setMaximumWidth(160)
         btn.clicked.connect(lambda: QApplication.clipboard().setText(r.texto()))
         fila_btn.addWidget(btn)
+        if getattr(self.host, "tablero", None) is not None:
+            btn_panel = QPushButton("Llevar al Panel")
+            btn_panel.setMaximumWidth(160)
+            btn_panel.setToolTip("Muestra esta respuesta en el Panel, en «Lo que se viene». Solo guarda el texto "
+                                 "(la respuesta con su rango y su confianza), no el modelo.")
+            btn_panel.clicked.connect(self._llevar_al_panel)
+            fila_btn.addWidget(btn_panel)
         self.btn_pdf = QPushButton("Exportar PDF ▾")
         self.btn_pdf.setMaximumWidth(160)
         menu_pdf = QMenu(self.btn_pdf)
@@ -849,6 +856,31 @@ class PanelPalabras(QWidget):
         fila_btn.addStretch(1)
         self.res_lay.addLayout(fila_btn)
         self.card_resultado.setVisible(True)
+
+    def _llevar_al_panel(self):
+        """Deja la respuesta actual a la vista del Panel (tablero.py). Es la misma
+        respuesta que se ve aquí: no se recalcula nada."""
+        import hashlib
+        import json
+        r, ctx = self._resultado, self._contexto_pdf
+        tablero = getattr(self.host, "tablero", None)
+        if r is None or ctx is None or tablero is None:
+            return
+        cfg = ctx.config or {}
+        tabla = cfg.get("tabla") or ""
+        # Mismo análisis (misma configuración) recalculado = reemplaza al anterior; otra configuración = otro.
+        huella = hashlib.md5(json.dumps(cfg, sort_keys=True, default=str).encode("utf-8")).hexdigest()[:8]
+        critico = next((str(a) for a in r.avisos_ordenados() if a.nivel == CRITICO), "")
+        try:
+            tablero.publicar_pronostico(f"{r.palabra}|{tabla}|{huella}", r, tabla=tabla,
+                                        calculado_en=getattr(ctx, "calculado_en", None), aviso_critico=critico)
+        except ValueError as e:
+            QMessageBox.warning(self, "No se pudo llevar al Panel", str(e))
+            return
+        avisar = getattr(self.host, "_pronostico_publicado", None)
+        if avisar is not None:
+            avisar(r.titulo)
+        self.lbl_estado.setText("Listo: la respuesta ya está en el Panel («Lo que se viene»).")
 
     def _exportar_pdf(self, modo, tecnico=False):
         """modo = "todo" (configuración + respuesta) o "resultados" (solo la respuesta)."""

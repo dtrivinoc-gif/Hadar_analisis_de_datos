@@ -8,7 +8,7 @@ import pandas as pd
 from PySide6.QtCore import Qt, QAbstractTableModel, QModelIndex
 from PySide6.QtGui import QColor, QPixmap, QPainter, QBrush
 
-from .config import COLOR_DANGER, COLOR_ACCENT_3
+from .config import COLOR_DANGER, COLOR_ACCENT, COLOR_ACCENT_3
 from .io_datos import cast_valor_a_dtype
 
 # Rojo oscuro para celdas que SOLO marcó el chequeo de combinación (ML) --
@@ -53,6 +53,11 @@ class PandasTableModel(QAbstractTableModel):
         # {nombre_columna: aviso} de las calculadas que pudieron quedar
         # desactualizadas (se modificaron datos de los que salen).
         self._columnas_desactualizadas = {}
+        # {nombre_columna: texto} de las columnas que son PREDICCIONES de la
+        # pestaña Predicción (ver tablero.py). No son datos del usuario: se
+        # muestran de otro color, con aviso en el encabezado, y no se pueden
+        # editar (no existen en el DataFrame maestro).
+        self._columnas_predichas = {}
         # Iconos: se crean una sola vez (no en cada data(), que se llama por
         # cada celda visible en cada repintado).
         self._icono_anomalia = self._crear_icono_punto(COLOR_DANGER)
@@ -204,6 +209,26 @@ class PandasTableModel(QAbstractTableModel):
         if n:
             self.headerDataChanged.emit(Qt.Horizontal, 0, n - 1)
 
+    def set_columnas_predichas(self, mapa):
+        """mapa: {nombre_columna: texto del aviso}. Vacío o None = ninguna."""
+        mapa = dict(mapa or {})
+        if mapa == self._columnas_predichas:
+            return
+        self._columnas_predichas = mapa
+        n = self.columnCount()
+        if n:
+            self.headerDataChanged.emit(Qt.Horizontal, 0, n - 1)
+            self.dataChanged.emit(self.index(0, 0), self.index(max(self.rowCount() - 1, 0), n - 1),
+                                  [Qt.ForegroundRole])
+
+    def _es_columna_predicha(self, col):
+        if not self._columnas_predichas:
+            return False
+        try:
+            return str(self._df.columns[col]) in self._columnas_predichas
+        except IndexError:
+            return False
+
     def set_dataframe(self, df: pd.DataFrame):
         self.beginResetModel()
         self._df = df
@@ -238,6 +263,9 @@ class PandasTableModel(QAbstractTableModel):
                 return color
             return None
 
+        if role == Qt.ForegroundRole:
+            return QColor(COLOR_ACCENT) if self._es_columna_predicha(col) else None
+
         if role == Qt.ToolTipRole:
             clave = self._clave(row, col)
             valor = self._df.iat[row, col]
@@ -267,7 +295,7 @@ class PandasTableModel(QAbstractTableModel):
         base = super().flags(index)
         if not index.isValid():
             return base
-        if self.editable:
+        if self.editable and not self._es_columna_predicha(index.column()):
             return base | Qt.ItemIsEditable
         return base
 
@@ -275,6 +303,8 @@ class PandasTableModel(QAbstractTableModel):
         if role != Qt.EditRole or not index.isValid() or not self.editable:
             return False
         row, col = index.row(), index.column()
+        if self._es_columna_predicha(col):
+            return False
         col_name = self._df.columns[col]
         dtype = self._df[col_name].dtype
         nuevo_valor = cast_valor_a_dtype(str(value), dtype)
@@ -298,6 +328,11 @@ class PandasTableModel(QAbstractTableModel):
             # la columna (ej. la barra de estado al hacer clic en una celda).
             if role == Qt.EditRole:
                 return nombre
+            if nombre in self._columnas_predichas:
+                if role == Qt.ToolTipRole:
+                    return self._columnas_predichas[nombre]
+                if role == Qt.DisplayRole:
+                    return nombre
             formula = self._columnas_calculadas.get(nombre)
             aviso = self._columnas_desactualizadas.get(nombre)
             if role == Qt.DisplayRole:

@@ -17,12 +17,12 @@ import numpy as np
 import pandas as pd
 import pyqtgraph as pg
 
-from PySide6.QtCore import Qt, QTimer, QPointF
+from PySide6.QtCore import Qt, QTimer, QPointF, QObject, QEvent
 from PySide6.QtGui import QColor, QPainter, QPainterPath, QPen
 from PySide6.QtWidgets import (
     QWidget, QFrame, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel,
     QPushButton, QDialog, QDialogButtonBox, QListWidget, QListWidgetItem,
-    QComboBox, QMessageBox, QCheckBox, QTabWidget,
+    QComboBox, QMessageBox, QCheckBox, QTabWidget, QScrollArea, QApplication,
 )
 
 from .config import COLOR_ACCENT, COLOR_ACCENT_3
@@ -872,6 +872,30 @@ class DialogoPersonalizarPanel(QDialog):
         return None if self.lista_tablas is None else _claves_marcadas(self.lista_tablas)
 
 
+def _con_alfa(color, alfa):
+    """El mismo color con transparencia, para que la barra se note en
+    cualquier tema (claro u oscuro) sin inventar un color nuevo."""
+    q = QColor(color)
+    return f"rgba({q.red()}, {q.green()}, {q.blue()}, {alfa})"
+
+
+class _RuedaAlScroll(QObject):
+    """Los gráficos de pyqtgraph se quedan con la ruedita del ratón (para
+    hacer zoom) y el Panel no se desliza cuando el puntero está encima de
+    uno. Este filtro le pasa la ruedita al Panel; con Ctrl apretado deja que
+    el gráfico haga su zoom de siempre."""
+
+    def __init__(self, area, parent=None):
+        super().__init__(parent)
+        self._area = area
+
+    def eventFilter(self, obj, event):
+        if event.type() == QEvent.Wheel and not (event.modifiers() & Qt.ControlModifier):
+            QApplication.sendEvent(self._area.viewport(), event)
+            return True
+        return False
+
+
 class PanelControl(QWidget):
     """La pestaña Panel. `host` es la ventana principal: se leen de ella
     df, filtered_df, indicadores, colors y rango_tiempo."""
@@ -893,9 +917,11 @@ class PanelControl(QWidget):
         self._timer.setInterval(150)
         self._timer.timeout.connect(self.actualizar)
 
-        raiz = QVBoxLayout(self)
-        raiz.setContentsMargins(18, 16, 18, 16)
-        raiz.setSpacing(14)
+        # La cabecera queda fija arriba; todo lo demás va dentro de un área
+        # con barra para deslizarse hacia abajo cuando no cabe en pantalla.
+        externo = QVBoxLayout(self)
+        externo.setContentsMargins(18, 16, 18, 0)
+        externo.setSpacing(12)
 
         cab = QHBoxLayout()
         self.lbl_titulo = QLabel("Panel de control")
@@ -916,7 +942,24 @@ class PanelControl(QWidget):
         self.btn_personalizar.setCursor(Qt.PointingHandCursor)
         self.btn_personalizar.setStyleSheet(QSS_SUBPESTANA)
         cab.addWidget(self.btn_personalizar)
-        raiz.addLayout(cab)
+        externo.addLayout(cab)
+
+        self.scroll = QScrollArea()
+        self.scroll.setObjectName("panelScroll")
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setFrameShape(QFrame.NoFrame)
+        self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.scroll.verticalScrollBar().setSingleStep(32)
+        self.scroll.viewport().setObjectName("panelViewport")
+        self._contenido = QWidget()
+        self._contenido.setObjectName("panelContenido")
+        self.scroll.setWidget(self._contenido)
+        externo.addWidget(self.scroll, 1)
+        self._rueda = _RuedaAlScroll(self.scroll, self)
+
+        raiz = QVBoxLayout(self._contenido)
+        raiz.setContentsMargins(0, 2, 6, 16)
+        raiz.setSpacing(14)
 
         self.lbl_vacio = QLabel("Carga datos para ver tu panel.")
         self.lbl_vacio.setObjectName("muted")
@@ -952,6 +995,27 @@ class PanelControl(QWidget):
         self.card_alarmas.setVisible(False)
         raiz.addWidget(self.card_alarmas)
 
+        # «Lo que se viene»: respuestas de Predicción > Preguntas que el usuario
+        # llevó al Panel (ver tablero.py). Solo aparece si hay alguna.
+        self.card_pronosticos = QFrame()
+        self.card_pronosticos.setObjectName("panelTarjeta")
+        lp = QVBoxLayout(self.card_pronosticos)
+        lp.setContentsMargins(16, 12, 16, 12)
+        lp.setSpacing(8)
+        cab_pr = QHBoxLayout()
+        self.lbl_pronosticos = QLabel("Lo que se viene")
+        cab_pr.addWidget(self.lbl_pronosticos)
+        self.lbl_pronosticos_n = QLabel("")
+        cab_pr.addWidget(self.lbl_pronosticos_n)
+        cab_pr.addStretch()
+        lp.addLayout(cab_pr)
+        self.grid_pronosticos = QGridLayout()
+        self.grid_pronosticos.setSpacing(10)
+        lp.addLayout(self.grid_pronosticos)
+        self._chips_pronosticos = []
+        self.card_pronosticos.setVisible(False)
+        raiz.addWidget(self.card_pronosticos)
+
         self.card_grafico = QFrame()
         self.card_grafico.setObjectName("panelTarjeta")
         lg = QVBoxLayout(self.card_grafico)
@@ -959,7 +1023,7 @@ class PanelControl(QWidget):
         self.lbl_grafico = QLabel("")
         lg.addWidget(self.lbl_grafico)
         self.plot = pg.PlotWidget(axisItems={"bottom": pg.DateAxisItem(orientation="bottom")})
-        self.plot.setMinimumHeight(190)
+        self.plot.setMinimumHeight(260)
         self.plot.setFrameShape(QFrame.NoFrame)
         self.plot.setMenuEnabled(False)
         self.plot.showGrid(x=False, y=True, alpha=0.12)
@@ -975,6 +1039,9 @@ class PanelControl(QWidget):
         raiz.addLayout(self.grid_propios)
         self._tarjetas_graficos = []
         raiz.addWidget(self._crear_card_tiempo())
+
+        for pw in (self.plot, self.plot_t):
+            pw.viewport().installEventFilter(self._rueda)
 
         self._estilo_plot()
         self.card_grafico.setVisible(False)
@@ -1078,6 +1145,8 @@ class PanelControl(QWidget):
         self.card_hallazgos.setStyleSheet(estilo_tarjeta(c))
         self.card_tiempo.setStyleSheet(estilo_tarjeta(c))
         self.card_alarmas.setStyleSheet(estilo_tarjeta(c))
+        self.card_pronosticos.setStyleSheet(estilo_tarjeta(c))
+        self.lbl_pronosticos.setStyleSheet(f"color: {c['text']}; font-size: 13px;")
         self.lbl_alarmas.setStyleSheet(f"color: {c['text']}; font-size: 13px;")
         self.btn_alarmas.setStyleSheet(
             f"QPushButton {{ background: transparent; border: none; color: {COLOR_ACCENT};"
@@ -1090,6 +1159,16 @@ class PanelControl(QWidget):
             f"QPushButton {{ background: transparent; border: none; color: {COLOR_ACCENT};"
             " padding: 2px 0; text-align: left; }"
             f"QPushButton:hover {{ color: {c['text']}; }}"
+        )
+        self.scroll.setStyleSheet(
+            "QScrollArea#panelScroll { background: transparent; border: none; }"
+            "QWidget#panelViewport, QWidget#panelContenido { background: transparent; }"
+            "QScrollBar:vertical { background: transparent; width: 10px; margin: 2px 0; }"
+            f"QScrollBar::handle:vertical {{ background: {_con_alfa(c['muted'], 110)};"
+            " border-radius: 4px; min-height: 36px; }"
+            f"QScrollBar::handle:vertical:hover {{ background: {_con_alfa(c['muted'], 200)}; }}"
+            "QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }"
+            "QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: transparent; }"
         )
         self.btn_personalizar.setCursor(Qt.PointingHandCursor)
         self.btn_personalizar.setStyleSheet(
@@ -1231,6 +1310,7 @@ class PanelControl(QWidget):
             self.card_hallazgos.setVisible(False)
             self.card_tiempo.setVisible(False)
             self.card_alarmas.setVisible(False)
+            self.card_pronosticos.setVisible(False)
             self.lbl_sub.setText("")
             return
         self.lbl_vacio.setVisible(False)
@@ -1256,6 +1336,7 @@ class PanelControl(QWidget):
             self._tarjetas.append(tarjeta)
 
         self._dibujar_alarmas(cfg.get("mostrar_alarmas", True))
+        self._dibujar_pronosticos()
         self._dibujar_grafico(df, col_fecha, fechas)
         self._dibujar_graficos_propios(df)
         self._dibujar_hallazgos(cfg.get("mostrar_hallazgos", True))
@@ -1333,6 +1414,83 @@ class PanelControl(QWidget):
         resto = len(estados) - len(visibles)
         self.btn_alarmas.setText(f"Ver alarmas (+{resto} más) →" if resto > 0 else "Ver alarmas →")
 
+    def _dibujar_pronosticos(self, maximo=6, columnas=2):
+        """«Lo que se viene»: las respuestas de Preguntas que el usuario llevó al
+        Panel, las más urgentes primero. Es el texto tal como se calculó (con su
+        rango y su confianza): el Panel no vuelve a calcular nada."""
+        for chip in self._chips_pronosticos:
+            chip.setParent(None)
+            chip.deleteLater()
+        self._chips_pronosticos.clear()
+        tablero = getattr(self.host, "tablero", None)
+        lista = tablero.pronosticos() if tablero is not None else []
+        if not lista:
+            self.card_pronosticos.setVisible(False)
+            return
+        self.card_pronosticos.setVisible(True)
+        c = self.colors
+        est = colores_estado(c)
+        color_nivel = {"alerta": est["baja"], "atencion": "#D97706" if _es_tema_claro(c) else "#FBBF24"}
+        varias_tablas = len({p.tabla for p in lista}) > 1
+        visibles = lista[:maximo]
+        resto = len(lista) - len(visibles)
+        self.lbl_pronosticos_n.setText(f"  {len(lista)}" + (f" · se ven las {maximo} más urgentes" if resto > 0 else ""))
+        self.lbl_pronosticos_n.setStyleSheet(f"color: {c['muted']}; font-size: 12px;")
+        for i, p in enumerate(visibles):
+            color = color_nivel.get(p.nivel, COLOR_ACCENT)
+            borde = color if p.nivel == "alerta" else c["border"]
+            chip = QFrame()
+            chip.setObjectName("panelChip")
+            chip.setStyleSheet(
+                f"QFrame#panelChip {{ background: transparent; border: 1px solid {borde}; border-radius: 8px; }}"
+                "QFrame#panelChip QLabel { background: transparent; border: none; }"
+            )
+            lay = QVBoxLayout(chip)
+            lay.setContentsMargins(12, 8, 12, 8)
+            lay.setSpacing(3)
+            fila = QHBoxLayout()
+            nombre = html.escape(p.titulo or p.palabra)
+            if varias_tablas and p.tabla:
+                nombre += f" <span style='color:{c['muted']}; font-weight:400'>· {html.escape(p.tabla)}</span>"
+            titulo = QLabel(f"<span style='color:{color}'>●</span>&nbsp; " + nombre)
+            titulo.setTextFormat(Qt.RichText)
+            titulo.setWordWrap(True)
+            titulo.setStyleSheet(f"color: {c['text']}; font-size: 12px; font-weight: 600;")
+            fila.addWidget(titulo, 1)
+            quitar = QPushButton("Quitar")
+            quitar.setFlat(True)
+            quitar.setCursor(Qt.PointingHandCursor)
+            quitar.setToolTip("Quita esta respuesta del Panel (no borra nada más).")
+            quitar.setStyleSheet(f"QPushButton {{ color: {c['muted']}; font-size: 11px; border: none; padding: 0 2px; }}"
+                                 f"QPushButton:hover {{ color: {c['text']}; }}")
+            quitar.clicked.connect(lambda _=False, k=p.clave: QTimer.singleShot(0, lambda: self._quitar_pronostico(k)))
+            fila.addWidget(quitar, 0, Qt.AlignTop)
+            lay.addLayout(fila)
+            titular = QLabel(p.titular)
+            titular.setWordWrap(True)
+            titular.setStyleSheet(f"color: {c['text']}; font-size: 13px;")
+            lay.addWidget(titular)
+            if p.aviso_critico:
+                aviso = QLabel(p.aviso_critico)
+                aviso.setWordWrap(True)
+                aviso.setStyleSheet(f"color: {est['baja']}; font-size: 12px;")
+                lay.addWidget(aviso)
+            pie = QLabel(f"Confianza {p.confianza}" + (f" · calculado el {p.calculado_en}" if p.calculado_en else ""))
+            pie.setStyleSheet(f"color: {c['muted']}; font-size: 11px;")
+            if p.por_que_confianza:
+                pie.setToolTip(p.por_que_confianza)
+            lay.addWidget(pie)
+            self.grid_pronosticos.addWidget(chip, i // columnas, i % columnas)
+            self._chips_pronosticos.append(chip)
+        for col in range(columnas):
+            self.grid_pronosticos.setColumnStretch(col, 1)
+
+    def _quitar_pronostico(self, clave):
+        tablero = getattr(self.host, "tablero", None)
+        if tablero is not None:
+            tablero.quitar_pronostico(clave)
+        self._dibujar_pronosticos()
+
     def _limpiar_graficos_propios(self):
         for t in self._tarjetas_graficos:
             t.setParent(None)
@@ -1347,6 +1505,8 @@ class PanelControl(QWidget):
             tarjeta = TarjetaGrafico(g, datos_grafico_propio(g, df), self.colors)
             self.grid_propios.addWidget(tarjeta, i // 2, i % 2)
             self.grid_propios.setColumnStretch(i % 2, 1)
+            for pw in tarjeta.findChildren(pg.PlotWidget):
+                pw.viewport().installEventFilter(self._rueda)
             self._tarjetas_graficos.append(tarjeta)
 
     def _opciones_graficos(self):
